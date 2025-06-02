@@ -1,0 +1,44 @@
+{
+  "description": "PHP Helper Classes",
+  "name": "vitorgd16/php-helper",
+  "type": "library",
+  "license": "MIT",
+  "require": {
+    "php": ">=8.0",
+    "ext-json": "*",
+    "ext-mbstring": "*"
+  },
+  "require-dev": {
+    "mervick/aes-everywhere": "^1.1",
+    "phpmailer/phpmailer": "^6.10",
+    "phpoffice/phpspreadsheet": "^4.2",
+    "rebasedata/php-client": "^1.0",
+    "ext-curl": "*",
+    "ext-simplexml": "*",
+    "ext-openssl": "*",
+    "ext-dom": "*",
+    "ext-ctype": "*",
+    "ext-calendar": "*",
+    "ext-zip": "*",
+    "ext-libxml": "*"
+  },
+  "suggest": {
+    "phpmailer/phpmailer": "Requerido para envio de e-mails",
+    "phpoffice/phpspreadsheet": "Requerido para planilhas Excel",
+    "mervick/aes-everywhere": "Criptografia multiplataforma",
+    "rebasedata/php-client": "Conversão de arquivos",
+    "ext-curl": "Necessário para chamadas HTTP externas",
+    "ext-simplexml": "Necessário para manipulação de XML",
+    "ext-openssl": "Necessário para criptografia SSL",
+    "ext-dom": "Necessário para manipular XML/DOM",
+    "ext-ctype": "Necessário para validações de tipo",
+    "ext-calendar": "Necessário para funções de calendário",
+    "ext-zip": "Necessário para manipulação de arquivos zip",
+    "ext-libxml": "Necessário para parsing de XML"
+  },
+  "autoload": {
+    "psr-4": {
+      "VD\\PHPHelper\\": "src/"
+    }
+  }
+}
