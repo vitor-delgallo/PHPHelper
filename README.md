@@ -75,7 +75,7 @@ You can include this library directly or via Composer (if structured as a packag
 
 ```bash
 composer config repositories.phphelper vcs https://github.com/vitor-delgallo/PHPHelper
-composer require vitor-delgallo/phphelper:dev-main
+composer require vitor-delgallo/phphelper:dev-master
 ```
 
 ---

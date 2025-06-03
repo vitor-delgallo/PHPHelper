@@ -1,6 +1,6 @@
 {
   "description": "PHP Helper Classes",
-  "name": "vitorgd16/php-helper",
+  "name": "vitor-delgallo/phphelper",
   "type": "library",
   "license": "MIT",
   "require": {
