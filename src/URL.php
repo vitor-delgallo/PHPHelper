@@ -29,21 +29,21 @@ class URL {
      * @return string The full URL of the current request
      */
     public static function currentURL(): string {
-        $url = str_replace(['\\', '/'], DIRECTORY_SEPARATOR, $_SERVER['REQUEST_URI']);
+        $url = str_replace('\\', '/', $_SERVER['REQUEST_URI']);
 
-        if (Str::subStr($url, -1) === DIRECTORY_SEPARATOR) {
+        if (Str::subStr($url, -1) === '/') {
             $url = Str::subStr($url, 0, -1);
         }
-        if (Str::subStr($url, 0, 1) === DIRECTORY_SEPARATOR) {
+        if (Str::subStr($url, 0, 1) === '/') {
             $url = Str::subStr($url, 1);
         }
 
         $siteUrl = self::siteURL();
-        if (Str::subStr($siteUrl, -1) === DIRECTORY_SEPARATOR) {
+        if (Str::subStr($siteUrl, -1) === '/') {
             $siteUrl = Str::subStr($siteUrl, 0, -1);
         }
 
-        return $siteUrl . DIRECTORY_SEPARATOR . $url;
+        return $siteUrl . '/' . $url;
     }
 
     /**
@@ -54,32 +54,41 @@ class URL {
      */
     public static function siteURL(?string $suffix = null): string {
         $protocol = 'http://';
+
+        // Determine if HTTPS is enabled (various proxy-aware checks)
         if (
-            (
-                isset($_SERVER['HTTPS']) &&
-                ($_SERVER['HTTPS'] === 'on' || $_SERVER['HTTPS'] === '1')
-            ) || (
-                isset($_SERVER['HTTP_X_FORWARDED_PROTO']) &&
-                $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https' &&
-                isset($_SERVER['REMOTE_ADDR'])
-            )
+            isset($_SERVER['HTTPS']) && ($_SERVER['HTTPS'] == 'on' || $_SERVER['HTTPS'] == 1) ||
+            isset($_SERVER['HTTP_X_FORWARDED_PROTO']) &&
+            $_SERVER['HTTP_X_FORWARDED_PROTO'] == 'https' &&
+            isset($_SERVER['REMOTE_ADDR'])
         ) {
             $protocol = 'https://';
         }
 
-        $result = $protocol . $_SERVER['HTTP_HOST'];
-        $result = str_replace(['\\', '/'], DIRECTORY_SEPARATOR, $result);
+        // Determine the current host
+        $host = $_SERVER['HTTP_X_FORWARDED_HOST']
+            ?? $_SERVER['HTTP_HOST']
+            ?? $_SERVER['SERVER_NAME']
+            ?? 'localhost';
 
-        if (Str::subStr($result, -1) !== DIRECTORY_SEPARATOR) {
-            $result .= DIRECTORY_SEPARATOR;
+        // Build base URL
+        $ret = $protocol . $host . self::basePath();
+        $ret = str_replace("\\", "/", $ret);
+
+        // Ensure trailing slash
+        if (mb_substr($ret, -1) !== "/") {
+            $ret .= "/";
         }
 
-        $suffix = str_replace(['\\', '/'], DIRECTORY_SEPARATOR, $suffix);
-        if (Str::subStr($suffix, 0, 1) === DIRECTORY_SEPARATOR) {
-            $suffix = Str::subStr($suffix, 1);
+        // Optionally append suffix
+        if (!empty($suffix)) {
+            $suffix = str_replace("\\", "/", $suffix);
+            if (mb_substr($suffix, 0, 1) === "/") {
+                $suffix = mb_substr($suffix, 1);
+            }
         }
 
-        return $result . $suffix;
+        return $ret . $suffix;
     }
 
     /**
