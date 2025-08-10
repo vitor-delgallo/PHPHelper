@@ -72,7 +72,7 @@ class URL {
             ?? 'localhost';
 
         // Build base URL
-        $ret = $protocol . $host . self::basePath();
+        $ret = $protocol . $host;
         $ret = str_replace("\\", "/", $ret);
 
         // Ensure trailing slash
