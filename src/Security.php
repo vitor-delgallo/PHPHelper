@@ -7,6 +7,7 @@ class Security {
      * Number of encryption blocks to read per iteration.
      *
      * For the 'AES-128-CBC' cipher, each block consists of 16 bytes.
+     * For the 'AES-256-GCM' cipher, each block consists of 32 bytes.
      * Therefore:
      * - 10,000 blocks = 160 KB
      * - 37,500 blocks = 600 KB
@@ -25,9 +26,15 @@ class Security {
      * @param int $length Desired length of the derived key in bytes
      * @param string|null $salt Optional salt value to add randomness to the derived key
      * 
+     * @throws \Exception
      * @return string
      */
     private static function deriveKey(string $key, int $length, ?string $salt = ""): string {
+        // Checks if the key is empty or it does not has the min length
+        if (empty($key) || mb_strlen($key, '8bit') < 16) {
+            throw new \Exception("Invalid encryption key. The key must be at least 16 bytes long.");
+        }
+
         return hash_hkdf(
             'sha256',
             $key,
@@ -39,14 +46,14 @@ class Security {
 
     /**
      * Returns the number of encryption blocks to read per iteration.
-     * If no value is set, the default (37,500) will be returned and set.
+     * If no value is set, the default (3.200.000) will be returned and set.
      *
      * @return int
      */
     public static function getFileEncryptionBlocks(): int
     {
         if (empty(self::$fileEncryptionBlocks)) {
-            self::setFileEncryptionBlocks(37500);
+            self::setFileEncryptionBlocks(3200000);
         }
 
         return self::$fileEncryptionBlocks;
@@ -74,12 +81,12 @@ class Security {
      * 
      * @param mixed $str The input string to generate the search hash for
      * @param string $key Base key to derive the search hash key from
-     * @param string $salt Salt value to add randomness to the derived search hash key
+     * @param string|null $salt (Optional) Salt value to add randomness to the derived search hash key
      * 
      * @throws \Exception
      * @return string
      */
-    public static function generateSearchHash(mixed $str, string $key, string $salt): string {
+    public static function generateSearchHash(mixed $str, string $key, ?string $salt = ""): string {
         if ($str === null || $str === "") {
             return "";
         }
@@ -89,9 +96,11 @@ class Security {
         }
         $str = (string) $str;
 
-        if (empty($key) || mb_strlen($key, '8bit') !== 32) {
-            throw new \Exception("Invalid encryption key. The key must be 32 bytes long.");
+        // Checks if the key is empty or it does not has the min length
+        if (empty($key) || mb_strlen($key, '8bit') < 16) {
+            throw new \Exception("Invalid encryption key. The key must be at least 16 bytes long.");
         }
+
         $keySearch = hash_hkdf(
             'sha256',
             $key,
@@ -104,13 +113,93 @@ class Security {
         return hash_hmac('sha256', $str, $keySearch);
     }
 
+    private static function readLengthEncodedBlock($fp): string|false {
+        $lenData = "";
+        while (!feof($fp)) {
+            $char = fgetc($fp);
+            if ($char === "-" || $char === false) {
+                break;
+            }
+            $lenData .= $char;
+        }
+
+        $lenData = Str::onlyNumbers($lenData);
+        if ($lenData === "") {
+            return false;
+        }
+
+        $len = (int) $lenData;
+        $data = fread($fp, $len);
+        if ($data === false || mb_strlen($data, '8bit') !== $len) {
+            return false;
+        }
+
+        return ($data !== "" ? Parser::base64Decode($data) : "");
+    }
+
+    private static function writeLengthEncodedBlock($fp, $text): string|false {
+        $textEncoded = base64_encode($text);
+        if (fwrite($fpOut, (mb_strlen($textEncoded, '8bit') . "-" . $textEncoded)) === false) {
+            return false;
+        }
+
+        return true;
+    }
+
+    private static function getRealSource(?string $source) {
+        $ret = false;
+
+        // Attempts to get the absolute path of the source file
+        $sourceReal = realpath($source);
+        if(!empty($sourceReal)) {
+            $ret = $sourceReal;
+        } elseif (!is_uploaded_file($source)) {
+            $ret = false;
+        }
+
+        // Checks the validity of the source files
+        $sourceReal = null;
+        if (empty($ret)) {
+            throw new \Exception("File not found to be encrypted.");
+        }
+
+        return $ret;
+    }
+
+    private static function getRealDestination(?string $destination, ?string $permissionMode = null) {
+        $ret = false;
+
+        // Sets the destination file path
+        $destPath = self::getFileAndPath($destination);
+        if(empty($destPath) || empty($destPath['file'])) {
+            throw new \Exception("Invalid destination path provided for writing!");
+        }
+
+        $destPath['dir'] = realpath(self::getPath(dir: $destPath['dir'], createPath: $permissionMode));
+        if(empty($destPath['dir'])) {
+            throw new \Exception("Invalid destination directory path provided for file writing!");
+        }
+        if(Str::subStr($destPath['dir'], -1) !== DIRECTORY_SEPARATOR) $destPath['dir'] .= DIRECTORY_SEPARATOR;
+        $destPath['path'] = $destPath['dir'] . $destPath['file'];
+        
+        $ret = $destPath["path"];
+        $destPath = null;
+
+        // Checks the validity of the destination files
+        if (empty($ret)) {
+            throw new \Exception("Invalid file destination to generate the encrypted file.");
+        }
+
+        return $ret;
+    }
+
     /**
-     * Encrypts the given file and saves the result to a new destination file.
+     * Encrypts the given file and saves the result to a new destination file V1
      *
      * @param string $source Path to the file to be encrypted (use tmp_name if from $_FILES)
      * @param string $key Encryption key to be used
-     * @param string|null $salt Optional salt for key derivation
      * @param string $destination Path where the encrypted file should be saved
+     * @param string|null $salt Optional salt for key derivation
      * @param string|null $permissionMode Optional file permission mode to apply to the destination file
      *
      * @return string Returns the path to the encrypted file
@@ -118,44 +207,26 @@ class Security {
      *
      * @ref https://riptutorial.com/php/example/25499/symmetric-encryption-and-decryption-of-large-files-with-openssl
      */
-    public static function encryptFile(string $source, string $key, ?string $salt, string $destination, ?string $permissionMode = null): string {
+    public static function encryptFileV1(string $source, string $key, string $destination, ?string $salt = null, ?string $permissionMode = null): string {
         if (!extension_loaded('openssl')) {
             throw new \Exception("OpenSSL not loaded");
         }
+        $salt = (($salt ?? "") === "" ? "?" : $salt);
+        $key = self::deriveKey($key, 16, $salt);
+
+        // Attempts to get the absolute path of the source file
+        $source = self::getRealSource($source);
+
+        // Sets the destination file path
+        $destination = self::getRealDestination($destination, $permissionMode);
 
         // Sets the default permission mode if it's empty
         $mode = File::getPermissionMode($permissionMode);
 
-        // Sets the IV (Initialization Vector) length using the 'AES-128-CBC' algorithm
-        $iv_length = openssl_cipher_iv_length("AES-128-CBC");
-
-        // Checks if the key is empty or not exactly 16 bytes long
-        if (empty($key) || mb_strlen($key, '8bit') !== $iv_length) {
-            throw new \Exception("Invalid encryption key. The key must be {$iv_length} bytes long.");
-        }
-        $key = self::deriveKey($key, 16, $salt);
-
-        // Attempts to get the absolute path of the source file
-        $sourceReal = realpath($source);
-        if(!empty($sourceReal)) {
-            $source = $sourceReal;
-        } elseif (!is_uploaded_file($source)) {
-            $source = false;
-        }
-
-        // Clears the sourceReal variable
-        $sourceReal = null;
-
-        // Sets the destination file path
-        $destination = realpath($destination);
-
-        // Checks the validity of the source and destination files
-        if (empty($source)) {
-            throw new \Exception("File not found to be encrypted.");
-        }
-        if (empty($destination)) {
-            throw new \Exception("Invalid file destination to generate the encrypted file.");
-        }
+        // Sets the IV (Initialization Vector) length using the algorithm
+        $cipher = "aes-128-cbc";
+        $version = "v1";
+        $iv_length = openssl_cipher_iv_length($cipher);
 
         // Attempts to generate a secure random initialization vector
         try {
@@ -163,7 +234,6 @@ class Security {
         } catch (\Exception $e) {
             $iv = openssl_random_pseudo_bytes($iv_length);
         }
-
 
         // Sets the permission of the destination file
         $oldMask = umask(0);
@@ -175,37 +245,346 @@ class Security {
             // Initializes the error flag
             $error = false;
 
+            // Writes the cipher to the destination file
+            if(!self::writeLengthEncodedBlock($fpOut, $cipher)) {
+                $error = true;
+            }
+
+            // Writes the version to the destination file
+            if(!self::writeLengthEncodedBlock($fpOut, $version)) {
+                $error = true;
+            }
+
+            // Writes the salt to the destination file
+            if(!self::writeLengthEncodedBlock($fpOut, $salt)) {
+                $error = true;
+            }
+
             // Writes the initialization vector to the destination file
-            if(fwrite($fpOut, (mb_strlen(base64_encode($iv), '8bit') . "-" . base64_encode($iv))) === false) {
+            if(!self::writeLengthEncodedBlock($fpOut, $iv)) {
                 $error = true;
             }
 
             // Attempts to open the source file for reading
-            if ($fpIn = fopen($source, 'rb')) {
+            if (!$error && $fpIn = fopen($source, 'rb')) {
                 // Reads blocks of text, encrypts them, and writes to the destination file
                 while (!feof($fpIn)) {
                     // Reads a block from the source file
-                    $plaintext = fread($fpIn, $iv_length * self::getFileEncryptionBlocks());
+                    $plaintext = fread($fpIn, self::getFileEncryptionBlocks());
                     if($plaintext === false) {
                         $error = true;
+                        break;
                     }
+
+                    if($plaintext === "") {
+                        break;
+                    }
+
                     // Encrypts the plaintext block
                     $ciphertext = openssl_encrypt(
                         $plaintext,
-                        "AES-128-CBC",
+                        $cipher,
                         $key,
                         OPENSSL_RAW_DATA,
                         $iv
                     );
                     if($ciphertext === false) {
                         $error = true;
+                        break;
                     }
+
                     // Uses the last encrypted block as the next initialization vector
-                    $iv = mb_substr($ciphertext, 0, $iv_length, '8bit');
+                    $iv = mb_substr($ciphertext, -$iv_length, NULL, '8bit');
+                    
+                    // Writes the encoded block to the destination file
+                    if(!self::writeLengthEncodedBlock($fpOut, $ciphertext)) {
+                        $error = true;
+                        break;
+                    }
+                }
+
+                // Closes the source file
+                fclose($fpIn);
+            } else {
+                // Sets the error flag if the source file could not be opened
+                $error = true;
+            }
+
+            // Closes the destination file
+            fclose($fpOut);
+
+            // Checks if any error occurred during encryption
+            if ($error) {
+                // Deletes the destination file if an error occurred
+                if(is_file($destination)) {
+                    @unlink($destination);
+                }
+                throw new \Exception("Error while reading the main file.");
+            }
+        } else {
+            throw new \Exception("Error while writing to the destination file.");
+        }
+
+        // Returns the path of the encrypted file
+        return $destination;
+    }
+
+    /**
+     * Decrypts the given file and saves the result to a new destination file V1.
+     *
+     * @param string $source Path to the file to be decrypted (use tmp_name when from $_FILES)
+     * @param string $key Key used for decryption
+     * @param string $destination Path where the decrypted file should be saved
+     * @param string|null $permissionMode Optional file permission mode to apply to the destination file
+     * @param string $outReadMode Defines how the destination file will be opened ('w' or 'a')
+     *
+     * @return string|false Returns the path of the decrypted file or FALSE in case of error
+     * @throws \Exception
+     */
+    public static function decryptFileV1(string $source, string $key, string $destination, ?string $permissionMode, string $outReadMode = "w"): string|false {
+        if (!extension_loaded('openssl')) {
+            throw new \Exception("OpenSSL not loaded");
+        }
+
+        // Attempts to get the absolute path of the source file
+        $source = self::getRealSource($source);
+
+        // Sets the destination file path
+        $destination = self::getRealDestination($destination, $permissionMode);
+
+        // Sets the default permission mode if it's empty
+        $mode = File::getPermissionMode($permissionMode);
+
+        // Sets the IV (Initialization Vector) length using the algorithm
+        $cipher = "aes-128-cbc";
+        $version = "v1";
+        $iv_length = openssl_cipher_iv_length($cipher);
+
+        // Defines defaults for $outReadMode options
+        if (
+            empty($outReadMode) ||
+            !in_array($outReadMode, array('w', 'a'))
+        ) {
+            $outReadMode = "w";
+        }
+
+        // Sets the permission of the destination file
+        $oldMask = umask(0);
+        @chmod($destination, $mode);
+        umask($oldMask);
+
+        // Attempts to open the source file for reading
+        if ($fpIn = fopen($source, 'rb')) {
+            // Initializes the error flag
+            $error = false;
+
+            // Reads the cipher in source file
+            $fCipher = self::readLengthEncodedBlock($fpIn);
+            if ($fCipher === false) {
+                $error = true;
+            } else {
+                if ($fCipher !== $cipher) {
+                    $error = true;
+                }
+            }
+
+            // Reads the version in source file
+            $fVersion = self::readLengthEncodedBlock($fpIn);
+            if ($fVersion === false) {
+                $error = true;
+            } else {
+                if ($fVersion !== $version) {
+                    $error = true;
+                }
+            }
+
+            // Reads the salt in source file
+            $salt = self::readLengthEncodedBlock($fpIn);
+            if ($salt === false) {
+                $error = true;
+            }
+
+            // Reads the initialization vector in source file
+            $iv = self::readLengthEncodedBlock($fpIn);
+            if ($iv === false) {
+                $error = true;
+            }
+
+            $key = self::deriveKey($key, 16, $salt);
+            // Attempts to open the destination file for writing
+            if (!$error && $fpOut = fopen($destination, $outReadMode)) {
+                // Reads encrypted text blocks, decrypts them, and writes to the destination file
+                while (!feof($fpIn)) {
+                    // Reads encoded block
+                    $ciphertext = self::readLengthEncodedBlock($fpIn);
+                    if ($ciphertext === false) {
+                        $error = true;
+                        break;
+                    } else if($ciphertext === "") {
+                        break;
+                    }
+
+                    // Decrypts the encrypted text block
+                    $plaintext = openssl_decrypt(
+                        $ciphertext,
+                        $cipher,
+                        $key,
+                        OPENSSL_RAW_DATA,
+                        $iv
+                    );
+                    if ($plaintext === false) {
+                        $error = true;
+                        break;
+                    }
+
+                    // Uses the last encrypted block as the next initialization vector
+                    $iv = mb_substr($ciphertext, -$iv_length, NULL, '8bit');
+
+                    // Writes the decrypted text to the destination file
+                    if (fwrite($fpOut, $plaintext) === false) {
+                        $error = true;
+                        break;
+                    }
+                }
+                // Closes the source file
+                fclose($fpIn);
+            } else {
+                // Sets the error flag if the source file could not be opened
+                $error = true;
+            }
+
+            // Closes the destination file
+            fclose($fpOut);
+
+            // Checks if any error occurred during decryption
+            if ($error) {
+                // Deletes the destination file if an error occurred
+                if (is_file($destination)) {
+                    @unlink($destination);
+                }
+                throw new \Exception("Error while reading the main file.");
+            }
+        } else {
+            throw new \Exception("Error while writing to the destination file.");
+        }
+
+        // Returns the path of the decrypted file
+        return $destination;
+    }
+
+    /**
+     * Encrypts the given file and saves the result to a new destination file V2
+     *
+     * @param string $source Path to the file to be encrypted (use tmp_name if from $_FILES)
+     * @param string $key Encryption key to be used
+     * @param string $destination Path where the encrypted file should be saved
+     * @param string|null $salt Optional salt for key derivation
+     * @param string|null $permissionMode Optional file permission mode to apply to the destination file
+     *
+     * @return string Returns the path to the encrypted file
+     * @throws \Exception If encryption fails or file handling encounters an error
+     *
+     * @ref https://riptutorial.com/php/example/25499/symmetric-encryption-and-decryption-of-large-files-with-openssl
+     */
+    public static function encryptFileV2(string $source, string $key, string $destination, ?string $salt = null, ?string $permissionMode = null): string {
+        if (!extension_loaded('openssl')) {
+            throw new \Exception("OpenSSL not loaded");
+        }
+        $salt = (($salt ?? "") === "" ? "?" : $salt);
+        $key = self::deriveKey($key, 32, $salt);
+
+        // Attempts to get the absolute path of the source file
+        $source = self::getRealSource($source);
+
+        // Sets the destination file path
+        $destination = self::getRealDestination($destination, $permissionMode);
+
+        // Sets the default permission mode if it's empty
+        $mode = File::getPermissionMode($permissionMode);
+
+        // Sets the IV (Initialization Vector) length using the 'AES-256-gcm' algorithm
+        $cipher = "aes-256-gcm";
+        $version = "v2";
+        $iv_length = openssl_cipher_iv_length($cipher);
+        $tag_length = 16;
+
+        // Sets the permission of the destination file
+        $oldMask = umask(0);
+        @chmod($destination, $mode);
+        umask($oldMask);
+
+        // Attempts to open the destination file for writing
+        if ($fpOut = fopen($destination, 'w')) {
+            // Initializes the error flag
+            $error = false;
+
+            // Writes the cipher to the destination file
+            if(!self::writeLengthEncodedBlock($fpOut, $cipher)) {
+                $error = true;
+            }
+
+            // Writes the version to the destination file
+            if(!self::writeLengthEncodedBlock($fpOut, $version)) {
+                $error = true;
+            }
+
+            // Writes the salt to the destination file
+            if(!self::writeLengthEncodedBlock($fpOut, $salt)) {
+                $error = true;
+            }
+
+            // Attempts to open the source file for reading
+            if (!$error && $fpIn = fopen($source, 'rb')) {
+                // Reads blocks of text, encrypts them, and writes to the destination file
+                while (!feof($fpIn)) {
+                    // Reads a block from the source file
+                    $plaintext = fread($fpIn, self::getFileEncryptionBlocks());
+                    if($plaintext === false) {
+                        $error = true;
+                        break;
+                    }
+
+                    if($plaintext === "") {
+                        break;
+                    }
+
+                    // Attempts to generate a secure random vector
+                    try {
+                        $iv = random_bytes($iv_length);
+                    } catch (\Exception $e) {
+                        $iv = openssl_random_pseudo_bytes($iv_length);
+                    }
+
+                    // Encrypts the plaintext block
+                    $ciphertext = openssl_encrypt(
+                        $plaintext,
+                        $cipher,
+                        $key,
+                        OPENSSL_RAW_DATA,
+                        $iv,
+                        $tag
+                    );
+                    if($ciphertext === false) {
+                        $error = true;
+                        break;
+                    }
+                    if (mb_strlen($tag, '8bit') !== $tag_length) {
+                        $error = true;
+                        break;
+                    }
+
+                    // Encodes the encrypted iv block in base64
+                    if(!self::writeLengthEncodedBlock($fpOut, $iv)) {
+                        $error = true;
+                    }
+
+                    // Encodes the encrypted tag block in base64
+                    if(!self::writeLengthEncodedBlock($fpOut, $tag)) {
+                        $error = true;
+                    }
+
                     // Encodes the encrypted block in base64
-                    $ciphertext = base64_encode($ciphertext);
-                    // Writes the base64 string length + "-" + encrypted text to the destination file
-                    if(fwrite($fpOut, (mb_strlen($ciphertext, '8bit') . "-" . $ciphertext)) === false) {
+                    if(!self::writeLengthEncodedBlock($fpOut, $ciphertext)) {
                         $error = true;
                     }
                 }
@@ -237,11 +616,10 @@ class Security {
     }
 
     /**
-     * Decrypts the given file and saves the result to a new destination file.
+     * Decrypts the given file and saves the result to a new destination file V2.
      *
      * @param string $source Path to the file to be decrypted (use tmp_name when from $_FILES)
      * @param string $key Key used for decryption
-     * @param string|null $salt Optional salt for key derivation
      * @param string $destination Path where the decrypted file should be saved
      * @param string|null $permissionMode Optional file permission mode to apply to the destination file
      * @param string $outReadMode Defines how the destination file will be opened ('w' or 'a')
@@ -249,23 +627,25 @@ class Security {
      * @return string|false Returns the path of the decrypted file or FALSE in case of error
      * @throws \Exception
      */
-    public static function decryptFile(string $source, string $key, ?string $salt, string $destination, ?string $permissionMode, string $outReadMode = "w"): string|false {
+    public static function decryptFileV2(string $source, string $key, string $destination, ?string $permissionMode, string $outReadMode = "w"): string|false {
         if (!extension_loaded('openssl')) {
             throw new \Exception("OpenSSL not loaded");
         }
 
+        // Attempts to get the absolute path of the source file
+        $source = self::getRealSource($source);
+
+        // Sets the destination file path
+        $destination = self::getRealDestination($destination, $permissionMode);
+
         // Sets the default permission mode if it's empty
         $mode = File::getPermissionMode($permissionMode);
 
-        // Sets the IV (Initialization Vector) length using the 'AES-128-CBC' algorithm
-        $iv = null;
-        $iv_length = openssl_cipher_iv_length("AES-128-CBC");
-
-        // Checks if the key is empty or not exactly 16 bytes long
-        if (empty($key) || mb_strlen($key, '8bit') !== $iv_length) {
-            throw new \Exception("Invalid encryption key. The key must be {$iv_length} bytes long.");
-        }
-        $key = self::deriveKey($key, 16, $salt);
+        // Sets the IV (Initialization Vector) length using the algorithm
+        $cipher = "aes-256-gcm";
+        $version = "v2";
+        $iv_length = openssl_cipher_iv_length($cipher);
+        $tag_length = 16;
 
         // Defines defaults for $outReadMode options
         if (
@@ -275,91 +655,96 @@ class Security {
             $outReadMode = "w";
         }
 
-        // Attempts to get the absolute path of the source file
-        $sourceReal = realpath($source);
-        if (!empty($sourceReal)) {
-            $source = $sourceReal;
-        } elseif (!is_uploaded_file($source)) {
-            $source = false;
-        }
-
-        // Clears the sourceReal variable
-        $sourceReal = null;
-
-        // Sets the destination file path
-        $destination = realpath($destination);
-
-        // Checks the validity of the source and destination files
-        if (empty($source)) {
-            throw new \Exception("File not found to be decrypted.");
-        }
-        if (empty($destination)) {
-            throw new \Exception("Invalid destination path to generate the decrypted file.");
-        }
-
         // Sets the permission of the destination file
         $oldMask = umask(0);
         @chmod($destination, $mode);
         umask($oldMask);
 
-        // Attempts to open the destination file for writing
-        if ($fpOut = fopen($destination, $outReadMode)) {
+        // Attempts to open the source file for reading
+        if ($fpIn = fopen($source, 'rb')) {
             // Initializes the error flag
             $error = false;
 
-            // Attempts to open the source file for reading
-            if ($fpIn = fopen($source, 'rb')) {
+            // Reads the cipher in source file
+            $fCipher = self::readLengthEncodedBlock($fpIn);
+            if ($fCipher === false) {
+                $error = true;
+            } else {
+                if ($fCipher !== $cipher) {
+                    $error = true;
+                }
+            }
+
+            // Reads the version in source file
+            $fVersion = self::readLengthEncodedBlock($fpIn);
+            if ($fVersion === false) {
+                $error = true;
+            } else {
+                if ($fVersion !== $version) {
+                    $error = true;
+                }
+            }
+
+            // Reads the salt in source file
+            $salt = self::readLengthEncodedBlock($fpIn);
+            if ($salt === false) {
+                $error = true;
+            }
+
+            $key = self::deriveKey($key, 32, $salt);
+            // Attempts to open the destination file for writing
+            if (!$error && $fpOut = fopen($destination, $outReadMode)) {
                 // Reads encrypted text blocks, decrypts them, and writes to the destination file
                 while (!feof($fpIn)) {
-                    // Reads character by character until the next "-", to get the length of the next base64 string
-                    $lenB64 = "";
-                    while (!feof($fpIn)) {
-                        $char = fgetc($fpIn);
-                        if ($char === "-" || $char === false) {
-                            break;
-                        }
-
-                        $lenB64 .= $char;
-                    }
-
-                    $lenB64 = Str::onlyNumbers($lenB64);
-                    if (empty($lenB64)) {
+                    // Reads encoded iv block
+                    $iv = self::readLengthEncodedBlock($fpIn);
+                    if ($iv === false) {
+                        $error = true;
+                        break;
+                    } else if($iv === "") {
                         break;
                     }
-                    $lenB64 *= 1;
-
-                    // Reads a block from the source file
-                    $ciphertext = fread($fpIn, $lenB64);
-                    if ($ciphertext === false) {
+                    if (mb_strlen($iv, '8bit') !== $iv_length) {
                         $error = true;
+                        break;
                     }
 
-                    // Decrypts the base64 block
-                    $ciphertext = base64_decode($ciphertext, true);
+                    // Reads encoded tag block
+                    $tag = self::readLengthEncodedBlock($fpIn);
+                    if ($tag === false || $tag === "") {
+                        $error = true;
+                        break;
+                    } 
+                    if (mb_strlen($tag, '8bit') !== $tag_length) {
+                        $error = true;
+                        break;
+                    }
 
-                    if (empty($iv)) {
-                        // Reads the initialization vector from the source file
-                        $iv = $ciphertext;
-                    } else {
-                        // Decrypts the encrypted text block
-                        $plaintext = openssl_decrypt(
-                            $ciphertext,
-                            "AES-128-CBC",
-                            $key,
-                            OPENSSL_RAW_DATA,
-                            $iv
-                        );
-                        if ($plaintext === false) {
-                            $error = true;
-                        }
+                    // Reads encoded block
+                    $ciphertext = self::readLengthEncodedBlock($fpIn);
+                    if ($ciphertext === false || $ciphertext === "") {
+                        $error = true;
+                        break;
+                    }
 
-                        // Uses the last encrypted block as the next initialization vector
-                        $iv = mb_substr($ciphertext, 0, $iv_length, '8bit');
+                    // Decrypts the encrypted text block
+                    $plaintext = openssl_decrypt(
+                        $ciphertext,
+                        $cipher,
+                        $key,
+                        OPENSSL_RAW_DATA,
+                        $iv,
+                        $tag
+                    );
+                    if ($plaintext === false) {
+                        $error = true;
+                        break;
+                    }
 
-                        // Writes the decrypted text to the destination file
-                        if (fwrite($fpOut, $plaintext) === false) {
-                            $error = true;
-                        }
+                    // Writes the decrypted text to the destination file
+                    if (fwrite($fpOut, $plaintext) === false) {
+                        $error = true;
+                        break;
                     }
                 }
                 // Closes the source file
@@ -412,8 +797,9 @@ class Security {
         }
         $str = (string) $str;
 
-        if (empty($key) || mb_strlen($key, '8bit') !== 32) {
-            throw new \Exception("Invalid encryption key. The key must be 32 bytes long.");
+        // Checks if the key is empty or it does not has the min length
+        if (empty($key) || mb_strlen($key, '8bit') < 16) {
+            throw new \Exception("Invalid encryption key. The key must be at least 16 bytes long.");
         }
         $key = self::deriveKey($key, 32, $salt);
 
@@ -472,8 +858,9 @@ class Security {
             return "";
         }
 
-        if (empty($key) || mb_strlen($key, '8bit') !== 32) {
-            throw new \Exception("Invalid decryption key. The key must be 32 bytes long.");
+        // Checks if the key is empty or it does not has the min length
+        if (empty($key) || mb_strlen($key, '8bit') < 16) {
+            throw new \Exception("Invalid encryption key. The key must be at least 16 bytes long.");
         }
         $key = self::deriveKey($key, 32, $salt);
 
@@ -541,15 +928,16 @@ class Security {
         }
         $str = (string) $str;
 
-        if (empty($key) || mb_strlen($key, '8bit') !== 32) {
-            throw new \Exception("Invalid encryption key. The key must be exactly 32 bytes long.");
+        // Checks if the key is empty or it does not has the min length
+        if (empty($key) || mb_strlen($key, '8bit') < 16) {
+            throw new \Exception("Invalid encryption key. The key must be at least 16 bytes long.");
         }
         $key = self::deriveKey($key, 32, $salt);
 
         // Derive encryption and authentication keys using HKDF
         [$encKey, $authKey] = [
-            hash_hkdf("sha256", $key, 32, "LOCAL-ENC"),
-            hash_hkdf("sha256", $key, 32, "LOCAL-AUTH"),
+            hash_hkdf("sha256", $key, 32, "local-encryption"),
+            hash_hkdf("sha256", $key, 32, "local-authentication"),
         ];
         
         $cipher = "aes-256-ctr";
@@ -604,15 +992,16 @@ class Security {
             return "";
         }
 
-        if (empty($key) || mb_strlen($key, '8bit') !== 32) {
-            throw new \Exception("Invalid encryption key. The key must be exactly 32 bytes long.");
+        // Checks if the key is empty or it does not has the min length
+        if (empty($key) || mb_strlen($key, '8bit') < 16) {
+            throw new \Exception("Invalid encryption key. The key must be at least 16 bytes long.");
         }
         $key = self::deriveKey($key, 32, $salt);
 
         // Derive encryption and authentication keys using HKDF
         [$encKey, $authKey] = [
-            hash_hkdf("sha256", $key, 32, "LOCAL-ENC"),
-            hash_hkdf("sha256", $key, 32, "LOCAL-AUTH"),
+            hash_hkdf("sha256", $key, 32, "local-encryption"),
+            hash_hkdf("sha256", $key, 32, "local-authentication"),
         ];
 
         // Decode Base64 (custom function)
@@ -672,8 +1061,10 @@ class Security {
         if ($var === null || $var === "") {
             return $var;
         }
-        if (empty($key) || mb_strlen($key, '8bit') !== 32) {
-            throw new \Exception("Invalid encryption key. The key must be 32 bytes long.");
+
+        // Checks if the key is empty or it does not has the min length
+        if (empty($key) || mb_strlen($key, '8bit') < 16) {
+            throw new \Exception("Invalid encryption key. The key must be at least 16 bytes long.");
         }
         $key = self::deriveKey($key, 32, $salt);
 
@@ -709,8 +1100,10 @@ class Security {
         if ($encrypted === null || $encrypted === "") {
             return $encrypted;
         }
-        if (empty($key) || mb_strlen($key, '8bit') !== 32) {
-            throw new \Exception("Invalid encryption key. The key must be 32 bytes long.");
+
+        // Checks if the key is empty or it does not has the min length
+        if (empty($key) || mb_strlen($key, '8bit') < 16) {
+            throw new \Exception("Invalid encryption key. The key must be at least 16 bytes long.");
         }
         $key = self::deriveKey($key, 32, $salt);
 
@@ -758,17 +1151,17 @@ class Security {
             return call_user_func($fnName, $item, $key, $salt);
         }
 
-        $key = null;
-        $value = null;
-        foreach ($item as $key => $value) {
-            if (!is_array($value) && !is_object($value)) {
-                $item[$key] = call_user_func($fnName, $value, $key, $salt);
+        $keyItem = null;
+        $valueItem = null;
+        foreach ($item AS $keyItem => $valueItem) {
+            if (!is_array($valueItem) && !is_object($valueItem)) {
+                $item[$key] = call_user_func($fnName, $valueItem, $key, $salt);
             } else {
-                $item[$key] = self::applySecurityFunctionArray($value, $key, $salt, $fnName);
+                $item[$key] = self::applySecurityFunctionArray($valueItem, $key, $salt, $fnName);
             }
         }
-        $key = null;
-        $value = null;
+        $keyItem = null;
+        $valueItem = null;
 
         return $item;
     }
@@ -834,7 +1227,11 @@ class Security {
             }
         }
 
-        return $xssClean($input);
+        if (is_string($input)) {
+            return $xssClean($input);
+        }
+
+        return $input;
     }
 
     /**
@@ -979,7 +1376,7 @@ class Security {
     }
 
     /**
-     * Encrypts a password using the Whirlpool hash algorithm.
+     * Encrypts a password using hash algorithm.
      *
      * @param string|null $password Password to be encrypted
      *
@@ -987,9 +1384,20 @@ class Security {
      */
     public static function encryptPassword(?string $password): string {
         if (empty($password)) {
-            return '';
+            return "";
         }
 
-        return strtoupper(hash('whirlpool', $password));
+        return password_hash($password, PASSWORD_ARGON2ID);
+    }
+
+    /**
+     * Verify a password using hash algorithm.
+     *
+     * @param string|null $password Password to be verified
+     *
+     * @return bool
+     */
+    public static function verifyPassword(string $password, string $hash): bool {
+        return password_verify($password, $hash);
     }
 }
