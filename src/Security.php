@@ -43,75 +43,6 @@ class Security {
             ($salt ?? "")
         );
     }
-
-    /**
-     * Returns the number of encryption blocks to read per iteration.
-     * If no value is set, the default (3.200.000) will be returned and set.
-     *
-     * @return int
-     */
-    public static function getFileEncryptionBlocks(): int
-    {
-        if (empty(self::$fileEncryptionBlocks)) {
-            self::setFileEncryptionBlocks(3200000);
-        }
-
-        return self::$fileEncryptionBlocks;
-    }
-
-    /**
-     * Sets the number of encryption blocks to be used during file processing.
-     * Accepts null, in which case the default will be used on next get.
-     *
-     * @param int|null $fileEncryptionBlocks
-     * @return void
-     */
-    public static function setFileEncryptionBlocks(?int $fileEncryptionBlocks): void
-    {
-        if (empty($fileEncryptionBlocks) || $fileEncryptionBlocks < 0) {
-            return;
-        }
-
-        self::$fileEncryptionBlocks = $fileEncryptionBlocks;
-    }
-
-    /**
-     * Generates a search hash for a given string using HMAC with a derived key.
-     * This function is used to create a consistent hash for search purposes, allowing for secure comparisons without exposing the original data.
-     * 
-     * @param mixed $str The input string to generate the search hash for
-     * @param string $key Base key to derive the search hash key from
-     * @param string|null $salt (Optional) Salt value to add randomness to the derived search hash key
-     * 
-     * @throws \Exception
-     * @return string
-     */
-    public static function generateSearchHash(mixed $str, string $key, ?string $salt = ""): string {
-        if ($str === null || $str === "") {
-            return "";
-        }
-
-        if(is_bool($str)) {
-            $str = (int) $str;
-        }
-        $str = (string) $str;
-
-        // Checks if the key is empty or it does not has the min length
-        if (empty($key) || mb_strlen($key, '8bit') < 16) {
-            throw new \Exception("Invalid encryption key. The key must be at least 16 bytes long.");
-        }
-
-        $keySearch = hash_hkdf(
-            'sha256',
-            $key,
-            32,
-            'search-hash',
-            $salt
-        );
-
-        // hex: 64 caracteres
-        return hash_hmac('sha256', $str, $keySearch);
-    }
     
     /**
      * Reads a length-encoded block from the given file pointer.
@@ -160,7 +91,7 @@ class Security {
      */
     private static function writeLengthEncodedBlock($fp, $text): string|false {
         $textEncoded = base64_encode($text);
-        if (fwrite($fpOut, (mb_strlen($textEncoded, '8bit') . "-" . $textEncoded)) === false) {
+        if (fwrite($fp, (mb_strlen($textEncoded, '8bit') . "-" . $textEncoded)) === false) {
             return false;
         }
 
@@ -235,6 +166,75 @@ class Security {
         }
 
         return $ret;
+    }
+
+    /**
+     * Returns the number of encryption blocks to read per iteration.
+     * If no value is set, the default (3.200.000) will be returned and set.
+     *
+     * @return int
+     */
+    public static function getFileEncryptionBlocks(): int
+    {
+        if (empty(self::$fileEncryptionBlocks)) {
+            self::setFileEncryptionBlocks(3200000);
+        }
+
+        return self::$fileEncryptionBlocks;
+    }
+
+    /**
+     * Sets the number of encryption blocks to be used during file processing.
+     * Accepts null, in which case the default will be used on next get.
+     *
+     * @param int|null $fileEncryptionBlocks
+     * @return void
+     */
+    public static function setFileEncryptionBlocks(?int $fileEncryptionBlocks): void
+    {
+        if (empty($fileEncryptionBlocks) || $fileEncryptionBlocks < 0) {
+            return;
+        }
+
+        self::$fileEncryptionBlocks = $fileEncryptionBlocks;
+    }
+
+    /**
+     * Generates a search hash for a given string using HMAC with a derived key.
+     * This function is used to create a consistent hash for search purposes, allowing for secure comparisons without exposing the original data.
+     * 
+     * @param mixed $str The input string to generate the search hash for
+     * @param string $key Base key to derive the search hash key from
+     * @param string|null $salt (Optional) Salt value to add randomness to the derived search hash key
+     * 
+     * @throws \Exception
+     * @return string
+     */
+    public static function generateSearchHash(mixed $str, string $key, ?string $salt = ""): string {
+        if ($str === null || $str === "") {
+            return "";
+        }
+
+        if(is_bool($str)) {
+            $str = (int) $str;
+        }
+        $str = (string) $str;
+
+        // Checks if the key is empty or it does not has the min length
+        if (empty($key) || mb_strlen($key, '8bit') < 16) {
+            throw new \Exception("Invalid encryption key. The key must be at least 16 bytes long.");
+        }
+
+        $keySearch = hash_hkdf(
+            'sha256',
+            $key,
+            32,
+            'search-hash',
+            $salt
+        );
+
+        // hex: 64 caracteres
+        return hash_hmac('sha256', $str, $keySearch);
     }
 
     /**
