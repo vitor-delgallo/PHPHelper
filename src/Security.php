@@ -49,10 +49,11 @@ class Security {
      *
      * @param resource $fp File pointer opened for reading
      *
-     * @return string|false Returns the decoded block content, an empty string for an empty block,
-     *                      or false if the block length is invalid or the data cannot be fully read
+     * @return string|bool  Returns the decoded block content, an empty string for an empty block,
+     *                      false if the block length is invalid or the data cannot be fully read
+     *                      true if it has reached the end of file
      */
-    private static function readLengthEncodedBlock($fp): string|false {
+    private static function readLengthEncodedBlock($fp): string|bool {
         $lenData = "";
         while (!feof($fp)) {
             $char = fgetc($fp);
