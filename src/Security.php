@@ -13,7 +13,7 @@ class Security {
      *
      * @var int
      */
-    private static int $fileEncryptionBlocks = 0;
+    private static int $fileEncryptBlocksMB = 0;
 
     /**
      * Derives a key of the specified length from the given key & salt using HKDF with SHA-256.
@@ -166,34 +166,34 @@ class Security {
     }
 
     /**
-     * Returns the number of encryption blocks to read per iteration.
+     * Returns the mb of encryption blocks to read per iteration.
      * If no value is set, the default (3.200.000) will be returned and set.
      *
      * @return int
      */
-    public static function getFileEncryptionBlocks(): int
+    public static function getFileEncryptBlocksMB(): int
     {
-        if (empty(self::$fileEncryptionBlocks)) {
+        if (empty(self::$fileEncryptBlocksMB)) {
             self::setFileEncryptionBlocks(3200000);
         }
 
-        return self::$fileEncryptionBlocks;
+        return self::$fileEncryptBlocksMB;
     }
 
     /**
-     * Sets the number of encryption blocks to be used during file processing.
+     * Sets the mb of encryption blocks to be used during file processing.
      * Accepts null, in which case the default will be used on next get.
      *
-     * @param int|null $fileEncryptionBlocks
+     * @param int|null $fileEncryptBlocksMB
      * @return void
      */
-    public static function setFileEncryptionBlocks(?int $fileEncryptionBlocks): void
+    public static function setFileEncryptBlocksMB(?int $fileEncryptBlocksMB): void
     {
-        if (empty($fileEncryptionBlocks) || $fileEncryptionBlocks < 0) {
+        if (empty($fileEncryptBlocksMB) || $fileEncryptBlocksMB < 0) {
             return;
         }
 
-        self::$fileEncryptionBlocks = $fileEncryptionBlocks;
+        self::$fileEncryptBlocksMB = $fileEncryptBlocksMB;
     }
 
     /**
@@ -288,22 +288,22 @@ class Security {
 
             // Writes the cipher to the destination file
             if(!self::writeLengthEncodedBlock($fpOut, $cipher)) {
-                $error = true;
+                $error = "Error on writing cipher type";
             }
 
             // Writes the version to the destination file
             if(!self::writeLengthEncodedBlock($fpOut, $version)) {
-                $error = true;
+                $error = "Error on writing cipher version";
             }
 
             // Writes the salt to the destination file
             if(!self::writeLengthEncodedBlock($fpOut, $salt)) {
-                $error = true;
+                $error = "Error on writing cipher salt";
             }
 
             // Writes the initialization vector to the destination file
             if(!self::writeLengthEncodedBlock($fpOut, $iv)) {
-                $error = true;
+                $error = "Error on writing cipher initialization IV";
             }
 
             // Attempts to open the source file for reading
@@ -313,7 +313,7 @@ class Security {
                     // Reads a block from the source file
                     $plaintext = fread($fpIn, self::getFileEncryptionBlocks());
                     if($plaintext === false) {
-                        $error = true;
+                        $error = "Error on reading plaintext";
                         break;
                     }
 
@@ -330,7 +330,7 @@ class Security {
                         $iv
                     );
                     if($ciphertext === false) {
-                        $error = true;
+                        $error = "Error on creating cipher of plaintext";
                         break;
                     }
 
@@ -339,16 +339,16 @@ class Security {
                     
                     // Writes the encoded block to the destination file
                     if(!self::writeLengthEncodedBlock($fpOut, $ciphertext)) {
-                        $error = true;
+                        $error = "Error on writing ciphertext";
                         break;
                     }
                 }
 
                 // Closes the source file
                 fclose($fpIn);
-            } else {
+            } else if(!$error) {
                 // Sets the error flag if the source file could not be opened
-                $error = true;
+                $error = "Error on opening source file stream";
             }
 
             // Closes the destination file
@@ -360,7 +360,7 @@ class Security {
                 if(is_file($destination)) {
                     @unlink($destination);
                 }
-                throw new \Exception("Error while reading the main file.");
+                throw new \Exception($error);
             }
         } else {
             throw new \Exception("Error while writing to the destination file.");
@@ -422,7 +422,7 @@ class Security {
             // Reads the cipher in source file
             $fCipher = self::readLengthEncodedBlock($fpIn);
             if ($fCipher === false) {
-                $error = true;
+                $error = "Error on reading cipher type";
             } else {
                 if ($fCipher !== $cipher) {
                     $error = true;
@@ -432,7 +432,7 @@ class Security {
             // Reads the version in source file
             $fVersion = self::readLengthEncodedBlock($fpIn);
             if ($fVersion === false) {
-                $error = true;
+                $error = "Error on reading cipher version";
             } else {
                 if ($fVersion !== $version) {
                     $error = true;
@@ -442,13 +442,13 @@ class Security {
             // Reads the salt in source file
             $salt = self::readLengthEncodedBlock($fpIn);
             if ($salt === false) {
-                $error = true;
+                $error = "Error on reading cipher salt";
             }
 
             // Reads the initialization vector in source file
             $iv = self::readLengthEncodedBlock($fpIn);
             if ($iv === false) {
-                $error = true;
+                $error = "Error on reading cipher initialization IV";
             }
 
             $key = self::deriveKey($key, 16, $salt);
@@ -459,7 +459,7 @@ class Security {
                     // Reads encoded block
                     $ciphertext = self::readLengthEncodedBlock($fpIn);
                     if ($ciphertext === false) {
-                        $error = true;
+                        $error = "Error on reading ciphertext";
                         break;
                     } else if($ciphertext === "") {
                         break;
@@ -474,7 +474,7 @@ class Security {
                         $iv
                     );
                     if ($plaintext === false) {
-                        $error = true;
+                        $error = "Error on creating plaintext of a ciphertext";
                         break;
                     }
 
@@ -483,7 +483,7 @@ class Security {
 
                     // Writes the decrypted text to the destination file
                     if (fwrite($fpOut, $plaintext) === false) {
-                        $error = true;
+                        $error = "Error on writing plaintext";
                         break;
                     }
                 }
@@ -491,7 +491,7 @@ class Security {
                 fclose($fpIn);
             } else {
                 // Sets the error flag if the source file could not be opened
-                $error = true;
+                $error = "Error while writing to the destination file.";
             }
 
             // Closes the destination file
@@ -503,10 +503,10 @@ class Security {
                 if (is_file($destination)) {
                     @unlink($destination);
                 }
-                throw new \Exception("Error while reading the main file.");
+                throw new \Exception($error);
             }
         } else {
-            throw new \Exception("Error while writing to the destination file.");
+            throw new \Exception("Error while reading the source file.");
         }
 
         // Returns the path of the decrypted file
@@ -561,17 +561,17 @@ class Security {
 
             // Writes the cipher to the destination file
             if(!self::writeLengthEncodedBlock($fpOut, $cipher)) {
-                $error = true;
+                $error = "Error on writing cipher type";
             }
 
             // Writes the version to the destination file
             if(!self::writeLengthEncodedBlock($fpOut, $version)) {
-                $error = true;
+                $error = "Error on writing cipher version";
             }
 
             // Writes the salt to the destination file
             if(!self::writeLengthEncodedBlock($fpOut, $salt)) {
-                $error = true;
+                $error = "Error on writing cipher salt";
             }
 
             // Attempts to open the source file for reading
@@ -581,7 +581,7 @@ class Security {
                     // Reads a block from the source file
                     $plaintext = fread($fpIn, self::getFileEncryptionBlocks());
                     if($plaintext === false) {
-                        $error = true;
+                        $error = "Error on reading plaintext";
                         break;
                     }
 
@@ -606,27 +606,30 @@ class Security {
                         $tag
                     );
                     if($ciphertext === false) {
-                        $error = true;
+                        $error = "Error on creating cipher of plaintext";
                         break;
                     }
                     if (mb_strlen($tag, '8bit') !== $tag_length) {
-                        $error = true;
+                        $error = "Error on validating tag length";
                         break;
                     }
 
                     // Encodes the encrypted iv block in base64
                     if(!self::writeLengthEncodedBlock($fpOut, $iv)) {
-                        $error = true;
+                        $error = "Error on writing IV ciphertext";
+                        break;
                     }
 
                     // Encodes the encrypted tag block in base64
                     if(!self::writeLengthEncodedBlock($fpOut, $tag)) {
-                        $error = true;
+                        $error = "Error on writing tag ciphertext";
+                        break;
                     }
 
                     // Encodes the encrypted block in base64
                     if(!self::writeLengthEncodedBlock($fpOut, $ciphertext)) {
-                        $error = true;
+                        $error = "Error on writing ciphertext";
+                        break;
                     }
                 }
 
@@ -634,7 +637,7 @@ class Security {
                 fclose($fpIn);
             } else {
                 // Sets the error flag if the source file could not be opened
-                $error = true;
+                $error = "Error on opening source file stream";
             }
 
             // Closes the destination file
@@ -646,7 +649,7 @@ class Security {
                 if(is_file($destination)) {
                     @unlink($destination);
                 }
-                throw new \Exception("Error while reading the main file.");
+                throw new \Exception($error);
             }
         } else {
             throw new \Exception("Error while writing to the destination file.");
@@ -709,7 +712,7 @@ class Security {
             // Reads the cipher in source file
             $fCipher = self::readLengthEncodedBlock($fpIn);
             if ($fCipher === false) {
-                $error = true;
+                $error = "Error on reading cipher type";
             } else {
                 if ($fCipher !== $cipher) {
                     $error = true;
@@ -719,7 +722,7 @@ class Security {
             // Reads the version in source file
             $fVersion = self::readLengthEncodedBlock($fpIn);
             if ($fVersion === false) {
-                $error = true;
+                $error = "Error on reading cipher version";
             } else {
                 if ($fVersion !== $version) {
                     $error = true;
@@ -729,7 +732,7 @@ class Security {
             // Reads the salt in source file
             $salt = self::readLengthEncodedBlock($fpIn);
             if ($salt === false) {
-                $error = true;
+                $error = "Error on reading cipher salt";
             }
 
             $key = self::deriveKey($key, 32, $salt);
@@ -740,31 +743,31 @@ class Security {
                     // Reads encoded iv block
                     $iv = self::readLengthEncodedBlock($fpIn);
                     if ($iv === false) {
-                        $error = true;
+                        $error = "Error on reading IV ciphertext";
                         break;
                     } else if($iv === "") {
                         break;
                     }
                     if (mb_strlen($iv, '8bit') !== $iv_length) {
-                        $error = true;
+                        $error = "Error on validating iv length";
                         break;
                     }
 
                     // Reads encoded tag block
                     $tag = self::readLengthEncodedBlock($fpIn);
                     if ($tag === false || $tag === "") {
-                        $error = true;
+                        $error = "Error on reading tag ciphertext";
                         break;
                     } 
                     if (mb_strlen($tag, '8bit') !== $tag_length) {
-                        $error = true;
+                        $error = "Error on validating tag length";
                         break;
                     }
 
                     // Reads encoded block
                     $ciphertext = self::readLengthEncodedBlock($fpIn);
                     if ($ciphertext === false || $ciphertext === "") {
-                        $error = true;
+                        $error = "Error on reading ciphertext";
                         break;
                     }
 
@@ -778,13 +781,13 @@ class Security {
                         $tag
                     );
                     if ($plaintext === false) {
-                        $error = true;
+                        $error = "Error on creating plaintext of a ciphertext";
                         break;
                     }
 
                     // Writes the decrypted text to the destination file
                     if (fwrite($fpOut, $plaintext) === false) {
-                        $error = true;
+                        $error = "Error on writing plaintext";
                         break;
                     }
                 }
@@ -792,7 +795,7 @@ class Security {
                 fclose($fpIn);
             } else {
                 // Sets the error flag if the source file could not be opened
-                $error = true;
+                $error = "Error while writing to the destination file.";
             }
 
             // Closes the destination file
@@ -804,10 +807,10 @@ class Security {
                 if (is_file($destination)) {
                     @unlink($destination);
                 }
-                throw new \Exception("Error while reading the main file.");
+                throw new \Exception($error);
             }
         } else {
-            throw new \Exception("Error while writing to the destination file.");
+            throw new \Exception("Error while reading the source file.");
         }
 
         // Returns the path of the decrypted file
