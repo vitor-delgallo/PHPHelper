@@ -147,20 +147,14 @@ class Security {
             throw new \Exception("Invalid destination path provided for writing!");
         }
 
-        $destPath['dir'] = realpath(File::getPath(dir: $destPath['dir'], createPath: ($permissionMode == null ? true : $permissionMode)));
-        if(empty($destPath['dir'])) {
-            throw new \Exception("Invalid destination directory path provided for file writing!");
+        if(File::createDir($destPath['dir'], NULL) <= 0) {
+            throw new \Exception("Error on creating destination path!");
         }
-        if(Str::subStr($destPath['dir'], -1) !== DIRECTORY_SEPARATOR) $destPath['dir'] .= DIRECTORY_SEPARATOR;
-        $destPath['path'] = $destPath['dir'] . $destPath['file'];
-        
-        $ret = $destPath["path"];
-        $destPath = null;
 
-        // Checks the validity of the destination files
-        if (empty($ret)) {
-            throw new \Exception("Invalid file destination to generate the encrypted file.");
-        }
+        $ret = realpath($destPath['dir']);
+        if(Str::subStr($ret, -1) !== DIRECTORY_SEPARATOR) $ret.= DIRECTORY_SEPARATOR;
+        $ret .= $destPath['file'];
+        $destPath = null;
 
         return $ret;
     }
