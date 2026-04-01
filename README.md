@@ -20,7 +20,6 @@ A modern, modular and extensible utility library for PHP 8+, built for real-worl
 
 These classes are auto-loaded under the namespace `VD\PHPHelper`:
 
-- `DataTable` – tabular data structure utilities
 - `DateTime` – date formatting, age calculation, diff tools
 - `DBF` – legacy DBF file support
 - `File` – file handling and utility helpers

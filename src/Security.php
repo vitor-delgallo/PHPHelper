@@ -18,6 +18,26 @@ class Security {
     private static int $fileEncryptionBlocks = 0;
 
     /**
+     * Derives a key of the specified length from the given key & salt using HKDF with SHA-256.
+     * This function is used to generate encryption keys of the required length from a base key.
+     * 
+     * @param string $key Base key to derive from
+     * @param int $length Desired length of the derived key in bytes
+     * @param string|null $salt Optional salt value to add randomness to the derived key
+     * 
+     * @return string
+     */
+    private static function deriveKey(string $key, int $length, ?string $salt = ""): string {
+        return hash_hkdf(
+            'sha256',
+            $key,
+            $length,
+            'derived-key',
+            ($salt ?? "")
+        );
+    }
+
+    /**
      * Returns the number of encryption blocks to read per iteration.
      * If no value is set, the default (37,500) will be returned and set.
      *
@@ -49,10 +69,47 @@ class Security {
     }
 
     /**
+     * Generates a search hash for a given string using HMAC with a derived key.
+     * This function is used to create a consistent hash for search purposes, allowing for secure comparisons without exposing the original data.
+     * 
+     * @param mixed $str The input string to generate the search hash for
+     * @param string $key Base key to derive the search hash key from
+     * @param string $salt Salt value to add randomness to the derived search hash key
+     * 
+     * @throws \Exception
+     * @return string
+     */
+    public static function generateSearchHash(mixed $str, string $key, string $salt): string {
+        if ($str === null || $str === "") {
+            return "";
+        }
+
+        if(is_bool($str)) {
+            $str = (int) $str;
+        }
+        $str = (string) $str;
+
+        if (empty($key) || mb_strlen($key, '8bit') !== 32) {
+            throw new \Exception("Invalid encryption key. The key must be 32 bytes long.");
+        }
+        $keySearch = hash_hkdf(
+            'sha256',
+            $key,
+            32,
+            'search-hash',
+            $salt
+        );
+
+        // hex: 64 caracteres
+        return hash_hmac('sha256', $str, $keySearch);
+    }
+
+    /**
      * Encrypts the given file and saves the result to a new destination file.
      *
      * @param string $source Path to the file to be encrypted (use tmp_name if from $_FILES)
      * @param string $key Encryption key to be used
+     * @param string|null $salt Optional salt for key derivation
      * @param string $destination Path where the encrypted file should be saved
      * @param string|null $permissionMode Optional file permission mode to apply to the destination file
      *
@@ -61,7 +118,7 @@ class Security {
      *
      * @ref https://riptutorial.com/php/example/25499/symmetric-encryption-and-decryption-of-large-files-with-openssl
      */
-    public static function encryptFile(string $source, string $key, string $destination, ?string $permissionMode = null): string {
+    public static function encryptFile(string $source, string $key, ?string $salt, string $destination, ?string $permissionMode = null): string {
         if (!extension_loaded('openssl')) {
             throw new \Exception("OpenSSL not loaded");
         }
@@ -73,9 +130,10 @@ class Security {
         $iv_length = openssl_cipher_iv_length("AES-128-CBC");
 
         // Checks if the key is empty or not exactly 16 bytes long
-        if (empty($key) || strlen($key) !== $iv_length) {
+        if (empty($key) || mb_strlen($key, '8bit') !== $iv_length) {
             throw new \Exception("Invalid encryption key. The key must be {$iv_length} bytes long.");
         }
+        $key = self::deriveKey($key, 16, $salt);
 
         // Attempts to get the absolute path of the source file
         $sourceReal = realpath($source);
@@ -106,8 +164,6 @@ class Security {
             $iv = openssl_random_pseudo_bytes($iv_length);
         }
 
-        // Derives the encryption key using the whirlpool hash function
-        $encryption_key = substr(hash('whirlpool', $key, true), 0, $iv_length);
 
         // Sets the permission of the destination file
         $oldMask = umask(0);
@@ -120,7 +176,7 @@ class Security {
             $error = false;
 
             // Writes the initialization vector to the destination file
-            if(fwrite($fpOut, (strlen(base64_encode($iv)) . "-" . base64_encode($iv))) === false) {
+            if(fwrite($fpOut, (mb_strlen(base64_encode($iv), '8bit') . "-" . base64_encode($iv))) === false) {
                 $error = true;
             }
 
@@ -137,7 +193,7 @@ class Security {
                     $ciphertext = openssl_encrypt(
                         $plaintext,
                         "AES-128-CBC",
-                        $encryption_key,
+                        $key,
                         OPENSSL_RAW_DATA,
                         $iv
                     );
@@ -145,11 +201,11 @@ class Security {
                         $error = true;
                     }
                     // Uses the last encrypted block as the next initialization vector
-                    $iv = substr($ciphertext, 0, $iv_length);
+                    $iv = mb_substr($ciphertext, 0, $iv_length, '8bit');
                     // Encodes the encrypted block in base64
                     $ciphertext = base64_encode($ciphertext);
                     // Writes the base64 string length + "-" + encrypted text to the destination file
-                    if(fwrite($fpOut, (strlen($ciphertext) . "-" . $ciphertext)) === false) {
+                    if(fwrite($fpOut, (mb_strlen($ciphertext, '8bit') . "-" . $ciphertext)) === false) {
                         $error = true;
                     }
                 }
@@ -185,6 +241,7 @@ class Security {
      *
      * @param string $source Path to the file to be decrypted (use tmp_name when from $_FILES)
      * @param string $key Key used for decryption
+     * @param string|null $salt Optional salt for key derivation
      * @param string $destination Path where the decrypted file should be saved
      * @param string|null $permissionMode Optional file permission mode to apply to the destination file
      * @param string $outReadMode Defines how the destination file will be opened ('w' or 'a')
@@ -192,7 +249,7 @@ class Security {
      * @return string|false Returns the path of the decrypted file or FALSE in case of error
      * @throws \Exception
      */
-    public static function decryptFile(string $source, string $key, string $destination, ?string $permissionMode, string $outReadMode = "w"): string|false {
+    public static function decryptFile(string $source, string $key, ?string $salt, string $destination, ?string $permissionMode, string $outReadMode = "w"): string|false {
         if (!extension_loaded('openssl')) {
             throw new \Exception("OpenSSL not loaded");
         }
@@ -205,9 +262,10 @@ class Security {
         $iv_length = openssl_cipher_iv_length("AES-128-CBC");
 
         // Checks if the key is empty or not exactly 16 bytes long
-        if (empty($key) || strlen($key) !== $iv_length) {
+        if (empty($key) || mb_strlen($key, '8bit') !== $iv_length) {
             throw new \Exception("Invalid encryption key. The key must be {$iv_length} bytes long.");
         }
+        $key = self::deriveKey($key, 16, $salt);
 
         // Defines defaults for $outReadMode options
         if (
@@ -238,9 +296,6 @@ class Security {
         if (empty($destination)) {
             throw new \Exception("Invalid destination path to generate the decrypted file.");
         }
-
-        // Derives the decryption key using the whirlpool hash function
-        $encryption_key = substr(hash('whirlpool', $key, true), 0, $iv_length);
 
         // Sets the permission of the destination file
         $oldMask = umask(0);
@@ -290,7 +345,7 @@ class Security {
                         $plaintext = openssl_decrypt(
                             $ciphertext,
                             "AES-128-CBC",
-                            $encryption_key,
+                            $key,
                             OPENSSL_RAW_DATA,
                             $iv
                         );
@@ -299,7 +354,7 @@ class Security {
                         }
 
                         // Uses the last encrypted block as the next initialization vector
-                        $iv = substr($ciphertext, 0, $iv_length);
+                        $iv = mb_substr($ciphertext, 0, $iv_length, '8bit');
 
                         // Writes the decrypted text to the destination file
                         if (fwrite($fpOut, $plaintext) === false) {
@@ -336,13 +391,14 @@ class Security {
     /**
      * Encrypts a string using a key with the "aes-256-gcm" algorithm.
      *
-     * @param string|float|int|bool|null $str The string to encrypt
-     * @param string|null $key The encryption key
+     * @param mixed $str The string to encrypt
+     * @param string $key The encryption key
+     * @param string|null $salt Optional salt for key derivation
      *
      * @return string
      * @throws \Exception
      */
-    public static function encryptDataDB(string|float|int|bool|null $str, ?string $key): string {
+    public static function encryptDataDB(mixed $str, string $key, ?string $salt = ""): string {
         if (!extension_loaded('openssl')) {
             throw new \Exception("OpenSSL not loaded");
         }
@@ -356,12 +412,15 @@ class Security {
         }
         $str = (string) $str;
 
-        if (empty($key) || strlen($key) !== 32) {
+        if (empty($key) || mb_strlen($key, '8bit') !== 32) {
             throw new \Exception("Invalid encryption key. The key must be 32 bytes long.");
         }
+        $key = self::deriveKey($key, 32, $salt);
 
         // Defines the IV (Initialization Vector) length using the 'aes-256-gcm' algorithm
-        $ivLength = openssl_cipher_iv_length("aes-256-gcm");
+        $cipher = "aes-256-gcm";
+        $ivLength = openssl_cipher_iv_length($cipher);
+        $tagLength = 16;
 
         // Generates a random IV. The IV size depends on the algorithm used.
         try {
@@ -374,28 +433,37 @@ class Security {
         // The $tag value is generated after encryption and is used to verify data integrity.
         $ciphertext = openssl_encrypt(
             $str,
-            "aes-256-gcm",
+            $cipher,
             $key,
-            0,
+            OPENSSL_RAW_DATA,
             $iv,
             $tag
         );
 
         // Returns the encrypted text in a base64-encoded string containing the IV,
         // the ciphertext, and the tag.
-        return base64_encode($iv . $ciphertext . $tag);
+        if ($ciphertext === false) {
+            throw new \Exception("Encryption failed.");
+        }
+
+        if (mb_strlen($tag, '8bit') !== $tagLength) {
+            throw new \Exception("Invalid authentication tag length.");
+        }
+
+        return base64_encode($iv . $tag . $ciphertext);
     }
 
     /**
      * Decrypts a message after verifying its integrity using "aes-256-gcm".
      *
      * @param string|null $str Encrypted message
-     * @param string|null $key Encryption key
+     * @param string $key Encryption key
+     * @param string|null $salt Optional salt for key derivation
      *
      * @return string|false Decrypted text or FALSE if an error occurs
      * @throws \Exception
      */
-    public static function decryptDataDB(?string $str, ?string $key): string|false {
+    public static function decryptDataDB(?string $str, string $key, ?string $salt = ""): string|false {
         if (!extension_loaded('openssl')) {
             throw new \Exception("OpenSSL not loaded");
         }
@@ -404,9 +472,10 @@ class Security {
             return "";
         }
 
-        if (empty($key) || strlen($key) !== 32) {
+        if (empty($key) || mb_strlen($key, '8bit') !== 32) {
             throw new \Exception("Invalid decryption key. The key must be 32 bytes long.");
         }
+        $key = self::deriveKey($key, 32, $salt);
 
         // Decodes the base64-encoded encrypted text into binary
         $decoded = Parser::base64Decode($str);
@@ -416,17 +485,27 @@ class Security {
 
         // Gets the IV length based on the encryption algorithm.
         // We use AES-256-GCM for performance and security.
-        $ivLength = openssl_cipher_iv_length("aes-256-gcm");
+        $cipher = "aes-256-gcm";
+        $ivLength = openssl_cipher_iv_length($cipher);
+        $tagLength = 16;
+
+        if (mb_strlen($decoded, '8bit') < ($ivLength + $tagLength + 1)) {
+            throw new \Exception("Encrypted payload is too short.");
+        }
+
+        $iv = mb_substr($decoded, 0, $ivLength, '8bit');
+        $tag = mb_substr($decoded, $ivLength, $tagLength, '8bit');
+        $ciphertext = mb_substr($decoded, $ivLength + $tagLength, null, '8bit');
 
         // Decrypts the text using "aes-256-gcm", the provided key, IV, and tag.
         // Extracts the IV, tag, and ciphertext from the decoded string.
         return openssl_decrypt(
-            substr($decoded, $ivLength, -16),
-            "aes-256-gcm",
+            $ciphertext,
+            $cipher,
             $key,
-            0,
-            substr($decoded, 0, $ivLength),
-            substr($decoded, -16)
+            OPENSSL_RAW_DATA,
+            $iv,
+            $tag
         );
     }
 
@@ -439,15 +518,16 @@ class Security {
      *
      * The result is the MAC concatenated with the IV and ciphertext, encoded in Base64.
      *
-     * @param string|float|int|bool|null $str The plaintext to encrypt
-     * @param string|null $key A 32-byte encryption key
+     * @param mixed $str The plaintext to encrypt
+     * @param string $key A 32-byte encryption key
+     * @param string|null $salt Optional salt for key derivation
      *
      * @return string Encrypted string, Base64 encoded
      * @throws \Exception If the key is invalid or secure random bytes can't be generated
      *
      * @link https://stackoverflow.com/questions/9262109/simplest-two-way-encryption-using-php
      */
-    public static function encryptLocal(string|float|int|bool|null $str, ?string $key): string {
+    public static function encryptLocal(mixed $str, string $key, ?string $salt = ""): string {
         if (!extension_loaded('openssl')) {
             throw new \Exception("OpenSSL not loaded");
         }
@@ -461,41 +541,44 @@ class Security {
         }
         $str = (string) $str;
 
-        if (empty($key) || strlen($key) !== 32) {
+        if (empty($key) || mb_strlen($key, '8bit') !== 32) {
             throw new \Exception("Invalid encryption key. The key must be exactly 32 bytes long.");
         }
+        $key = self::deriveKey($key, 32, $salt);
 
         // Derive encryption and authentication keys using HKDF
         [$encKey, $authKey] = [
-            hash_hkdf("sha256", 'ENCRYPTION', 0, "aes-256-ctr", $key),
-            hash_hkdf("sha256", 'AUTHENTICATION', 0, "aes-256-ctr", $key),
+            hash_hkdf("sha256", $key, 32, "LOCAL-ENC"),
+            hash_hkdf("sha256", $key, 32, "LOCAL-AUTH"),
         ];
-        $key = null;
-
-        $ivLength = openssl_cipher_iv_length("aes-256-ctr");
+        
+        $cipher = "aes-256-ctr";
+        $ivLength = openssl_cipher_iv_length($cipher);
 
         // Generate a secure random IV (nonce)
         try {
             $nonce = random_bytes($ivLength);
-        } catch (Exception $e) {
+        } catch (\Exception $e) {
             $nonce = openssl_random_pseudo_bytes($ivLength);
         }
 
         // Encrypt the plaintext using AES-256-CTR
         $encryptedData = openssl_encrypt(
             $str,
-            "aes-256-ctr",
+            $cipher,
             $encKey,
             OPENSSL_RAW_DATA,
             $nonce
         );
 
-        $ciphertext = $nonce . $encryptedData;
+        if ($encryptedData === false) {
+            throw new \Exception("Encryption failed.");
+        }
+        
+        $payload = $nonce . $encryptedData;
+        $mac = hash_hmac("sha256", $payload, $authKey, true);
 
-        // Generate MAC using auth key
-        $mac = hash_hmac("sha256", $ciphertext, $authKey, true);
-
-        return base64_encode($mac . $ciphertext);
+        return base64_encode($mac . $payload);
     }
 
     /**
@@ -504,14 +587,15 @@ class Security {
      * It verifies the MAC before attempting decryption. If the MAC is invalid, an exception is thrown.
      *
      * @param string|null $str The encrypted string, Base64 encoded
-     * @param string|null $key A 32-byte encryption key
+     * @param string $key A 32-byte encryption key
+     * @param string|null $salt Optional salt for key derivation
      *
      * @return string|false Decrypted string or false if decryption fails
      * @throws \Exception If the key is invalid, Base64 is malformed, or MAC verification fails
      *
      * @link https://stackoverflow.com/questions/9262109/simplest-two-way-encryption-using-php
      */
-    public static function decryptLocal(?string $str, ?string $key): string|false {
+    public static function decryptLocal(?string $str, string $key, ?string $salt = ""): string|false {
         if (!extension_loaded('openssl')) {
             throw new \Exception("OpenSSL not loaded");
         }
@@ -520,16 +604,16 @@ class Security {
             return "";
         }
 
-        if (empty($key) || strlen($key) !== 32) {
+        if (empty($key) || mb_strlen($key, '8bit') !== 32) {
             throw new \Exception("Invalid encryption key. The key must be exactly 32 bytes long.");
         }
+        $key = self::deriveKey($key, 32, $salt);
 
         // Derive encryption and authentication keys using HKDF
         [$encKey, $authKey] = [
-            hash_hkdf("sha256", 'ENCRYPTION', 0, "aes-256-ctr", $key),
-            hash_hkdf("sha256", 'AUTHENTICATION', 0, "aes-256-ctr", $key),
+            hash_hkdf("sha256", $key, 32, "LOCAL-ENC"),
+            hash_hkdf("sha256", $key, 32, "LOCAL-AUTH"),
         ];
-        $key = null;
 
         // Decode Base64 (custom function)
         $decoded = Parser::base64Decode($str);
@@ -537,24 +621,28 @@ class Security {
             throw new \Exception("Failed to decode encrypted message. Invalid Base64.");
         }
 
-        $macSize = mb_strlen(hash("sha256", '', true), '8bit');
-        $mac = mb_substr($decoded, 0, $macSize, '8bit');
-        $ciphertext = mb_substr($decoded, $macSize, null, '8bit');
+        $cipher = "aes-256-ctr";
+        $ivLength = openssl_cipher_iv_length($cipher);
+        $macSize = 32;
 
-        // Verify MAC
-        $calculatedMac = hash_hmac("sha256", $ciphertext, $authKey, true);
+        if (mb_strlen($decoded, '8bit') < ($macSize + $ivLength + 1)) {
+            throw new \Exception("Encrypted payload is too short.");
+        }
+
+        $mac = mb_substr($decoded, 0, $macSize, '8bit');
+        $payload = mb_substr($decoded, $macSize, null, '8bit');
+
+        $calculatedMac = hash_hmac("sha256", $payload, $authKey, true);
         if (!hash_equals($mac, $calculatedMac)) {
             throw new \Exception("Provided MAC does not match the calculated MAC.");
         }
 
-        $ivLength = openssl_cipher_iv_length("aes-256-ctr");
-
-        $nonce = mb_substr($ciphertext, 0, $ivLength, '8bit');
-        $encryptedPayload = mb_substr($ciphertext, $ivLength, null, '8bit');
+        $nonce = mb_substr($payload, 0, $ivLength, '8bit');
+        $encryptedPayload = mb_substr($payload, $ivLength, null, '8bit');
 
         return openssl_decrypt(
             $encryptedPayload,
-            "aes-256-ctr",
+            $cipher,
             $encKey,
             OPENSSL_RAW_DATA,
             $nonce
@@ -565,27 +653,29 @@ class Security {
      * Encrypts a string, can be used cross-platform.
      *
      * @param mixed $var Value to be encrypted
-     * @param string $passphrase Encryption key
+     * @param string $key Encryption key 
+     * @param string|null $salt Salt for key derivation
      *
      * @return string|null
      * @throws \Exception
      *
-     * @ref https://github.com/mervick/aes-everywhere
+     * @ref https://github.com/mervick/aes-bridge-php
      */
-    public static function encryptCrossPlatform(mixed $var, string $passphrase): ?string {
+    public static function encryptCrossPlatform(mixed $var, string $key, ?string $salt = ""): ?string {
         if (!extension_loaded('openssl')) {
             throw new \Exception("OpenSSL not loaded");
         }
-        if (!class_exists(\mervick\aesEverywhere\AES256::class)) {
-            throw new \Exception("Class '\mervick\aesEverywhere\AES256' not found");
+        if (!class_exists(\AesBridge\Gcm::class)) {
+            throw new \Exception("Class '\AesBridge\Gcm' not found");
         }
 
         if ($var === null || $var === "") {
             return $var;
         }
-        if (empty($passphrase) || strlen($passphrase) !== 32) {
+        if (empty($key) || mb_strlen($key, '8bit') !== 32) {
             throw new \Exception("Invalid encryption key. The key must be 32 bytes long.");
         }
+        $key = self::deriveKey($key, 32, $salt);
 
         if ($var === true) {
             $var = "{{!BOOL_TRUE!}}";
@@ -593,36 +683,38 @@ class Security {
         if ($var === false) {
             $var = "{{!BOOL_FALSE!}}";
         }
-        return \mervick\aesEverywhere\AES256::encrypt($var, $passphrase);
+        return \AesBridge\Gcm::encrypt($var, $key);
     }
 
     /**
      * Decrypts a string, can be used cross-platform.
      *
      * @param mixed $encrypted Text to be decrypted
-     * @param string $passphrase Decryption key
+     * @param string $key Decryption key
+     * @param string|null $salt Salt for key derivation
      *
      * @return mixed
      * @throws \Exception
      *
-     * @ref https://github.com/mervick/aes-everywhere
+     * @ref https://github.com/mervick/aes-bridge-php
      */
-    public static function decryptCrossPlatform(mixed $encrypted, string $passphrase): mixed {
+    public static function decryptCrossPlatform(mixed $encrypted, string $key, ?string $salt = ""): mixed {
         if (!extension_loaded('openssl')) {
             throw new \Exception("OpenSSL not loaded");
         }
-        if (!class_exists(\mervick\aesEverywhere\AES256::class)) {
-            throw new \Exception("Class '\mervick\aesEverywhere\AES256' not found");
+        if (!class_exists(\AesBridge\Gcm::class)) {
+            throw new \Exception("Class '\AesBridge\Gcm' not found");
         }
 
         if ($encrypted === null || $encrypted === "") {
             return $encrypted;
         }
-        if (empty($passphrase) || strlen($passphrase) !== 32) {
+        if (empty($key) || mb_strlen($key, '8bit') !== 32) {
             throw new \Exception("Invalid encryption key. The key must be 32 bytes long.");
         }
+        $key = self::deriveKey($key, 32, $salt);
 
-        $ret = \mervick\aesEverywhere\AES256::decrypt($encrypted, $passphrase);
+        $ret = \AesBridge\Gcm::decrypt($encrypted, $key);
         if ($ret === "{{!BOOL_TRUE!}}") {
             $ret = true;
         }
@@ -636,13 +728,14 @@ class Security {
      * Apply personalized encrypt/decrypt function in array elements
      *
      * @param mixed $item Item to be applied
-     * @param string $passphrase Decryption key
+     * @param string $key Decryption key
+     * @param string|null $salt Optional salt for key derivation
      * @param string $fnName Name of function
      *
      * @return mixed
      * @throws \Exception
      */
-    public static function applySecurityFunctionArray(mixed $item, string $passphrase, string $fnName): mixed {
+    public static function applySecurityFunctionArray(mixed $item, string $key, ?string $salt, string $fnName): mixed {
         if(empty($fnName)) {
             return $item;
         }
@@ -662,16 +755,16 @@ class Security {
             $item = (array) $item;
         }
         if (!is_array($item)) {
-            return call_user_func($fnName, $item, $passphrase);
+            return call_user_func($fnName, $item, $key, $salt);
         }
 
         $key = null;
         $value = null;
         foreach ($item as $key => $value) {
             if (!is_array($value) && !is_object($value)) {
-                $item[$key] = call_user_func($fnName, $value, $passphrase);
+                $item[$key] = call_user_func($fnName, $value, $key, $salt);
             } else {
-                $item[$key] = self::applySecurityFunctionArray($value, $passphrase, $fnName);
+                $item[$key] = self::applySecurityFunctionArray($value, $key, $salt, $fnName);
             }
         }
         $key = null;

@@ -29,27 +29,29 @@ class SQL {
     /**
      * Encrypts a string using a key with the "aes-256-gcm" algorithm.
      *
-     * @param string|float|int|bool|null $str The string to encrypt
-     * @param string|null $key The encryption key
+     * @param mixed $str The string to encrypt
+     * @param string $key The encryption key
+     * @param string|null $salt Optional salt to use in key derivation
      *
      * @return string
      * @throws \Exception
      */
-    public static function encryptDataDB(string|float|int|bool|null $str, ?string $key): string {
-        return Security::encryptDataDB($str, $key);
+    public static function encryptDataDB(mixed $str, string $key, ?string $salt = ""): string {
+        return Security::encryptDataDB($str, $key, $salt);
     }
 
     /**
      * Decrypts a message after verifying its integrity using "aes-256-gcm".
      *
      * @param string|null $str Encrypted message
-     * @param string|null $key Encryption key
+     * @param string $key Encryption key
+     * @param string|null $salt Optional salt used during encryption
      *
      * @return string|false Decrypted text or FALSE if an error occurs
      * @throws \Exception
      */
-    public static function decryptDataDB(?string $str, ?string $key): string|false {
-        return Security::decryptDataDB($str, $key);
+    public static function decryptDataDB(?string $str, string $key, ?string $salt = ""): string|false {
+        return Security::decryptDataDB($str, $key, $salt);
     }
 
     /**
@@ -201,32 +203,5 @@ class SQL {
         }
 
         return true;
-    }
-
-    /**
-     * Builds a MySQL query string formatted for DataTables server-side usage.
-     *
-     * This function creates a SELECT query with JOINs, WHERE, ORDER, and pagination, including a subquery for total count.
-     *
-     * @param array $selectFields Array of SELECT fields (e.g., ['id', 'name'])
-     * @param string $fromClause The FROM clause (e.g., 'users u')
-     * @param array $joinClauses Array of JOIN clauses (e.g., ['INNER JOIN roles r ON r.id = u.role_id'])
-     * @param string|null $whereClause Optional WHERE clause (e.g., 'u.active = 1')
-     * @param array $orderBy Array of ORDER BY parts (e.g., ['u.name ASC', 'u.id DESC'])
-     * @param int|null $limit Optional LIMIT value
-     * @param int|null $offset Optional OFFSET value
-     *
-     * @return string Final SQL query string formatted for DataTables
-     */
-    public static function buildDataTableQueryFromParts(
-        array $selectFields,
-        string $fromClause,
-        array $joinClauses = [],
-        ?string $whereClause = null,
-        array $orderBy = [],
-        ?int $limit = null,
-        ?int $offset = null
-    ): string {
-        return DataTable::buildDataTableQueryFromParts($selectFields, $fromClause, $joinClauses, $whereClause, $orderBy, $limit, $offset);
     }
 }
