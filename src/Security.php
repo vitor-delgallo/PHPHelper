@@ -4,16 +4,16 @@ namespace VD\PHPHelper;
 
 class Security {
     /**
-     * Number of encryption blocks to read per iteration.
+     * Number of bytes blocks to read per iteration.
      *
-     * 'AES-128-CBC' = 16 bytes.
-     * 'AES-256-GCM' = 32 bytes.
+     * 'AES-128-CBC' uses 16 bytes crypt.
+     * 'AES-256-GCM' uses 32 bytes crypt.
      *
      * This value can be adjusted based on the file size to optimize memory usage.
      *
      * @var int
      */
-    private static int $fileEncryptBlocksMB = 0;
+    private static int $fileEncryptBlocksBytes = 0;
 
     /**
      * Derives a key of the specified length from the given key & salt using HKDF with SHA-256.
@@ -166,34 +166,34 @@ class Security {
     }
 
     /**
-     * Returns the mb of encryption blocks to read per iteration.
+     * Returns the bytes of encryption blocks to read per iteration.
      * If no value is set, the default (3.200.000) will be returned and set.
      *
      * @return int
      */
-    public static function getFileEncryptBlocksMB(): int
+    public static function getFileEncryptBlocksBytes(): int
     {
-        if (empty(self::$fileEncryptBlocksMB)) {
-            self::setFileEncryptionBlocks(3200000);
+        if (empty(self::$fileEncryptBlocksBytes)) {
+            self::setFileEncryptBlocksBytes(3200000);
         }
 
-        return self::$fileEncryptBlocksMB;
+        return self::$fileEncryptBlocksBytes;
     }
 
     /**
-     * Sets the mb of encryption blocks to be used during file processing.
+     * Sets the bytes of encryption blocks to be used during file processing.
      * Accepts null, in which case the default will be used on next get.
      *
-     * @param int|null $fileEncryptBlocksMB
+     * @param int|null $fileEncryptBlocksBytes
      * @return void
      */
-    public static function setFileEncryptBlocksMB(?int $fileEncryptBlocksMB): void
+    public static function setFileEncryptBlocksBytes(?int $fileEncryptBlocksBytes): void
     {
-        if (empty($fileEncryptBlocksMB) || $fileEncryptBlocksMB < 0) {
+        if (empty($fileEncryptBlocksBytes) || $fileEncryptBlocksBytes < 0) {
             return;
         }
 
-        self::$fileEncryptBlocksMB = $fileEncryptBlocksMB;
+        self::$fileEncryptBlocksBytes = $fileEncryptBlocksBytes;
     }
 
     /**
@@ -311,7 +311,7 @@ class Security {
                 // Reads blocks of text, encrypts them, and writes to the destination file
                 while (!feof($fpIn)) {
                     // Reads a block from the source file
-                    $plaintext = fread($fpIn, self::getFileEncryptionBlocks());
+                    $plaintext = fread($fpIn, self::getFileEncryptBlocksBytes());
                     if($plaintext === false) {
                         $error = "Error on reading plaintext";
                         break;
@@ -579,7 +579,7 @@ class Security {
                 // Reads blocks of text, encrypts them, and writes to the destination file
                 while (!feof($fpIn)) {
                     // Reads a block from the source file
-                    $plaintext = fread($fpIn, self::getFileEncryptionBlocks());
+                    $plaintext = fread($fpIn, self::getFileEncryptBlocksBytes());
                     if($plaintext === false) {
                         $error = "Error on reading plaintext";
                         break;
