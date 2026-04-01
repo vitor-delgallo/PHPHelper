@@ -219,7 +219,7 @@ class Security {
             throw new \Exception("Invalid destination path provided for writing!");
         }
 
-        $destPath['dir'] = realpath(File::getPath(dir: $destPath['dir'], createPath: $permissionMode));
+        $destPath['dir'] = realpath(File::getPath(dir: $destPath['dir'], createPath: ($permissionMode == null ? true : $permissionMode));
         if(empty($destPath['dir'])) {
             throw new \Exception("Invalid destination directory path provided for file writing!");
         }
