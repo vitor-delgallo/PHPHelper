@@ -56,9 +56,16 @@ class Security {
         $lenData = "";
         while (!feof($fp)) {
             $char = fgetc($fp);
-            if ($char === "-" || $char === false) {
+            if ($char === "-") {
                 break;
-            }
+            } else if ($char === false) {
+                if($lenData === "" && feof($fp)) {
+                    return true;
+                } else {
+                    return false;
+                }
+            } 
+            
             $lenData .= $char;
         }
 
@@ -73,7 +80,7 @@ class Security {
             return false;
         }
 
-        return ($data !== "" ? Parser::base64Decode($data) : "");
+        return ($data !== "" ? base64_decode($data, true) : true);
     }
     
     /**
@@ -415,7 +422,7 @@ class Security {
 
             // Reads the cipher in source file
             $fCipher = self::readLengthEncodedBlock($fpIn);
-            if ($fCipher === false) {
+            if (is_bool($fCipher)) {
                 $error = "Error on reading cipher type";
             } else {
                 if ($fCipher !== $cipher) {
@@ -425,7 +432,7 @@ class Security {
 
             // Reads the version in source file
             $fVersion = self::readLengthEncodedBlock($fpIn);
-            if ($fVersion === false) {
+            if (is_bool($fVersion)) {
                 $error = "Error on reading cipher version";
             } else {
                 if ($fVersion !== $version) {
@@ -435,13 +442,13 @@ class Security {
 
             // Reads the salt in source file
             $salt = self::readLengthEncodedBlock($fpIn);
-            if ($salt === false) {
+            if (is_bool($salt)) {
                 $error = "Error on reading cipher salt";
             }
 
             // Reads the initialization vector in source file
             $iv = self::readLengthEncodedBlock($fpIn);
-            if ($iv === false) {
+            if (is_bool($iv)) {
                 $error = "Error on reading cipher initialization IV";
             }
 
@@ -455,7 +462,7 @@ class Security {
                     if ($ciphertext === false) {
                         $error = "Error on reading ciphertext";
                         break;
-                    } else if($ciphertext === "") {
+                    } else if($ciphertext === true) {
                         break;
                     }
 
@@ -705,7 +712,7 @@ class Security {
 
             // Reads the cipher in source file
             $fCipher = self::readLengthEncodedBlock($fpIn);
-            if ($fCipher === false) {
+            if (is_bool($fCipher)) {
                 $error = "Error on reading cipher type";
             } else {
                 if ($fCipher !== $cipher) {
@@ -715,7 +722,7 @@ class Security {
 
             // Reads the version in source file
             $fVersion = self::readLengthEncodedBlock($fpIn);
-            if ($fVersion === false) {
+            if (is_bool($fVersion)) {
                 $error = "Error on reading cipher version";
             } else {
                 if ($fVersion !== $version) {
@@ -725,7 +732,7 @@ class Security {
 
             // Reads the salt in source file
             $salt = self::readLengthEncodedBlock($fpIn);
-            if ($salt === false) {
+            if (is_bool($salt)) {
                 $error = "Error on reading cipher salt";
             }
 
@@ -739,7 +746,7 @@ class Security {
                     if ($iv === false) {
                         $error = "Error on reading IV ciphertext";
                         break;
-                    } else if($iv === "") {
+                    } else if($iv === true) {
                         break;
                     }
                     if (mb_strlen($iv, '8bit') !== $iv_length) {
@@ -749,7 +756,7 @@ class Security {
 
                     // Reads encoded tag block
                     $tag = self::readLengthEncodedBlock($fpIn);
-                    if ($tag === false || $tag === "") {
+                    if (is_bool($tag)) {
                         $error = "Error on reading tag ciphertext";
                         break;
                     } 
@@ -760,7 +767,7 @@ class Security {
 
                     // Reads encoded block
                     $ciphertext = self::readLengthEncodedBlock($fpIn);
-                    if ($ciphertext === false || $ciphertext === "") {
+                    if (is_bool($ciphertext)) {
                         $error = "Error on reading ciphertext";
                         break;
                     }
