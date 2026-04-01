@@ -112,7 +112,18 @@ class Security {
         // hex: 64 caracteres
         return hash_hmac('sha256', $str, $keySearch);
     }
-
+    
+    /**
+     * Reads a length-encoded block from the given file pointer.
+     * The block format is expected to be: "{length}-{base64_encoded_data}".
+     * The numeric length is read until the "-" separator, then the corresponding
+     * number of bytes is read and base64-decoded before being returned.
+     *
+     * @param resource $fp File pointer opened for reading
+     *
+     * @return string|false Returns the decoded block content, an empty string for an empty block,
+     *                      or false if the block length is invalid or the data cannot be fully read
+     */
     private static function readLengthEncodedBlock($fp): string|false {
         $lenData = "";
         while (!feof($fp)) {
@@ -136,7 +147,17 @@ class Security {
 
         return ($data !== "" ? Parser::base64Decode($data) : "");
     }
-
+    
+    /**
+     * Writes a length-encoded block to the given file pointer.
+     * The given content is base64-encoded and written in the format:
+     * "{length}-{base64_encoded_data}".
+     *
+     * @param resource $fp File pointer opened for writing
+     * @param string $text Raw content to be encoded and written
+     *
+     * @return bool Returns true on success or false on failure
+     */
     private static function writeLengthEncodedBlock($fp, $text): string|false {
         $textEncoded = base64_encode($text);
         if (fwrite($fpOut, (mb_strlen($textEncoded, '8bit') . "-" . $textEncoded)) === false) {
@@ -145,8 +166,19 @@ class Security {
 
         return true;
     }
-
-    private static function getRealSource(?string $source) {
+    
+    /**
+     * Resolves and validates the real source file path.
+     * It first attempts to resolve the absolute path using realpath(). If that fails,
+     * it checks whether the given source is an uploaded file. An exception is thrown
+     * if the source is not valid or cannot be resolved.
+     *
+     * @param string|null $source Source file path
+     *
+     * @throws \Exception
+     * @return string Returns the validated real source file path
+     */
+    private static function getRealSource(?string $source) : string {
         $ret = false;
 
         // Attempts to get the absolute path of the source file
@@ -165,17 +197,29 @@ class Security {
 
         return $ret;
     }
-
-    private static function getRealDestination(?string $destination, ?string $permissionMode = null) {
+    
+    /**
+     * Resolves and validates the destination file path for writing.
+     * It extracts the file name and directory, ensures the target directory exists
+     * (creating it when allowed), normalizes the final path, and validates that the
+     * destination is usable for generating the output file.
+     *
+     * @param string|null $destination Destination file path
+     * @param string|null $permissionMode Optional permission mode used when creating the destination directory
+     *
+     * @throws \Exception
+     * @return string Returns the validated full destination file path
+     */
+    private static function getRealDestination(?string $destination, ?string $permissionMode = null) : string {
         $ret = false;
 
         // Sets the destination file path
-        $destPath = self::getFileAndPath($destination);
+        $destPath = File::getFileAndPath($destination);
         if(empty($destPath) || empty($destPath['file'])) {
             throw new \Exception("Invalid destination path provided for writing!");
         }
 
-        $destPath['dir'] = realpath(self::getPath(dir: $destPath['dir'], createPath: $permissionMode));
+        $destPath['dir'] = realpath(File::getPath(dir: $destPath['dir'], createPath: $permissionMode));
         if(empty($destPath['dir'])) {
             throw new \Exception("Invalid destination directory path provided for file writing!");
         }
