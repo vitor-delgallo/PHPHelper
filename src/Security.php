@@ -49,7 +49,7 @@ class Security {
      *
      * @param resource $fp File pointer opened for reading
      *
-     * @return string|bool  Returns the decoded block content, an empty string for an empty block,
+     * @return string|bool  Returns the decoded block content, 
      *                      false if the block length is invalid or the data cannot be fully read
      *                      true if it has reached the end of file
      */
@@ -94,7 +94,7 @@ class Security {
      *
      * @return bool Returns true on success or false on failure
      */
-    private static function writeLengthEncodedBlock($fp, $text): string|false {
+    private static function writeLengthEncodedBlock($fp, $text): bool {
         $textEncoded = base64_encode($text);
         if (fwrite($fp, (mb_strlen($textEncoded, '8bit') . "-" . $textEncoded)) === false) {
             return false;
@@ -284,7 +284,7 @@ class Security {
         umask($oldMask);
 
         // Attempts to open the destination file for writing
-        if ($fpOut = fopen($destination, 'w')) {
+        if ($fpOut = fopen($destination, 'wb')) {
             // Initializes the error flag
             $error = false;
 
@@ -345,16 +345,14 @@ class Security {
                         break;
                     }
                 }
-
-                // Closes the source file
-                fclose($fpIn);
             } else if(!$error) {
                 // Sets the error flag if the source file could not be opened
                 $error = "Error on opening source file stream";
             }
 
-            // Closes the destination file
-            fclose($fpOut);
+            // Closes the source and destination file
+            @fclose($fpIn);
+            @fclose($fpOut);
 
             // Checks if any error occurred during encryption
             if ($error) {
@@ -406,9 +404,9 @@ class Security {
         // Defines defaults for $outReadMode options
         if (
             empty($outReadMode) ||
-            !in_array($outReadMode, array('w', 'a'))
+            !in_array($outReadMode, array('wb', 'ab'))
         ) {
-            $outReadMode = "w";
+            $outReadMode = "wb";
         }
 
         // Sets the permission of the destination file
@@ -427,7 +425,7 @@ class Security {
                 $error = "Error on reading cipher type";
             } else {
                 if ($fCipher !== $cipher) {
-                    $error = true;
+                    $error = "Cipher type does not match with the one used in function";
                 }
             }
 
@@ -437,7 +435,7 @@ class Security {
                 $error = "Error on reading cipher version";
             } else {
                 if ($fVersion !== $version) {
-                    $error = true;
+                    $error = "Cipher version does not match with the one used in function";
                 }
             }
 
@@ -489,15 +487,14 @@ class Security {
                         break;
                     }
                 }
-                // Closes the source file
-                fclose($fpIn);
             } else {
                 // Sets the error flag if the source file could not be opened
                 $error = "Error while writing to the destination file.";
             }
 
-            // Closes the destination file
-            fclose($fpOut);
+            // Closes the source and destination file
+            @fclose($fpIn);
+            @fclose($fpOut);
 
             // Checks if any error occurred during decryption
             if ($error) {
@@ -557,7 +554,7 @@ class Security {
         umask($oldMask);
 
         // Attempts to open the destination file for writing
-        if ($fpOut = fopen($destination, 'w')) {
+        if ($fpOut = fopen($destination, 'wb')) {
             // Initializes the error flag
             $error = false;
 
@@ -634,16 +631,14 @@ class Security {
                         break;
                     }
                 }
-
-                // Closes the source file
-                fclose($fpIn);
             } else {
                 // Sets the error flag if the source file could not be opened
                 $error = "Error on opening source file stream";
             }
 
-            // Closes the destination file
-            fclose($fpOut);
+            // Closes the source and destination file
+            @fclose($fpIn);
+            @fclose($fpOut);
 
             // Checks if any error occurred during encryption
             if ($error) {
@@ -696,9 +691,9 @@ class Security {
         // Defines defaults for $outReadMode options
         if (
             empty($outReadMode) ||
-            !in_array($outReadMode, array('w', 'a'))
+            !in_array($outReadMode, array('wb', 'ab'))
         ) {
-            $outReadMode = "w";
+            $outReadMode = "wb";
         }
 
         // Sets the permission of the destination file
@@ -717,7 +712,7 @@ class Security {
                 $error = "Error on reading cipher type";
             } else {
                 if ($fCipher !== $cipher) {
-                    $error = true;
+                    $error = "Cipher type does not match with the one used in function";
                 }
             }
 
@@ -727,7 +722,7 @@ class Security {
                 $error = "Error on reading cipher version";
             } else {
                 if ($fVersion !== $version) {
-                    $error = true;
+                    $error = "Cipher version does not match with the one used in function";
                 }
             }
 
@@ -793,15 +788,14 @@ class Security {
                         break;
                     }
                 }
-                // Closes the source file
-                fclose($fpIn);
             } else {
                 // Sets the error flag if the source file could not be opened
                 $error = "Error while writing to the destination file.";
             }
 
-            // Closes the destination file
-            fclose($fpOut);
+            // Closes the source and destination file
+            @fclose($fpIn);
+            @fclose($fpOut);
 
             // Checks if any error occurred during decryption
             if ($error) {
@@ -1201,9 +1195,9 @@ class Security {
         $valueItem = null;
         foreach ($item AS $keyItem => $valueItem) {
             if (!is_array($valueItem) && !is_object($valueItem)) {
-                $item[$key] = call_user_func($fnName, $valueItem, $key, $salt);
+                $item[$keyItem] = call_user_func($fnName, $valueItem, $key, $salt);
             } else {
-                $item[$key] = self::applySecurityFunctionArray($valueItem, $key, $salt, $fnName);
+                $item[$keyItem] = self::applySecurityFunctionArray($valueItem, $key, $salt, $fnName);
             }
         }
         $keyItem = null;
