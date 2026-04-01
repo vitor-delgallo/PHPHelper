@@ -324,6 +324,11 @@ class System {
         static $timers = [];
     
         switch ($type) {
+            case "clear":
+                $timers = null;
+                $timers = [];
+                break;
+            
             case "init":
             case "reset":
                 $nowDate = new \DateTimeImmutable('now');
@@ -350,7 +355,7 @@ class System {
                         $elapsedMs = $elapsedNs / 1_000_000;
     
                         $result[] = [
-                            'timer' => $timerName,
+                            'timer' => $name,
                             'started_at' => $timer['started_at'],
                             'now' => $nowDate->format('Y-m-d H:i:s.u'),
                             'elapsed_ms' => round($elapsedMs, 3),
