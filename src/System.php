@@ -325,8 +325,13 @@ class System {
     
         switch ($type) {
             case "clear":
-                $timers = null;
-                $timers = [];
+                if (!empty($timerName)) {
+                    $timers[$timerName] = null;
+                    $timers[$timerName] = [];
+                } else {
+                    $timers = null;
+                    $timers = [];
+                }
                 break;
             
             case "init":
