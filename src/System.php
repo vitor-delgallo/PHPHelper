@@ -311,33 +311,72 @@ class System {
      *
      * @return string|array|null Returns the timestamp string, array of all timers, or null if not applicable.
      */
-    public static function timer(?string $timerName, string $type = "init"): string|array|null {
+    public static function timer(?string $timerName, string $type = "init"): ?array {
         if (empty($type)) {
             return null;
         }
-
+    
         $type = Str::strToLower($type);
         if (empty($timerName) && $type !== "get") {
             return null;
         }
-
+    
         static $timers = [];
+    
         switch ($type) {
             case "init":
             case "reset":
-                $timers[$timerName] = DateTime::getCurrentFormattedDate("Y-m-d H:i:s");
-                break;
-
+                $nowDate = new \DateTimeImmutable('now');
+    
+                $timers[$timerName] = [
+                    'started_at' => $nowDate->format('Y-m-d H:i:s.u'),
+                    'started_ns' => hrtime(true),
+                ];
+    
+                return [
+                    'timer' => $timerName,
+                    'started_at' => $timers[$timerName]['started_at'],
+                ];
+    
             case "get":
+                $nowDate = new \DateTimeImmutable('now');
+                $nowNs = hrtime(true);
+    
                 if (empty($timerName)) {
-                    return $timers;
+                    $result = [];
+    
+                    foreach ($timers as $name => $timer) {
+                        $elapsedNs = $nowNs - $timer['started_ns'];
+                        $elapsedMs = $elapsedNs / 1_000_000;
+    
+                        $result[] = [
+                            'timer' => $timerName,
+                            'started_at' => $timer['started_at'],
+                            'now' => $nowDate->format('Y-m-d H:i:s.u'),
+                            'elapsed_ms' => round($elapsedMs, 3),
+                            'elapsed_seconds' => round($elapsedMs / 1000, 6),
+                        ];
+                    }
+    
+                    return $result;
                 }
-                if (isset($timers[$timerName])) {
-                    return $timers[$timerName];
+    
+                if (!isset($timers[$timerName])) {
+                    return null;
                 }
-                break;
+    
+                $elapsedNs = $nowNs - $timers[$timerName]['started_ns'];
+                $elapsedMs = $elapsedNs / 1_000_000;
+    
+                return [
+                    'timer' => $timerName,
+                    'started_at' => $timers[$timerName]['started_at'],
+                    'now' => $nowDate->format('Y-m-d H:i:s.u'),
+                    'elapsed_ms' => round($elapsedMs, 3),
+                    'elapsed_seconds' => round($elapsedMs / 1000, 6),
+                ];
         }
-
+    
         return null;
     }
 }
