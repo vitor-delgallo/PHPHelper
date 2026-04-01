@@ -6,11 +6,8 @@ class Security {
     /**
      * Number of encryption blocks to read per iteration.
      *
-     * For the 'AES-128-CBC' cipher, each block consists of 16 bytes.
-     * For the 'AES-256-GCM' cipher, each block consists of 32 bytes.
-     * Therefore:
-     * - 10,000 blocks = 160 KB
-     * - 37,500 blocks = 600 KB
+     * 'AES-128-CBC' = 16 bytes.
+     * 'AES-256-GCM' = 32 bytes.
      *
      * This value can be adjusted based on the file size to optimize memory usage.
      *
@@ -385,7 +382,7 @@ class Security {
      * @return string|false Returns the path of the decrypted file or FALSE in case of error
      * @throws \Exception
      */
-    public static function decryptFileV1(string $source, string $key, string $destination, ?string $permissionMode, string $outReadMode = "w"): string|false {
+    public static function decryptFileV1(string $source, string $key, string $destination, ?string $permissionMode = null, string $outReadMode = "w"): string|false {
         if (!extension_loaded('openssl')) {
             throw new \Exception("OpenSSL not loaded");
         }
@@ -671,7 +668,7 @@ class Security {
      * @return string|false Returns the path of the decrypted file or FALSE in case of error
      * @throws \Exception
      */
-    public static function decryptFileV2(string $source, string $key, string $destination, ?string $permissionMode, string $outReadMode = "w"): string|false {
+    public static function decryptFileV2(string $source, string $key, string $destination, ?string $permissionMode = null, string $outReadMode = "w"): string|false {
         if (!extension_loaded('openssl')) {
             throw new \Exception("OpenSSL not loaded");
         }
