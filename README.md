@@ -28,6 +28,7 @@ These classes are auto-loaded under the namespace `VD\PHPHelper`:
 - `Mailer` – abstraction for PHPMailer integration
 - `Number` – numeric manipulation and memory unit helpers
 - `Parser` – data sanitization and filtering
+- `S3Storage` – data storage on s3 services
 - `Security` – hashing, encryption (AES, GCM), secure encoding
 - `Spreadsheet` – Excel and CSV utilities (via PhpSpreadsheet)
 - `SQL` – safe SQL snippet generators and query formatters

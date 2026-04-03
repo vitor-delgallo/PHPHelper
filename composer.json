@@ -13,6 +13,7 @@
     "phpmailer/phpmailer": "^7.0",
     "phpoffice/phpspreadsheet": "^5.5",
     "rebasedata/php-client": "^1.0",
+    "aws/aws-sdk-php": "^3.376.2",
     "ext-curl": "*",
     "ext-simplexml": "*",
     "ext-openssl": "*",
@@ -25,6 +26,7 @@
   "suggest": {
     "phpmailer/phpmailer": "Requerido para envio de e-mails",
     "phpoffice/phpspreadsheet": "Requerido para planilhas Excel",
+    "aws/aws-sdk-php": "Integração com o Amazon S3",
     "mervick/aes-bridge": "Criptografia multiplataforma",
     "rebasedata/php-client": "Conversão de arquivos",
     "ext-curl": "Necessário para chamadas HTTP externas",
