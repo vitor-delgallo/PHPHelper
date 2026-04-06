@@ -720,4 +720,59 @@ class DateTime {
 
         return 3; // Evening
     }
+    /**
+     * Converts a date string from one timezone to another, with optional format conversion.
+     *
+     * @param string $date Date string to be converted
+     * @param string $fromTimezone Timezone of the input date
+     * @param string $toTimezone Timezone of the output date
+     * @param string|null $fromFormat Format of the input date
+     * @param string|null $toFormat Format of the output date
+     *
+     * @return string|null
+     */
+    public static function convertTimezone(
+        string $date,
+        string $fromTimezone,
+        string $toTimezone,
+        ?string $fromFormat = null,
+        ?string $toFormat = null
+    ): ?string {
+        if (empty($fromFormat)) {
+            $fromFormat = 'Y-m-d H:i:s';
+        }
+        if (empty($toFormat)) {
+            $toFormat = $fromFormat;
+        }
+
+        if (
+            empty($date) ||
+            !self::isValidTimezone($fromTimezone) ||
+            !self::isValidTimezone($toTimezone)
+        ) {
+            return null;
+        }
+
+        try {
+            $dateObj = \DateTime::createFromFormat(
+                $fromFormat,
+                $date,
+                new \DateTimeZone($fromTimezone)
+            );
+
+            $errors = \DateTime::getLastErrors();
+            if (
+                $dateObj === false ||
+                (!empty($errors['warning_count'])) ||
+                (!empty($errors['error_count']))
+            ) {
+                return null;
+            }
+
+            $dateObj->setTimezone(new \DateTimeZone($toTimezone));
+            return $dateObj->format($toFormat);
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
 }
