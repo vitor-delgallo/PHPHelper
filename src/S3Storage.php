@@ -27,8 +27,6 @@ use Aws\Exception\AwsException;
  *   (true) or benign values (empty string / empty array).
  * - On real errors (AWS exceptions), methods return false and populate
  *   getLastError().
- *
- * @package App\Helper
  */
 class S3Storage
 {
