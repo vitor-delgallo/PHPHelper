@@ -7,7 +7,7 @@ description: Operational context for the vitor-delgallo/phphelper library for AI
 
 This file is the entry point for **vitor-delgallo/phphelper** context for AI agents, coding agents, and developers.
 
-Keep this document short enough to remain in context by default. Open the documents in `/storage/ia-context/phphelper-references/` when you need details about a specific class.
+Keep this document short enough to remain in context by default. Open the documents in `phphelper-references/` when you need details about a specific class.
 
 ## Essential Context
 
@@ -75,22 +75,22 @@ In Whitesky, the dependency is already referenced by `composer.json`. Before ins
 
 | Class | Document |
 | --- | --- |
-| `DateTime` | [01-datetime.md](/storage/ia-context/phphelper-references/01-datetime.md) |
-| `DBF` | [02-dbf.md](/storage/ia-context/phphelper-references/02-dbf.md) |
-| `File` | [03-file.md](/storage/ia-context/phphelper-references/03-file.md) |
-| `Formatter` | [04-formatter.md](/storage/ia-context/phphelper-references/04-formatter.md) |
-| `HTTP` | [05-http.md](/storage/ia-context/phphelper-references/05-http.md) |
-| `Mailer` | [06-mailer.md](/storage/ia-context/phphelper-references/06-mailer.md) |
-| `Number` | [07-number.md](/storage/ia-context/phphelper-references/07-number.md) |
-| `Parser` | [08-parser.md](/storage/ia-context/phphelper-references/08-parser.md) |
-| `S3Storage` | [09-s3storage.md](/storage/ia-context/phphelper-references/09-s3storage.md) |
-| `Security` | [10-security.md](/storage/ia-context/phphelper-references/10-security.md) |
-| `Spreadsheet` | [11-spreadsheet.md](/storage/ia-context/phphelper-references/11-spreadsheet.md) |
-| `SQL` | [12-sql.md](/storage/ia-context/phphelper-references/12-sql.md) |
-| `Str` | [13-str.md](/storage/ia-context/phphelper-references/13-str.md) |
-| `System` | [14-system.md](/storage/ia-context/phphelper-references/14-system.md) |
-| `URL` | [15-url.md](/storage/ia-context/phphelper-references/15-url.md) |
-| `Validator` | [16-validator.md](/storage/ia-context/phphelper-references/16-validator.md) |
+| `DateTime` | [01-datetime.md](phphelper-references/01-datetime.md) |
+| `DBF` | [02-dbf.md](phphelper-references/02-dbf.md) |
+| `File` | [03-file.md](phphelper-references/03-file.md) |
+| `Formatter` | [04-formatter.md](phphelper-references/04-formatter.md) |
+| `HTTP` | [05-http.md](phphelper-references/05-http.md) |
+| `Mailer` | [06-mailer.md](phphelper-references/06-mailer.md) |
+| `Number` | [07-number.md](phphelper-references/07-number.md) |
+| `Parser` | [08-parser.md](phphelper-references/08-parser.md) |
+| `S3Storage` | [09-s3storage.md](phphelper-references/09-s3storage.md) |
+| `Security` | [10-security.md](phphelper-references/10-security.md) |
+| `Spreadsheet` | [11-spreadsheet.md](phphelper-references/11-spreadsheet.md) |
+| `SQL` | [12-sql.md](phphelper-references/12-sql.md) |
+| `Str` | [13-str.md](phphelper-references/13-str.md) |
+| `System` | [14-system.md](phphelper-references/14-system.md) |
+| `URL` | [15-url.md](phphelper-references/15-url.md) |
+| `Validator` | [16-validator.md](phphelper-references/16-validator.md) |
 
 ## Quick Decisions
 
