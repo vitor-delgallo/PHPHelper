@@ -1,6 +1,6 @@
 # PHPHelper by VD
 
-A modern, modular and extensible utility library for PHP 8+, built for real-world applications. This library provides reliable helpers for strings, dates, arrays, numbers, HTTP, system operations, encryption, parsing, email, spreadsheet handling, and more.
+A modern, modular and extensible utility library for PHP 8.2+, built for real-world applications. This library provides reliable helpers for strings, dates, arrays, numbers, HTTP, system operations, encryption, parsing, email, spreadsheet handling, and more.
 
 > Clean, stateless, and built to work in any PHP environment.
 
@@ -34,14 +34,14 @@ These classes are auto-loaded under the namespace `VD\PHPHelper`:
 - `SQL` – safe SQL snippet generators and query formatters
 - `Str` – string manipulation and pattern helpers
 - `System` – CLI detection, environment tools
-- `URL` – encoding, decoding, querystring parsing
+- `URL` – URL formating/encoding and query params appending
 - `Validator` – validation tools for CPF, CNPJ, dates, etc.
 
 ---
 
 ## 🧪 Requirements
 
-- PHP **>= 8.0**
+- PHP **>= 8.2**
 - Extensions:
     - `ext-mbstring`
     - `ext-json`
@@ -56,7 +56,7 @@ The following packages are **only required if you use the related functionality*
 |---------------------------------|--------------------------------------------|
 | `phpmailer/phpmailer`           | Required for email sending via `Mailer`    |
 | `phpoffice/phpspreadsheet`      | Required for Excel/CSV operations          |
-| `mervick/aes-everywhere`        | Optional cross-platform AES encryption     |
+| `mervick/aes-bridge`            | Optional cross-platform AES encryption     |
 | `rebasedata/php-client`         | Required for file format conversions       |
 | `ext-curl`                      | Required for external HTTP requests        |
 | `ext-simplexml`                 | Required for XML manipulation              |
