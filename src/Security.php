@@ -149,19 +149,16 @@ class Security {
     private static function getRealDestination(?string $destination, ?string $permissionMode = null) : string {
         $ret = false;
 
-        // Sets the destination file path
-        $destPath = File::getFileAndPath($destination);
-        if(empty($destPath) || empty($destPath['file'])) {
+        $destPath = File::getPathInfo($destination, keepFileNotExists: true, createPath: $permissionMode ?? true);
+        if(empty($destPath['path']) || empty($destPath['file'])) {
             throw new \Exception("Invalid destination path provided for writing!");
         }
 
-        if(File::createDir($destPath['dir'], NULL) <= 0) {
+        if(empty($destPath['dir']) || !is_dir($destPath['dir'])) {
             throw new \Exception("Error on creating destination path!");
         }
 
-        $ret = realpath($destPath['dir']);
-        if(Str::subStr($ret, -1) !== DIRECTORY_SEPARATOR) $ret.= DIRECTORY_SEPARATOR;
-        $ret .= $destPath['file'];
+        $ret = $destPath['path'];
         $destPath = null;
 
         return $ret;

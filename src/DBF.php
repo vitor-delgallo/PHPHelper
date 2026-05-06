@@ -11,14 +11,13 @@ class DBF {
      * @return string|null
      */
     public static function DBFFormatPath(string $dbfPath): ?string {
-        $dbfPath = File::getPath(dir: $dbfPath, createPath: TRUE);
+        $dbfPathInfo = File::getPathInfo(path: $dbfPath, keepFile: true, createPath: true);
+        $dbfPath = $dbfPathInfo['path'];
         if(
             empty($dbfPath) ||
+            !$dbfPathInfo['isFile'] ||
             Str::strLen($dbfPath) < 4
         ) return null;
-
-        $dbfPath = realpath($dbfPath);
-        if(empty($dbfPath)) return null;
 
         return $dbfPath;
     }

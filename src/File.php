@@ -111,104 +111,218 @@ class File {
     }
 
     /**
-     * Returns the directory and file parts from a given file path.
+     * Appends path segments to a base path without losing root-only paths like C:\ or /.
      *
-     * @param string $filePath The full file or directory path
-     * @return array {
-     *     @type string|null $dir  The directory portion of the path
-     *     @type string|null $file The file name portion of the path
-     *     @type string|null $path The full reconstructed path (dir + file)
-     * }
+     * @param string $base Base path
+     * @param array $segments Path segments to append
+     * @return string
      */
-    public static function getFileAndPath(string $filePath): array {
-        $ret = array(
-            'dir' => null,
-            'file' => null,
-            'path' => null,
-        );
-        if(empty($filePath)) return $ret;
+    private static function appendPathSegments(string $base, array $segments): string {
+        $path = rtrim(str_replace(["\\", "/"], DIRECTORY_SEPARATOR, $base), "\\/");
 
-        $filePath = str_replace(array("\\", "/"), "/", $filePath);
-
-        $ret['dir'] = preg_replace('/\/{0,}([^\/]+\.[^\/]+)|(\.[^\/]+)$/i', "", $filePath);
-        if(empty($ret['dir'])) {
-            $ret['dir'] = "./";
-        } else {
-            $ret['dir'] .= "/";
-            $ret['dir'] = str_replace("/", DIRECTORY_SEPARATOR, $ret['dir']);
+        if ($path === "" || preg_match('/^[A-Z]:$/i', $path)) {
+            $path .= DIRECTORY_SEPARATOR;
         }
 
-        preg_match('/\/{0,}([^\/]+\.[^\/]+)|(\.[^\/]+)$/i', $filePath, $f);
-        $filePath = null;
-        if(!empty($f) && !empty($f[0])) {
-            $filePath = $f[0];
-            $f = null;
-
-            if(Str::subStr($filePath, 0, 1) === "/") {
-                $filePath = Str::subStr($filePath, 1);
+        foreach ($segments as $segment) {
+            if ($segment === "" || $segment === ".") {
+                continue;
             }
-            $filePath = str_replace("/", DIRECTORY_SEPARATOR, $filePath);
+
+            if (!str_ends_with($path, DIRECTORY_SEPARATOR)) {
+                $path .= DIRECTORY_SEPARATOR;
+            }
+            $path .= $segment;
         }
 
-        $ret['file'] = $filePath;
-        $filePath = null;
-
-        $ret['path'] = $ret['dir'] . ($ret['file'] !== NULL ? $ret['file'] : "");
-        return $ret;
+        return self::normalizeResolvedPath($path);
     }
 
     /**
-     * Validates and returns a properly formatted directory path if it passes the validation rules.
+     * Returns whether the path is absolute for the current platform.
      *
-     * @param string|null $dir Directory or file path containing the desired folder
-     * @param bool $keepFile If true, includes the file name in the returned path (if it exists)
-     * @param bool $keepFileNotExists If true, includes the file name even if it doesn't exist
-     * @param string|bool $createPath If true or string permission (e.g. '0777'), creates the path if it doesn't exist
+     * @param string $path Path to check
+     * @return bool
+     */
+    private static function isAbsolutePath(string $path): bool {
+        return preg_match('/^[A-Z]:[\\\\\/]/i', $path) === 1 ||
+            str_starts_with($path, "\\\\") ||
+            str_starts_with($path, "/");
+    }
+
+    /**
+     * Normalizes separators and dot segments in an already resolved path.
      *
+     * @param string $path Path to normalize
      * @return string
      */
-    public static function getPath(
-        ?string $dir,
+    private static function normalizeResolvedPath(string $path): string {
+        $path = str_replace(["\\", "/"], DIRECTORY_SEPARATOR, $path);
+        $prefix = "";
+
+        if (preg_match('/^[A-Z]:' . preg_quote(DIRECTORY_SEPARATOR, '/') . '/i', $path) === 1) {
+            $prefix = substr($path, 0, 3);
+            $path = substr($path, 3);
+        } elseif (str_starts_with($path, DIRECTORY_SEPARATOR)) {
+            $prefix = DIRECTORY_SEPARATOR;
+            $path = ltrim($path, DIRECTORY_SEPARATOR);
+        }
+
+        $segments = [];
+        foreach (explode(DIRECTORY_SEPARATOR, $path) as $segment) {
+            if ($segment === "" || $segment === ".") {
+                continue;
+            }
+
+            if ($segment === "..") {
+                if (!empty($segments) && end($segments) !== "..") {
+                    array_pop($segments);
+                } elseif ($prefix === "") {
+                    $segments[] = $segment;
+                }
+                continue;
+            }
+
+            $segments[] = $segment;
+        }
+
+        return $prefix . implode(DIRECTORY_SEPARATOR, $segments);
+    }
+
+    /**
+     * Resolves a path using realpath for the longest existing parent and appends missing segments.
+     *
+     * @param string $path Directory path to resolve
+     * @return string
+     */
+    private static function resolvePath(string $path): string {
+        $path = str_replace(["\\", "/"], DIRECTORY_SEPARATOR, $path);
+        if ($path === "") {
+            return "";
+        }
+
+        $realPath = realpath($path);
+        if ($realPath !== false) {
+            return $realPath;
+        }
+
+        $segments = [];
+        $currentPath = $path;
+        while ($currentPath !== "" && $currentPath !== ".") {
+            $segment = basename($currentPath);
+            if ($segment !== "" && $segment !== ".") {
+                array_unshift($segments, $segment);
+            }
+
+            $parentPath = dirname($currentPath);
+            $parentRealPath = realpath($parentPath);
+            if ($parentRealPath !== false) {
+                return self::appendPathSegments($parentRealPath, $segments);
+            }
+
+            if ($parentPath === $currentPath) {
+                break;
+            }
+
+            $currentPath = $parentPath;
+        }
+
+        if (!self::isAbsolutePath($path)) {
+            $path = getcwd() . DIRECTORY_SEPARATOR . $path;
+        }
+
+        return self::normalizeResolvedPath($path);
+    }
+
+    /**
+     * Ensures a directory path ends with the system directory separator.
+     *
+     * @param string $path Directory path
+     * @return string
+     */
+    private static function ensureTrailingDirectorySeparator(string $path): string {
+        return str_ends_with($path, DIRECTORY_SEPARATOR) ? $path : $path . DIRECTORY_SEPARATOR;
+    }
+
+    /**
+     * Returns normalized path information for an existing or future directory/file path.
+     *
+     * The existing part of the path is resolved with realpath(), and missing child
+     * directories or a missing final file are appended back to that resolved base.
+     *
+     * @param string|null $path Directory or file path
+     * @param bool $keepFile Treat the final segment as a file, even when it has no extension
+     * @param bool $keepFileNotExists Treat the final segment as a file even when it does not exist
+     * @param string|bool|null $createPath If true or octal string, creates the directory portion when missing
+     *
+     * @return array {
+     *     @type string|null $dir    Resolved directory path with trailing separator
+     *     @type string|null $file   File name, when the path points to or is configured as a file
+     *     @type string|null $path   Resolved full path, including the file when present
+     *     @type bool        $exists Whether the full path exists
+     *     @type bool        $isDir  Whether the full path is an existing directory
+     *     @type bool        $isFile Whether the full path is an existing file
+     * }
+     */
+    public static function getPathInfo(
+        ?string $path,
         bool $keepFile = false,
         bool $keepFileNotExists = false,
-        string|bool $createPath = false
-    ): string {
-        if(empty($dir)) return "";
+        string|bool|null $createPath = false
+    ): array {
+        $ret = [
+            'dir' => null,
+            'file' => null,
+            'path' => null,
+            'exists' => false,
+            'isDir' => false,
+            'isFile' => false,
+        ];
 
-        if($keepFileNotExists) {
-            $keepFile = FALSE;
+        if(empty($path)) {
+            return $ret;
+        }
+
+        if($createPath === null || (!is_bool($createPath) && !Validator::isOctal($createPath))) {
+            $createPath = false;
+        }
+
+        $normalizedPath = str_replace(["\\", "/"], DIRECTORY_SEPARATOR, trim($path));
+        $hasTrailingSeparator = str_ends_with($normalizedPath, DIRECTORY_SEPARATOR);
+        $realPath = realpath($normalizedPath);
+        $isExistingFile = $realPath !== false && is_file($realPath);
+        $isExistingDirectory = $realPath !== false && is_dir($realPath);
+        $looksLikeFile = !$hasTrailingSeparator && pathinfo($normalizedPath, PATHINFO_EXTENSION) !== "";
+        $shouldKeepFile = $isExistingFile || (!$isExistingDirectory && ($keepFile || $keepFileNotExists || $looksLikeFile));
+
+        if ($shouldKeepFile) {
+            $ret['file'] = basename($normalizedPath);
+            $directoryPath = dirname($normalizedPath);
         } else {
-            $keepFile = TRUE;
-        }
-        if(!is_bool($createPath) && !Validator::isOctal($createPath)) {
-            $createPath = FALSE;
+            $directoryPath = $normalizedPath;
         }
 
-        $temp = self::getFileAndPath($dir);
-        if(empty($temp['path'])) {
-            return "";
+        if ($directoryPath === "" || $directoryPath === ".") {
+            $directoryPath = getcwd();
         }
 
-        if($createPath !== FALSE && !is_dir($temp['dir'])) {
-            self::createDir($temp['dir'], $createPath === TRUE ? NULL : $createPath);
+        $resolvedDirectory = self::resolvePath($directoryPath);
+
+        if($createPath !== false && !is_dir($resolvedDirectory)) {
+            self::createDir($resolvedDirectory, $createPath === true ? null : $createPath);
+            $createdPath = realpath($resolvedDirectory);
+            if ($createdPath !== false) {
+                $resolvedDirectory = $createdPath;
+            }
         }
 
-        if(
-            !is_dir($temp['dir']) || (
-                $keepFile && !is_file($temp['file'])
-            )
-        ) {
-            return "";
-        } elseif(
-            (
-                $keepFile &&
-                is_file($temp['file'])
-            ) || $keepFileNotExists
-        ) {
-            return $temp['path'];
-        }
+        $ret['dir'] = self::ensureTrailingDirectorySeparator($resolvedDirectory);
+        $ret['path'] = $ret['dir'] . ($ret['file'] !== null ? $ret['file'] : "");
+        $ret['exists'] = file_exists($ret['path']);
+        $ret['isDir'] = is_dir($ret['path']);
+        $ret['isFile'] = is_file($ret['path']);
 
-        return $temp['dir'];
+        return $ret;
     }
 
     /**
@@ -229,17 +343,14 @@ class File {
         };
         $mode = self::getPermissionMode($permissionMode);
 
-        $filePath = self::getFileAndPath($filePath);
-        if(empty($filePath) || empty($filePath['file'])) {
+        $filePath = self::getPathInfo($filePath, keepFileNotExists: true, createPath: $permissionMode ?? true);
+        if(empty($filePath['path']) || empty($filePath['file'])) {
             throw new \Exception("Invalid file path provided for writing!");
         }
 
-        $filePath['dir'] = realpath(self::getPath(dir: $filePath['dir'], createPath: $permissionMode));
-        if(empty($filePath['dir'])) {
+        if(empty($filePath['dir']) || !is_dir($filePath['dir'])) {
             throw new \Exception("Invalid directory path provided for file writing!");
         }
-        if(Str::subStr($filePath['dir'], -1) !== DIRECTORY_SEPARATOR) $filePath['dir'] .= DIRECTORY_SEPARATOR;
-        $filePath['path'] = $filePath['dir'] . $filePath['file'];
 
         $oldMask = umask(0);
         @chmod($filePath['path'], $mode);
@@ -294,8 +405,9 @@ class File {
      * @ref https://stackoverflow.com/questions/3338123/how-do-i-recursively-delete-a-directory-and-its-entire-contents-files-sub-dir
      */
     public static function deleteFoldersRecursively(string $dir): bool {
-        $dir = self::getPath($dir);
-        if (empty($dir)) return false;
+        $pathInfo = self::getPathInfo($dir);
+        if (empty($pathInfo['path']) || !$pathInfo['isDir']) return false;
+        $dir = $pathInfo['path'];
 
         try {
             foreach (
@@ -343,15 +455,16 @@ class File {
      * @ref https://stackoverflow.com/questions/32173320/php-rename-all-files-to-lower-case-in-a-directory-recursively
      */
     public static function standardizeFilesCaseRecursive(string $dir, bool $toUpper = false): bool {
-        $dir = self::getPath($dir);
-        if (empty($dir)) {
+        $pathInfo = self::getPathInfo($dir);
+        if (empty($pathInfo['path']) || !$pathInfo['isDir']) {
             return false;
         }
+        $dir = $pathInfo['path'];
 
         $caseFunction = $toUpper ? 'Str::strToUpper' : 'Str::strToLower';
 
         $iterator = new \RecursiveIteratorIterator(
-            new \RecursiveDirectoryIterator(realpath($dir), \FilesystemIterator::SKIP_DOTS),
+            new \RecursiveDirectoryIterator($dir, \FilesystemIterator::SKIP_DOTS),
             \RecursiveIteratorIterator::CHILD_FIRST
         );
 
@@ -465,10 +578,17 @@ class File {
         if (!extension_loaded('zip')) {
             return false;
         }
-        $destinationPath = self::getPath(dir: $destinationPath, createPath: $permissionMode);
-        $zipPath = self::getPath(dir: $zipPath, keepFile: true);
+        $destinationPathInfo = self::getPathInfo($destinationPath, createPath: $permissionMode ?? true);
+        $zipPathInfo = self::getPathInfo($zipPath, keepFile: true);
+        $destinationPath = $destinationPathInfo['path'];
+        $zipPath = $zipPathInfo['path'];
 
-        if (empty($destinationPath) || empty($zipPath)) return false;
+        if (
+            empty($destinationPath) ||
+            empty($zipPath) ||
+            !$destinationPathInfo['isDir'] ||
+            !$zipPathInfo['isFile']
+        ) return false;
         if (empty($filesToExtract)) return true;
         if (!is_array($filesToExtract)) {
             $filesToExtract = [$filesToExtract];
@@ -593,22 +713,19 @@ class File {
         }
 
         $source = realpath($source);
-        $outputPath = realpath($outputPath);
-        if (empty($source)) return false;
+        if (empty($source) || !is_dir($source)) return false;
 
-        $zipPath = self::getPath(dir: $outputPath, createPath: $permissionMode);
-        if (empty($zipPath)) return false;
-
+        $outputPathInfo = self::getPathInfo($outputPath, createPath: $permissionMode ?? true);
+        if (empty($outputPathInfo['path']) || empty($outputPathInfo['dir']) || !is_dir($outputPathInfo['dir'])) return false;
         $sourceInfo = pathinfo($source);
 
-        $outputFile = substr($outputPath, min($zipPath, strlen($outputPath)));
-        if (empty($outputFile)) {
-            $outputFile = $zipPath . Str::removeStringSuffix($sourceInfo['basename'], DIRECTORY_SEPARATOR) . ".zip";
+        if (empty($outputPathInfo['file'])) {
+            $outputFile = $outputPathInfo['path'] . $sourceInfo['basename'] . ".zip";
         } else {
-            $outputFile = self::getZipName($outputFile);
+            $outputFile = self::getZipName($outputPathInfo['path']);
         }
 
-        $prefixLength = strlen(Str::removeStringSuffix($sourceInfo['dirname'], DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR);
+        $prefixLength = strlen(rtrim($sourceInfo['dirname'], "\\/") . DIRECTORY_SEPARATOR);
 
         $zip = new \ZipArchive();
         $zip->open($outputFile, \ZipArchive::CREATE);
@@ -657,16 +774,10 @@ class File {
 
         if (empty($files)) return false;
 
-        $outputPath = realpath($outputPath);
-        if (empty($outputPath)) return false;
+        $outputPathInfo = self::getPathInfo($outputPath, keepFileNotExists: true, createPath: $permissionMode ?? true);
+        if (empty($outputPathInfo['path']) || empty($outputPathInfo['file']) || !is_dir($outputPathInfo['dir'])) return false;
 
-        $zipPath = self::getPath(dir: $outputPath, createPath: $permissionMode);
-        if (empty($zipPath)) return false;
-
-        $outputFile = substr($outputPath, min($zipPath, strlen($outputPath)));
-        if (empty($outputFile)) return false;
-
-        $outputFile = self::getZipName($outputFile);
+        $outputFile = self::getZipName($outputPathInfo['path']);
         $zip = new \ZipArchive();
         $zip->open($outputFile, \ZipArchive::CREATE);
 
@@ -743,8 +854,9 @@ class File {
      * @return bool TRUE if all files were deleted successfully, FALSE otherwise
      */
     public static function deleteFiles(array $files, string $directory): bool {
-        $directory = self::getPath($directory);
-        if (empty($directory) || empty($files)) return false;
+        $pathInfo = self::getPathInfo($directory);
+        $directory = $pathInfo['path'];
+        if (empty($directory) || empty($files) || !$pathInfo['isDir']) return false;
 
         $success = true;
         foreach ($files as $file) {
@@ -912,10 +1024,11 @@ class File {
             $originalName = $uploadedFile['name'];
 
             $formattedName = self::renameUploadFile($originalName);
-            $finalPath = self::getPath(dir: $targetDirectory, createPath: $permissionMode);
+            $targetPathInfo = self::getPathInfo($targetDirectory, createPath: $permissionMode ?? true);
+            $finalPath = $targetPathInfo['path'];
             $fullFilePath = $finalPath . $formattedName;
 
-            if (!empty($finalPath)) {
+            if (!empty($finalPath) && $targetPathInfo['isDir']) {
                 $response['type'] = $uploadedFile['error'];
 
                 if ($response['type'] === 0) {
