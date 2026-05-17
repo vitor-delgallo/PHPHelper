@@ -13,6 +13,6 @@ Use to convert Excel/CSV spreadsheets into arrays when the optional dependency i
 
 ## Cautions
 
-- Depends on `phpoffice/phpspreadsheet`; do not install it without Vitor's permission.
+- Depends on `phpoffice/phpspreadsheet`; do not install it without user's permission.
 - Validate extension, size, and file origin before processing uploads.
 - For large files, consider memory and execution time.

@@ -15,7 +15,7 @@ Use for email sending through PHPMailer and simple email validation.
 
 ## Cautions
 
-- `sendMail` depends on `phpmailer/phpmailer`; do not install it without Vitor's permission.
+- `sendMail` depends on `phpmailer/phpmailer`; do not install it without user's permission.
 - Do not log SMTP users, passwords, tokens, or sensitive content.
 - Validate and sanitize user data before building subject, body, attachments, and headers.
 - If the project has its own response/queue helper, integrate carefully instead of sending directly from a view.

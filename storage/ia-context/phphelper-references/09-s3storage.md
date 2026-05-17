@@ -33,7 +33,7 @@ Use for Amazon S3 integration through the AWS SDK for PHP. The class keeps stati
 
 ## Cautions
 
-- Depends on `aws/aws-sdk-php`; do not install it without Vitor's permission.
+- Depends on `aws/aws-sdk-php`; do not install it without user's permission.
 - Access key and secret are sensitive; never expose them in logs, responses, or public context.
 - No-op mode returns logical success or benign values without performing real operations.
 - Recursive `delete` can remove many objects; validate prefix and bucket first.

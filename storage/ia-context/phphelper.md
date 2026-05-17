@@ -19,7 +19,7 @@ Keep this document short enough to remain in context by default. Open the docume
 - The library is made of static utility classes.
 - Before creating any new helper in the project, first check whether this library already solves the need.
 - To use it in a project, import the specific class, for example `use VD\PHPHelper\Str;`.
-- Do not install optional dependencies without Vitor's permission. Some classes have features that depend on PHPMailer, PhpSpreadsheet, AWS SDK, curl, openssl, simplexml, dom, zip, libxml, or other extensions.
+- Do not install optional dependencies without user's permission. Some classes have features that depend on PHPMailer, PhpSpreadsheet, AWS SDK, curl, openssl, simplexml, dom, zip, libxml, or other extensions.
 - Some methods send headers, start downloads, call `exit`, or perform write operations. Check behavior before using them in controllers or routes.
 - For user data, prefer `Validator`, `Security`, `Parser`, `Formatter`, and `Str` before creating local validation or cleanup logic.
 - For files, uploads, zip files, `.env`, and paths, prefer `File` before creating new utilities.
@@ -32,7 +32,7 @@ composer config repositories.phphelper vcs https://github.com/vitor-delgallo/PHP
 composer require vitor-delgallo/phphelper:dev-master
 ```
 
-In Whitesky, the dependency is already referenced by `composer.json`. Before installing or changing dependencies, ask Vitor.
+Before installing or changing dependencies, ask the user.
 
 ## Optional Dependencies
 
