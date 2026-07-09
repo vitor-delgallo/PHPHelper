@@ -44,8 +44,8 @@ $hash = Security::generateSearchHash($normalizedEmail, $blindIndexKey); // salt 
 
 Streaming AES-256-GCM. Each block's AAD binds `fileId | version | "D" | index`, and an authenticated
 end marker binds the total block count. This defeats **truncation, reordering, duplication, and
-cross-file splicing** — all rejected on decrypt. `encryptFileV1`/`decryptFileV1` (AES-128-CBC) are
-**unauthenticated legacy** and must not be used for sensitive data.
+cross-file splicing** — all rejected on decrypt. The legacy unauthenticated
+`encryptFileV1`/`decryptFileV1` (AES-128-CBC) were **removed**; only the authenticated V2 remains.
 
 ### Local strings — `encryptLocal` / `decryptLocal`
 
@@ -81,6 +81,5 @@ These need a policy/API decision by the maintainer:
 - **`filterValue(addSlashes/escapeDB)`** are not safe SQL escaping — use prepared statements.
 - **`System::makeSeed`, `Str::generateUniqueKey`, `Str::generateGuid` fallback** use `rand()`/
   `uniqid()` — not cryptographic. Use `random_bytes()`/`random_int()` for any token/secret.
-- **`encryptFileV1`/`decryptFileV1`** — unauthenticated; recommend removing them entirely.
 - **`Validator::isBase64UrlEncoded`, `System::isMemoryGreaterThan`** call undefined functions
   (latent fatals) — fix or remove.
