@@ -143,11 +143,21 @@ class Parser {
 
         if (empty($xmlSource) || is_dir($xmlSource)) return $result;
 
-        if (is_file($xmlSource)) {
-            return self::objectToArray(simplexml_load_file($xmlSource));
+        // Harden against XXE: hard-block external entity resolution and forbid network access
+        // (LIBXML_NONET). No LIBXML_NOENT, so entities are never expanded. NOTE: a string that
+        // happens to be an existing path is loaded as a FILE — never pass untrusted input here
+        // without confirming it is XML content, not a local path (arbitrary-file read).
+        if (\function_exists('libxml_set_external_entity_loader')) {
+            libxml_set_external_entity_loader(static fn() => null);
         }
 
-        return self::objectToArray(simplexml_load_string($xmlSource));
+        if (is_file($xmlSource)) {
+            $xml = simplexml_load_file($xmlSource, \SimpleXMLElement::class, LIBXML_NONET) ?: null;
+        } else {
+            $xml = simplexml_load_string($xmlSource, \SimpleXMLElement::class, LIBXML_NONET) ?: null;
+        }
+
+        return self::objectToArray($xml);
     }
 
     /**

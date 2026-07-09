@@ -17,7 +17,14 @@ class SQL {
             return 'NULL';
         }
         if (is_string($data)) {
-            return "'" . str_replace("'", "''", Str::removeInvisibleCharacters($data)) . "'";
+            // Escape BOTH backslash and single quote. Doubling only the quote (old behavior) let a
+            // trailing backslash (input "a\") escape the closing quote under MySQL's default
+            // sql_mode and break out of the literal -> SQL injection.
+            // WARNING: manual escaping is NOT multibyte-safe on non-UTF-8 connections. Prefer
+            // PARAMETERIZED queries (PDO/mysqli prepared statements) for all untrusted input; use
+            // this helper only when a bound parameter is genuinely impossible.
+            $escaped = str_replace(['\\', "'"], ['\\\\', "\\'"], Str::removeInvisibleCharacters($data));
+            return "'" . $escaped . "'";
         }
         if (is_bool($data)) {
             return (int) $data;

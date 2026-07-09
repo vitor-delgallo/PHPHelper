@@ -624,6 +624,21 @@ class File {
                         $relativePath = substr($filename, Str::strLen($fileToExtract, "UTF-8"));
                         $relativePath = str_replace(["/", "\\"], DIRECTORY_SEPARATOR, $relativePath);
 
+                        // Zip Slip guard: reject entries that escape the destination root via a
+                        // parent-traversal ("..") segment or an absolute/drive-qualified path.
+                        $pathSegments = array_filter(
+                            explode(DIRECTORY_SEPARATOR, $relativePath),
+                            static fn($s) => $s !== '' && $s !== '.'
+                        );
+                        if (
+                            in_array('..', $pathSegments, true) ||
+                            str_starts_with($relativePath, DIRECTORY_SEPARATOR) ||
+                            preg_match('/^[A-Za-z]:/', $relativePath) === 1
+                        ) {
+                            $errors[$i] = $filename;
+                            continue;
+                        }
+
                         if (Str::strLen($relativePath, "UTF-8") > 0) {
                             if (str_ends_with($filename, DIRECTORY_SEPARATOR)) {
                                 if (!is_dir($destinationPath . $relativePath)) {
@@ -860,6 +875,12 @@ class File {
 
         $success = true;
         foreach ($files as $file) {
+            // Reduce to a leaf name so a crafted "../.." or absolute entry cannot escape
+            // $directory and delete arbitrary files.
+            $file = basename((string) $file);
+            if ($file === '' || $file === '.' || $file === '..') {
+                continue;
+            }
             if (is_file($directory . $file)) {
                 $success = @unlink($directory . $file) && $success;
             }

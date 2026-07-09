@@ -146,7 +146,7 @@ class Str {
     public static function removeStringSuffix(?string $string, ?string $suffix): ?string {
         if (empty($string) || empty($suffix)) return $string;
 
-        if (str_starts_with($string, $suffix)) {
+        if (str_ends_with($string, $suffix)) {
             $string = substr_replace($string, "", (-1 * strlen($suffix)));
         }
 
@@ -553,16 +553,21 @@ class Str {
             $suffix = '';
         }
 
-        // Could use strip_tags or htmlentities
-        $text = addslashes(strip_tags($text));
+        // Work on tag-stripped plain text; HTML-encode ONLY at output. addslashes is NOT
+        // HTML-attribute encoding, so the old code allowed attribute-breakout XSS via a
+        // payload like: cliente" onmouseover=alert(1) (no angle brackets to strip).
+        $text = strip_tags($text);
+        $encFull = htmlspecialchars($text, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        $encSuffix = htmlspecialchars($suffix, ENT_QUOTES | ENT_HTML5, 'UTF-8');
 
         if (mb_strwidth($text, 'UTF-8') <= $maxLength) {
-            return '<span class="tooltip_ativo" title="' . $text . '">' . $text . '</span>';
+            return '<span class="tooltip_ativo" title="' . $encFull . '">' . $encFull . '</span>';
         }
 
         $shortened = rtrim(mb_strimwidth($text, 0, $maxLength, '', 'UTF-8'));
+        $encShort = htmlspecialchars($shortened, ENT_QUOTES | ENT_HTML5, 'UTF-8');
 
-        return '<span class="tooltip_ativo" title="' . $text . '">' . $shortened . $suffix . '</span>';
+        return '<span class="tooltip_ativo" title="' . $encFull . '">' . $encShort . $encSuffix . '</span>';
     }
 
     /**

@@ -16,6 +16,59 @@ class Security {
     private static int $fileEncryptBlocksBytes = 0;
 
     /**
+     * Minimum master-key length (in bytes) for the AES-256 code paths. HKDF cannot add
+     * entropy, so a 32-byte master is required to reach real 256-bit strength.
+     *
+     * @var int
+     */
+    private const MIN_KEY_BYTES = 32;
+
+    /**
+     * Version tag for the encryptDataDB/decryptDataDB envelope. Emitted as a prefix AND
+     * bound into the GCM AAD, so a value cannot be reinterpreted under another version.
+     *
+     * @var string
+     */
+    private const DB_ENVELOPE_VERSION = 'v1';
+
+    /**
+     * Version tag for the encryptFileV2/decryptFileV2 authenticated file format.
+     *
+     * @var string
+     */
+    private const FILE_V2_VERSION = 'v2';
+
+    /**
+     * Upper bound (bytes) accepted for a single length-encoded block on read. Prevents a
+     * crafted/corrupted file from forcing a huge allocation before authentication runs.
+     *
+     * @var int
+     */
+    private const MAX_ENCODED_BLOCK_BYTES = 268435456; // 256 MiB
+
+    /**
+     * Generates cryptographically secure random bytes, failing CLOSED.
+     *
+     * Uses random_bytes(), which throws when the platform CSPRNG is unavailable. There is
+     * deliberately NO openssl_random_pseudo_bytes() fallback: that path can return
+     * non-strong bytes, and a weak/repeated GCM nonce is catastrophic (nonce reuse leaks the
+     * GHASH authentication key and enables forgery). Aborting beats encrypting with
+     * unverified randomness.
+     *
+     * @param int $length Number of bytes to generate
+     *
+     * @throws \Exception When no cryptographically strong RNG is available
+     * @return string
+     */
+    private static function secureRandomBytes(int $length): string {
+        try {
+            return random_bytes($length);
+        } catch (\Throwable $e) {
+            throw new \Exception("No cryptographically strong RNG available.", 0, $e);
+        }
+    }
+
+    /**
      * Derives a key of the specified length from the given key & salt using HKDF with SHA-256.
      * This function is used to generate encryption keys of the required length from a base key.
      * 
@@ -26,17 +79,17 @@ class Security {
      * @throws \Exception
      * @return string
      */
-    private static function deriveKey(string $key, int $length, ?string $salt = ""): string {
-        // Checks if the key is empty or it does not has the min length
-        if (empty($key) || mb_strlen($key, '8bit') < 16) {
-            throw new \Exception("Invalid encryption key. The key must be at least 16 bytes long.");
+    private static function deriveKey(string $key, int $length, ?string $salt = "", string $info = 'derived-key'): string {
+        // Checks if the key is empty or it does not have the min length for AES-256.
+        if (empty($key) || mb_strlen($key, '8bit') < self::MIN_KEY_BYTES) {
+            throw new \Exception("Invalid encryption key. The key must be at least " . self::MIN_KEY_BYTES . " bytes long.");
         }
 
         return hash_hkdf(
             'sha256',
             $key,
             $length,
-            'derived-key',
+            $info,
             ($salt ?? "")
         );
     }
@@ -67,6 +120,10 @@ class Security {
                 }
             } 
             
+            // Abort early if the length header grows implausibly long (hostile/corrupt file).
+            if (mb_strlen($lenData, '8bit') > 20) {
+                return false;
+            }
             $lenData .= $char;
         }
 
@@ -76,6 +133,11 @@ class Security {
         }
 
         $len = (int) $lenData;
+        // Bound the declared length BEFORE allocating: a crafted/corrupt file must not be able
+        // to force a huge fread() before any authentication runs (memory-exhaustion DoS).
+        if ($len < 0 || $len > self::MAX_ENCODED_BLOCK_BYTES) {
+            return false;
+        }
         $data = fread($fp, $len);
         if ($data === false || mb_strlen($data, '8bit') !== $len) {
             return false;
@@ -121,8 +183,10 @@ class Security {
         $sourceReal = realpath($source);
         if(!empty($sourceReal)) {
             $ret = $sourceReal;
-        } elseif (!is_uploaded_file($source)) {
-            $ret = false;
+        } elseif (is_uploaded_file($source)) {
+            // A genuine PHP upload whose realpath() failed: keep the tmp path itself
+            // (previously this branch left $ret=false and wrongly rejected real uploads).
+            $ret = $source;
         }
 
         // Checks the validity of the source files
@@ -216,17 +280,19 @@ class Security {
         }
         $str = (string) $str;
 
-        // Checks if the key is empty or it does not has the min length
-        if (empty($key) || mb_strlen($key, '8bit') < 16) {
-            throw new \Exception("Invalid encryption key. The key must be at least 16 bytes long.");
+        // Checks if the key is empty or it does not have the min length for AES-256-grade keying
+        if (empty($key) || mb_strlen($key, '8bit') < self::MIN_KEY_BYTES) {
+            throw new \Exception("Invalid encryption key. The key must be at least " . self::MIN_KEY_BYTES . " bytes long.");
         }
 
+        // Normalize the salt (null -> "") so a null vs "" caller cannot yield different, unstable
+        // blind indexes. The blind index must be perfectly deterministic to match on lookup.
         $keySearch = hash_hkdf(
             'sha256',
             $key,
             32,
             'search-hash',
-            $salt
+            ($salt ?? "")
         );
 
         // hex: 64 caracteres
@@ -528,7 +594,8 @@ class Security {
             throw new \Exception("OpenSSL not loaded");
         }
         $salt = (($salt ?? "") === "" ? "?" : $salt);
-        $key = self::deriveKey($key, 32, $salt);
+        // Domain-separated key (distinct from the DB-cell / local subsystems).
+        $key = self::deriveKey($key, 32, $salt, 'file-v2');
 
         // Attempts to get the absolute path of the source file
         $source = self::getRealSource($source);
@@ -541,9 +608,13 @@ class Security {
 
         // Sets the IV (Initialization Vector) length using the 'AES-256-gcm' algorithm
         $cipher = "aes-256-gcm";
-        $version = "v2";
+        $version = self::FILE_V2_VERSION;
         $iv_length = openssl_cipher_iv_length($cipher);
         $tag_length = 16;
+
+        // Random per-file identity, folded into EVERY block's AAD so blocks cannot be spliced in
+        // from another file (even one under the same key) and the header cannot be swapped.
+        $fileId = bin2hex(self::secureRandomBytes(16));
 
         // Sets the permission of the destination file
         $oldMask = umask(0);
@@ -555,20 +626,23 @@ class Security {
             // Initializes the error flag
             $error = false;
 
-            // Writes the cipher to the destination file
+            // Writes the header (cipher, version, salt, fileId). Its integrity is enforced because
+            // $fileId is bound into every block's AAD and $salt drives key derivation.
             if(!self::writeLengthEncodedBlock($fpOut, $cipher)) {
                 $error = "Error on writing cipher type";
             }
-
-            // Writes the version to the destination file
-            if(!self::writeLengthEncodedBlock($fpOut, $version)) {
+            if(!$error && !self::writeLengthEncodedBlock($fpOut, $version)) {
                 $error = "Error on writing cipher version";
             }
-
-            // Writes the salt to the destination file
-            if(!self::writeLengthEncodedBlock($fpOut, $salt)) {
+            if(!$error && !self::writeLengthEncodedBlock($fpOut, $salt)) {
                 $error = "Error on writing cipher salt";
             }
+            if(!$error && !self::writeLengthEncodedBlock($fpOut, $fileId)) {
+                $error = "Error on writing file id";
+            }
+
+            // Monotonic block counter, bound into each block's AAD to fix its position.
+            $index = 0;
 
             // Attempts to open the source file for reading
             if (!$error && $fpIn = fopen($source, 'rb')) {
@@ -585,21 +659,21 @@ class Security {
                         break;
                     }
 
-                    // Attempts to generate a secure random vector
-                    try {
-                        $iv = random_bytes($iv_length);
-                    } catch (\Exception $e) {
-                        $iv = openssl_random_pseudo_bytes($iv_length);
-                    }
+                    // Fresh CSPRNG nonce; fails closed if no strong RNG is available.
+                    $iv = self::secureRandomBytes($iv_length);
 
-                    // Encrypts the plaintext block
+                    // AAD binds this ciphertext to (file, version, "data", position): reorder,
+                    // duplicate, cross-file splice, and header tamper all fail the GCM tag.
+                    $aad = $fileId . "|" . $version . "|D|" . $index;
                     $ciphertext = openssl_encrypt(
                         $plaintext,
                         $cipher,
                         $key,
                         OPENSSL_RAW_DATA,
                         $iv,
-                        $tag
+                        $tag,
+                        $aad,
+                        $tag_length
                     );
                     if($ciphertext === false) {
                         $error = "Error on creating cipher of plaintext";
@@ -610,31 +684,56 @@ class Security {
                         break;
                     }
 
-                    // Encodes the encrypted iv block in base64
                     if(!self::writeLengthEncodedBlock($fpOut, $iv)) {
                         $error = "Error on writing IV ciphertext";
                         break;
                     }
-
-                    // Encodes the encrypted tag block in base64
                     if(!self::writeLengthEncodedBlock($fpOut, $tag)) {
                         $error = "Error on writing tag ciphertext";
                         break;
                     }
-
-                    // Encodes the encrypted block in base64
                     if(!self::writeLengthEncodedBlock($fpOut, $ciphertext)) {
                         $error = "Error on writing ciphertext";
                         break;
                     }
+
+                    $index++;
                 }
-            } else {
+                @fclose($fpIn);
+            } else if(!$error) {
                 // Sets the error flag if the source file could not be opened
                 $error = "Error on opening source file stream";
             }
 
-            // Closes the source and destination file
-            @fclose($fpIn);
+            // Authenticated trailer: encrypts the total block count under AAD "...|F|<count>", so
+            // dropping trailing blocks (truncation) or removing the trailer is detected on decrypt.
+            if (!$error) {
+                $iv = self::secureRandomBytes($iv_length);
+                $aad = $fileId . "|" . $version . "|F|" . $index;
+                $ciphertext = openssl_encrypt(
+                    (string) $index,
+                    $cipher,
+                    $key,
+                    OPENSSL_RAW_DATA,
+                    $iv,
+                    $tag,
+                    $aad,
+                    $tag_length
+                );
+                if($ciphertext === false) {
+                    $error = "Error on creating end marker";
+                } else if (mb_strlen($tag, '8bit') !== $tag_length) {
+                    $error = "Error on validating end marker tag length";
+                } else if(!self::writeLengthEncodedBlock($fpOut, $iv)) {
+                    $error = "Error on writing end marker IV";
+                } else if(!self::writeLengthEncodedBlock($fpOut, $tag)) {
+                    $error = "Error on writing end marker tag";
+                } else if(!self::writeLengthEncodedBlock($fpOut, $ciphertext)) {
+                    $error = "Error on writing end marker ciphertext";
+                }
+            }
+
+            // Closes the destination file
             @fclose($fpOut);
 
             // Checks if any error occurred during encryption
@@ -705,94 +804,114 @@ class Security {
 
             // Reads the cipher in source file
             $fCipher = self::readLengthEncodedBlock($fpIn);
-            if (is_bool($fCipher)) {
-                $error = "Error on reading cipher type";
-            } else {
-                if ($fCipher !== $cipher) {
-                    $error = "Cipher type does not match with the one used in function";
-                }
+            if (is_bool($fCipher) || $fCipher !== $cipher) {
+                $error = "Cipher type does not match with the one used in function";
             }
 
             // Reads the version in source file
             $fVersion = self::readLengthEncodedBlock($fpIn);
-            if (is_bool($fVersion)) {
-                $error = "Error on reading cipher version";
-            } else {
-                if ($fVersion !== $version) {
-                    $error = "Cipher version does not match with the one used in function";
-                }
+            if (!$error && (is_bool($fVersion) || $fVersion !== $version)) {
+                $error = "Cipher version does not match with the one used in function";
             }
 
             // Reads the salt in source file
             $salt = self::readLengthEncodedBlock($fpIn);
-            if (is_bool($salt)) {
+            if (!$error && is_bool($salt)) {
                 $error = "Error on reading cipher salt";
             }
 
-            $key = self::deriveKey($key, 32, $salt);
+            // Reads the per-file identity (bound into every block AAD).
+            $fileId = self::readLengthEncodedBlock($fpIn);
+            if (!$error && (is_bool($fileId) || $fileId === "")) {
+                $error = "Error on reading file id";
+            }
+
+            if (!$error) {
+                $key = self::deriveKey($key, 32, $salt, 'file-v2');
+            }
+
+            // Expected position of the next data block, and whether the authenticated end marker
+            // was seen. Truncation is detected by the marker being absent.
+            $index = 0;
+            $sawTrailer = false;
+
             // Attempts to open the destination file for writing
-            if (!$error && $fpOut = fopen($destination, $outReadMode)) {
-                // Reads encrypted text blocks, decrypts them, and writes to the destination file
-                while (!feof($fpIn)) {
-                    // Reads encoded iv block
-                    $iv = self::readLengthEncodedBlock($fpIn);
-                    if ($iv === false) {
-                        $error = "Error on reading IV ciphertext";
-                        break;
-                    } else if($iv === true) {
-                        break;
-                    }
-                    if (mb_strlen($iv, '8bit') !== $iv_length) {
-                        $error = "Error on validating iv length";
-                        break;
-                    }
+            $fpOut = false;
+            if (!$error && !($fpOut = fopen($destination, $outReadMode))) {
+                $error = "Error while writing to the destination file.";
+            }
 
-                    // Reads encoded tag block
-                    $tag = self::readLengthEncodedBlock($fpIn);
-                    if (is_bool($tag)) {
-                        $error = "Error on reading tag ciphertext";
-                        break;
-                    } 
-                    if (mb_strlen($tag, '8bit') !== $tag_length) {
-                        $error = "Error on validating tag length";
-                        break;
-                    }
+            while (!$error) {
+                // Reads one [iv][tag][ciphertext] triple.
+                $iv = self::readLengthEncodedBlock($fpIn);
+                if ($iv === true) {
+                    // Clean EOF: valid only if we already consumed the end marker.
+                    break;
+                }
+                if ($iv === false) {
+                    $error = "Error on reading IV ciphertext";
+                    break;
+                }
+                if (mb_strlen($iv, '8bit') !== $iv_length) {
+                    $error = "Error on validating iv length";
+                    break;
+                }
 
-                    // Reads encoded block
-                    $ciphertext = self::readLengthEncodedBlock($fpIn);
-                    if (is_bool($ciphertext)) {
-                        $error = "Error on reading ciphertext";
-                        break;
-                    }
+                $tag = self::readLengthEncodedBlock($fpIn);
+                if (is_bool($tag)) {
+                    $error = "Error on reading tag ciphertext";
+                    break;
+                }
+                if (mb_strlen($tag, '8bit') !== $tag_length) {
+                    $error = "Error on validating tag length";
+                    break;
+                }
 
-                    // Decrypts the encrypted text block
-                    $plaintext = openssl_decrypt(
-                        $ciphertext,
-                        $cipher,
-                        $key,
-                        OPENSSL_RAW_DATA,
-                        $iv,
-                        $tag
-                    );
-                    if ($plaintext === false) {
-                        $error = "Error on creating plaintext of a ciphertext";
-                        break;
-                    }
+                $ciphertext = self::readLengthEncodedBlock($fpIn);
+                if (is_bool($ciphertext)) {
+                    $error = "Error on reading ciphertext";
+                    break;
+                }
 
-                    // Writes the decrypted text to the destination file
+                // Try to authenticate it as the DATA block at the expected position.
+                $dataAad = $fileId . "|" . $version . "|D|" . $index;
+                $plaintext = openssl_decrypt($ciphertext, $cipher, $key, OPENSSL_RAW_DATA, $iv, $tag, $dataAad);
+                if ($plaintext !== false) {
                     if (fwrite($fpOut, $plaintext) === false) {
                         $error = "Error on writing plaintext";
                         break;
                     }
+                    $index++;
+                    continue;
                 }
-            } else {
-                // Sets the error flag if the source file could not be opened
-                $error = "Error while writing to the destination file.";
+
+                // Otherwise it must be the authenticated end marker for exactly $index blocks.
+                $trailerAad = $fileId . "|" . $version . "|F|" . $index;
+                $count = openssl_decrypt($ciphertext, $cipher, $key, OPENSSL_RAW_DATA, $iv, $tag, $trailerAad);
+                if ($count !== false && $count === (string) $index) {
+                    $sawTrailer = true;
+                    // The end marker must be the last block: reject any trailing/spliced data.
+                    if (self::readLengthEncodedBlock($fpIn) !== true) {
+                        $error = "Trailing data after end-of-file marker";
+                    }
+                    break;
+                }
+
+                // Neither a valid data block nor a valid end marker => tamper / reorder / splice.
+                $error = "Error on creating plaintext of a ciphertext";
+                break;
+            }
+
+            // A file with no authenticated end marker has been truncated.
+            if (!$error && !$sawTrailer) {
+                $error = "Encrypted file is truncated (missing authenticated end marker)";
             }
 
             // Closes the source and destination file
             @fclose($fpIn);
-            @fclose($fpOut);
+            if ($fpOut) {
+                @fclose($fpOut);
+            }
 
             // Checks if any error occurred during decryption
             if ($error) {
@@ -811,16 +930,23 @@ class Security {
     }
 
     /**
-     * Encrypts a string using a key with the "aes-256-gcm" algorithm.
+     * Encrypts a value for storage with AES-256-GCM, binding it to a caller-supplied context
+     * (AAD) so a ciphertext cannot be relocated to another cell/row and still decrypt.
      *
-     * @param mixed $str The string to encrypt
-     * @param string $key The encryption key
-     * @param string|null $salt Optional salt for key derivation
+     * Output is a self-describing envelope: "<version>:" . base64(iv || tag || ciphertext).
+     * The version AND the caller's $aad are both fed as GCM Additional Authenticated Data, so a
+     * value cannot be reinterpreted under another version, table, column, or row.
+     *
+     * @param mixed $str The value to encrypt (null/empty encrypt to "")
+     * @param string $key Master key (>= 32 bytes)
+     * @param string $aad Context to bind, e.g. "{table}.{column}:{row_id}". REQUIRED and should be
+     *                     unique per logical cell. An empty AAD is rejected to forbid an unbound value.
+     * @param string|null $salt Optional per-subject salt for key derivation
      *
      * @return string
      * @throws \Exception
      */
-    public static function encryptDataDB(mixed $str, string $key, ?string $salt = ""): string {
+    public static function encryptDataDB(mixed $str, string $key, string $aad, ?string $salt = ""): string {
         if (!extension_loaded('openssl')) {
             throw new \Exception("OpenSSL not loaded");
         }
@@ -834,59 +960,59 @@ class Security {
         }
         $str = (string) $str;
 
-        // Checks if the key is empty or it does not has the min length
-        if (empty($key) || mb_strlen($key, '8bit') < 16) {
-            throw new \Exception("Invalid encryption key. The key must be at least 16 bytes long.");
+        // A missing context defeats the whole point of the AAD binding.
+        if ($aad === "") {
+            throw new \Exception("A non-empty AAD (value context) is required for encryptDataDB.");
         }
-        $key = self::deriveKey($key, 32, $salt);
 
-        // Defines the IV (Initialization Vector) length using the 'aes-256-gcm' algorithm
+        // Domain-separated 256-bit key (distinct from the file/local subsystems).
+        $key = self::deriveKey($key, 32, $salt, 'db-cell');
+
         $cipher = "aes-256-gcm";
         $ivLength = openssl_cipher_iv_length($cipher);
         $tagLength = 16;
 
-        // Generates a random IV. The IV size depends on the algorithm used.
-        try {
-            $iv = random_bytes($ivLength);
-        } catch (\Exception $e) {
-            $iv = openssl_random_pseudo_bytes($ivLength);
-        }
+        // Fresh CSPRNG nonce; fails closed if no strong RNG is available.
+        $iv = self::secureRandomBytes($ivLength);
 
-        // Encrypts the text using "aes-256-gcm", the provided key, and the generated IV.
-        // The $tag value is generated after encryption and is used to verify data integrity.
+        // Bind the envelope version into the AAD so a value cannot be replayed across versions.
+        $fullAad = self::DB_ENVELOPE_VERSION . "|" . $aad;
+
         $ciphertext = openssl_encrypt(
             $str,
             $cipher,
             $key,
             OPENSSL_RAW_DATA,
             $iv,
-            $tag
+            $tag,
+            $fullAad,
+            $tagLength
         );
 
-        // Returns the encrypted text in a base64-encoded string containing the IV,
-        // the ciphertext, and the tag.
         if ($ciphertext === false) {
             throw new \Exception("Encryption failed.");
         }
-
         if (mb_strlen($tag, '8bit') !== $tagLength) {
             throw new \Exception("Invalid authentication tag length.");
         }
 
-        return base64_encode($iv . $tag . $ciphertext);
+        return self::DB_ENVELOPE_VERSION . ":" . base64_encode($iv . $tag . $ciphertext);
     }
 
     /**
-     * Decrypts a message after verifying its integrity using "aes-256-gcm".
+     * Decrypts a value produced by encryptDataDB, verifying the GCM tag over the SAME context
+     * (AAD). A tampered value, a wrong context (relocated ciphertext), an unknown version, or a
+     * wrong key THROWS — it never returns a falsy value a caller could mistake for success.
      *
-     * @param string|null $str Encrypted message
-     * @param string $key Encryption key
-     * @param string|null $salt Optional salt for key derivation
+     * @param string|null $str Envelope produced by encryptDataDB ("" for an empty value)
+     * @param string $key Master key (>= 32 bytes)
+     * @param string $aad The identical context passed to encryptDataDB
+     * @param string|null $salt The identical salt passed to encryptDataDB
      *
-     * @return string|false Decrypted text or FALSE if an error occurs
-     * @throws \Exception
+     * @return string Decrypted text ("" for an empty input)
+     * @throws \Exception On decode / version / authentication failure
      */
-    public static function decryptDataDB(?string $str, string $key, ?string $salt = ""): string|false {
+    public static function decryptDataDB(?string $str, string $key, string $aad, ?string $salt = ""): string {
         if (!extension_loaded('openssl')) {
             throw new \Exception("OpenSSL not loaded");
         }
@@ -895,20 +1021,28 @@ class Security {
             return "";
         }
 
-        // Checks if the key is empty or it does not has the min length
-        if (empty($key) || mb_strlen($key, '8bit') < 16) {
-            throw new \Exception("Invalid encryption key. The key must be at least 16 bytes long.");
+        if ($aad === "") {
+            throw new \Exception("A non-empty AAD (value context) is required for decryptDataDB.");
         }
-        $key = self::deriveKey($key, 32, $salt);
 
-        // Decodes the base64-encoded encrypted text into binary
-        $decoded = Parser::base64Decode($str);
+        // Parse and validate the self-describing version prefix ("<version>:").
+        $sep = strpos($str, ":");
+        if ($sep === false) {
+            throw new \Exception("Malformed envelope: missing version prefix.");
+        }
+        $version = substr($str, 0, $sep);
+        if ($version !== self::DB_ENVELOPE_VERSION) {
+            throw new \Exception("Unsupported envelope version.");
+        }
+        $payload = substr($str, $sep + 1);
+
+        $key = self::deriveKey($key, 32, $salt, 'db-cell');
+
+        $decoded = Parser::base64Decode($payload);
         if ($decoded === false) {
             throw new \Exception("Failed to decode the secret message. Invalid base64.");
         }
 
-        // Gets the IV length based on the encryption algorithm.
-        // We use AES-256-GCM for performance and security.
         $cipher = "aes-256-gcm";
         $ivLength = openssl_cipher_iv_length($cipher);
         $tagLength = 16;
@@ -921,16 +1055,25 @@ class Security {
         $tag = mb_substr($decoded, $ivLength, $tagLength, '8bit');
         $ciphertext = mb_substr($decoded, $ivLength + $tagLength, null, '8bit');
 
-        // Decrypts the text using "aes-256-gcm", the provided key, IV, and tag.
-        // Extracts the IV, tag, and ciphertext from the decoded string.
-        return openssl_decrypt(
+        // Bind the same version + context; a mismatch fails the GCM tag below.
+        $fullAad = self::DB_ENVELOPE_VERSION . "|" . $aad;
+
+        $plaintext = openssl_decrypt(
             $ciphertext,
             $cipher,
             $key,
             OPENSSL_RAW_DATA,
             $iv,
-            $tag
+            $tag,
+            $fullAad
         );
+
+        // GCM authentication failure (tamper / wrong context / wrong key) => fail LOUD.
+        if ($plaintext === false) {
+            throw new \Exception("Decryption failed: authentication tag mismatch.");
+        }
+
+        return $plaintext;
     }
 
     /**
@@ -969,23 +1112,19 @@ class Security {
         if (empty($key) || mb_strlen($key, '8bit') < 16) {
             throw new \Exception("Invalid encryption key. The key must be at least 16 bytes long.");
         }
-        $key = self::deriveKey($key, 32, $salt);
+        $key = self::deriveKey($key, 32, $salt, 'local');
 
         // Derive encryption and authentication keys using HKDF
         [$encKey, $authKey] = [
             hash_hkdf("sha256", $key, 32, "local-encryption"),
             hash_hkdf("sha256", $key, 32, "local-authentication"),
         ];
-        
+
         $cipher = "aes-256-ctr";
         $ivLength = openssl_cipher_iv_length($cipher);
 
-        // Generate a secure random IV (nonce)
-        try {
-            $nonce = random_bytes($ivLength);
-        } catch (\Exception $e) {
-            $nonce = openssl_random_pseudo_bytes($ivLength);
-        }
+        // Fresh CSPRNG nonce; fails closed if no strong RNG is available.
+        $nonce = self::secureRandomBytes($ivLength);
 
         // Encrypt the plaintext using AES-256-CTR
         $encryptedData = openssl_encrypt(
@@ -1033,7 +1172,7 @@ class Security {
         if (empty($key) || mb_strlen($key, '8bit') < 16) {
             throw new \Exception("Invalid encryption key. The key must be at least 16 bytes long.");
         }
-        $key = self::deriveKey($key, 32, $salt);
+        $key = self::deriveKey($key, 32, $salt, 'local');
 
         // Derive encryption and authentication keys using HKDF
         [$encKey, $authKey] = [

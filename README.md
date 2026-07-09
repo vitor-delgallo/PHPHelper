@@ -80,6 +80,23 @@ composer require vitor-delgallo/phphelper:dev-master
 
 ---
 
+## 🔒 Security
+
+This library encrypts sensitive data. Read **[`SECURITY.md`](SECURITY.md)** for the cryptographic
+contract (AES-256-GCM with **required AAD** context binding, HKDF per-domain keys, keyed HMAC blind
+indexes, authenticated files) and for caller responsibilities (SSRF, XSS output-encoding,
+parameterized SQL). Encryption keys must be **>= 32 bytes**.
+
+---
+
+## 🧪 Testing
+
+```bash
+php tests/SecurityCryptoTest.php
+```
+
+---
+
 ## 🤝 Contributing
 If you want to contribute, feel free to open **issues** and **pull requests** in the repository!
 
