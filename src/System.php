@@ -42,51 +42,93 @@ class System {
     }
 
     /**
-     * Converts a string representing a memory size (e.g., "2GB") into its equivalent in bytes.
+     * Resolves a memory unit string to its power-of-1024 index in getMemoryUnitOrder().
      *
-     * @param string|null $input The memory size string
-     * @return int|false The size in bytes or false if the conversion failed
+     * Accepts the multi-letter form ("kb") and the single-letter shorthand ("k") that PHP itself
+     * uses for memory_limit / post_max_size / upload_max_filesize. Nothing else is accepted: the
+     * IEC forms ("kib") and any unknown unit ("x") are rejected rather than guessed at.
+     *
+     * @param string $unit Unit to resolve. Must already be lowercase and free of surrounding
+     *                     whitespace. An empty string means "plain byte count" and resolves to 0.
+     * @return int|false The exponent for pow(1024, $index), or false if the unit is not recognised.
+     */
+    private static function resolveMemoryUnitIndex(string $unit): int|false {
+        if ($unit === '') {
+            return 0;
+        }
+
+        $units = self::getMemoryUnitOrder();
+
+        $index = array_search($unit, $units, true);
+        if ($index !== false) {
+            return $index;
+        }
+
+        // Single-letter shorthand: "m" is "mb". The first letters of getMemoryUnitOrder() are unique.
+        if (strlen($unit) === 1) {
+            foreach ($units as $i => $candidate) {
+                if ($candidate[0] === $unit) {
+                    return $i;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Converts a string representing a memory size (e.g. "2GB", "512M", "1.5gb", "1024") into bytes.
+     *
+     * Accepted format, case-insensitive: an optional run of whitespace, a non-negative decimal
+     * number, optional whitespace, an optional unit, optional whitespace. Units are binary
+     * (1024-based), so "1kb" is 1024 bytes, and are either the multi-letter forms returned by
+     * getMemoryUnitOrder() ("b", "kb", "mb", "gb", "tb", "pb", "eb", "zb", "yb") or their
+     * single-letter shorthand ("b", "k", "m", "g", "t", "p", "e", "z", "y") — the form PHP itself
+     * uses for memory_limit, post_max_size and upload_max_filesize. Without a unit the number is
+     * taken as a plain byte count. A fractional byte result is floored ("1.5b" -> 1).
+     *
+     * @param string|null $input The memory size string. Required; null is a conversion failure.
+     * @return int|false The size in bytes, or false if the conversion failed. Conversion FAILS for:
+     *                   null, "", a string with no number ("gb"), a negative value ("-1", including
+     *                   PHP's "memory_limit = -1"), an unknown unit ("5x", "5kib"), any other
+     *                   unparseable input, and any result at or above PHP_INT_MAX ("9yb"), which
+     *                   cannot be represented as an int. It never throws and never returns a
+     *                   partially-parsed number: check `=== false` and the value is trustworthy.
      */
     public static function convertMemoryToBytes(?string $input): int|false {
         if ($input === null) {
             return false;
         }
 
-        $units = self::getMemoryUnitOrder();
-
-        $parsed = [
-            'num' => Str::onlyNumbers($input),
-            'unit' => Str::strToLower(Str::onlyLetters($input))
-        ];
-
-        if (empty($parsed['num'])) {
-            $parsed['num'] = 1;
+        if (!preg_match('/^\s*([0-9]+(?:\.[0-9]+)?)\s*([a-z]*)\s*$/i', $input, $matches)) {
+            return false;
         }
 
-        $parsed['num'] = $parsed['num'] * 1;
-
-        $index = array_search($parsed['unit'], $units);
-
-        if ($index === 0) {
-            return $parsed['num'];
+        $index = self::resolveMemoryUnitIndex(Str::strToLower($matches[2]));
+        if ($index === false) {
+            return false;
         }
 
-        if ($index === false && strlen($parsed['unit']) > 1) {
-            $index = array_search(substr($parsed['unit'], 0, 1), $units);
+        $bytes = ((float) $matches[1]) * pow(1024, $index);
 
-            if ($index === 0) {
-                return $parsed['num'];
-            } elseif ($index === false) {
-                return false;
-            }
+        // (int) on a float at/above 2**63 is undefined behaviour, so refuse instead of returning garbage.
+        if ($bytes >= (float) PHP_INT_MAX) {
+            return false;
         }
 
-        return $parsed['num'] * pow(1024, $index);
+        return (int) floor($bytes);
     }
 
     /**
-     * Retrieves memory usage information from the operating system.
-     * Works on both Windows and Linux systems.
+     * Retrieves PHYSICAL memory usage of the whole machine from the operating system.
+     * This is the box, not the PHP process: see getMemoryUsage() for the current process.
+     *
+     * Best-effort probe. It shells out to `wmic` on Windows and reads /proc/meminfo on everything
+     * else, suppressing any diagnostic those may raise, and returns null — never a partial array
+     * and never a warning — when the numbers cannot be obtained. Returning null is ROUTINE, not
+     * exceptional: `wmic` is deprecated and absent from Windows 11 24H2 / Server 2025 onwards,
+     * /proc/meminfo is unreadable under many hardened/containerised setups and open_basedir, and
+     * exec() is disabled on most shared hosting. Callers MUST handle null.
      *
      * @return array{
      *     totalBytes: int,
@@ -96,7 +138,9 @@ class System {
      *     usage: string,
      *     free: string,
      *     freePercent: float
-     * }|null Memory data or null if the data could not be retrieved
+     * }|null Memory data, or null if the OS did not give usable numbers. freePercent is the share
+     *        of physical memory that is FREE (freeBytes / totalBytes * 100), floored to 2 decimals
+     *        — not the used share. usageBytes is totalBytes - freeBytes.
      *
      * @see https://www.php.net/manual/en/function.memory-get-usage.php
      */
@@ -107,9 +151,20 @@ class System {
         ];
 
         if (stripos(PHP_OS, 'win') !== false) {
-            // Windows
-            @exec("wmic ComputerSystem get TotalPhysicalMemory", $outputTotal);
-            @exec("wmic OS get FreePhysicalMemory", $outputFree);
+            // Windows.
+            // function_exists() is not paranoia: exec() is in disable_functions on most shared
+            // hosting, and calling a disabled function raises an \Error ("Call to undefined
+            // function") that the @ operator does NOT suppress — which would break the documented
+            // "returns null" contract with an uncatchable-by-\Exception fatal.
+            $outputTotal = [];
+            $outputFree = [];
+
+            if (function_exists('exec')) {
+                // 2>NUL: on Windows 11 24H2+ / Server 2025 wmic is gone and cmd would otherwise
+                // write "'wmic' is not recognized" to stderr on every call, polluting caller logs.
+                @exec("wmic ComputerSystem get TotalPhysicalMemory 2>NUL", $outputTotal);
+                @exec("wmic OS get FreePhysicalMemory 2>NUL", $outputFree);
+            }
 
             if ($outputTotal && $outputFree) {
                 foreach ($outputTotal as $line) {
@@ -128,7 +183,7 @@ class System {
             }
         } else {
             // Linux
-            if (is_readable('/proc/meminfo')) {
+            if (@is_readable('/proc/meminfo')) {
                 $content = @file_get_contents('/proc/meminfo');
 
                 if ($content !== false) {
@@ -141,17 +196,24 @@ class System {
                         $key = Str::removeExcessSpaces(Str::strToLower($parts[0]), false);
                         $value = Str::removeExcessSpaces(Str::strToLower($parts[1]), false);
 
-                        if ($key === 'memtotal') {
-                            $result['totalBytes'] = self::convertMemoryToBytes($value);
-                        } elseif ($key === 'memfree') {
-                            $result['freeBytes'] = self::convertMemoryToBytes($value);
+                        if ($key !== 'memtotal' && $key !== 'memfree') {
+                            continue;
                         }
+
+                        // An unparseable line leaves the field null, which makes this method
+                        // return null below — never a false that would poison the arithmetic.
+                        $bytes = self::convertMemoryToBytes($value);
+                        if ($bytes === false) {
+                            continue;
+                        }
+
+                        $result[$key === 'memtotal' ? 'totalBytes' : 'freeBytes'] = $bytes;
                     }
                 }
             }
         }
 
-        if (is_null($result['totalBytes']) || is_null($result['freeBytes'])) {
+        if (is_null($result['totalBytes']) || is_null($result['freeBytes']) || $result['totalBytes'] <= 0) {
             return null;
         }
 
@@ -160,7 +222,7 @@ class System {
         $result['usage'] = self::convertBytesToReadable($result['usageBytes']);
         $result['free'] = self::convertBytesToReadable($result['freeBytes']);
         $result['freePercent'] = Number::roundDecimal(
-            (100 - ($result['freeBytes'] * 100 / $result['totalBytes'])),
+            ($result['freeBytes'] * 100 / $result['totalBytes']),
             2,
             'floor'
         );
@@ -169,8 +231,16 @@ class System {
     }
 
     /**
-     * Returns detailed information about the current memory usage by PHP.
-     * Includes usage in bytes and human-readable format, total and free memory, and free memory percentage.
+     * Returns detailed information about the memory available to the current PHP process.
+     *
+     * "Total" is PHP's own memory_limit, which is the ceiling that actually matters to a script.
+     * When memory_limit is negative ("-1", i.e. no PHP limit) or unparseable, the machine's
+     * physical total from getServerMemoryUsage() is used instead. Free memory is the remaining
+     * headroom under that total, capped by the physical memory the OS still has free when the OS
+     * can be asked — you cannot allocate what the box does not have.
+     *
+     * Always returns the full array; it never throws and never returns null, even when the OS
+     * probe fails (see getServerMemoryUsage(), where that is routine).
      *
      * @return array{
      *     usageBytes: int,
@@ -180,156 +250,175 @@ class System {
      *     freeBytes: int,
      *     free: string,
      *     freePercent: float
-     * }
+     * } usageBytes is memory_get_usage(true) — real memory allocated from the OS by this process.
+     *   freePercent is the share of totalBytes still FREE (freeBytes / totalBytes * 100), floored
+     *   to 2 decimals — NOT the used share: it falls towards 0 as memory runs out.
+     *   UNKNOWN TOTAL: if memory_limit is unlimited AND the OS probe returns null, the total is
+     *   unknowable here; totalBytes and freeBytes are then 0 and freePercent is 0.0. Test
+     *   `totalBytes > 0` before trusting freePercent — a 0.0 there means "unknown", not
+     *   "exhausted". usageBytes/usage are always real.
      *
      * @see http://php.net/manual/en/function.memory-get-usage.php
      */
     public static function getMemoryUsage(): array {
-        $result = [];
+        $serverMemory = self::getServerMemoryUsage();
 
-        $serverMemory = self::getServerMemoryUsage(); //VERIFICAR
+        $usageBytes = memory_get_usage(true);
 
-        $result['usageBytes'] = memory_get_usage(true);
-        $result['usage'] = self::convertBytesToReadable($result['usageBytes']);
+        // A negative memory_limit ("-1") means "no PHP ceiling"; fall back to the physical total.
+        $memoryLimit = (string) ini_get('memory_limit');
+        $limitBytes = Validator::isNegativeNumber($memoryLimit)
+            ? false
+            : self::convertMemoryToBytes($memoryLimit);
 
-        $memoryLimit = ini_get('memory_limit');
+        if ($limitBytes !== false && $limitBytes > 0) {
+            $totalBytes = $limitBytes;
 
-        if (!Validator::isNegativeNumber($memoryLimit)) {
-            $result['totalBytes'] = self::convertMemoryToBytes($memoryLimit);
-            $result['freeBytes'] = min(($result['totalBytes'] - $result['usageBytes']), $serverMemory['freeBytes']);
-            if ($result['freeBytes'] < 0) {
-                $result['freeBytes'] = 0;
+            $freeBytes = $limitBytes - $usageBytes;
+            if ($serverMemory !== null) {
+                // Never claim more free memory than the machine physically has left.
+                $freeBytes = min($freeBytes, $serverMemory['freeBytes']);
             }
+
+            $freeBytes = max(0, $freeBytes);
         } else {
-            $result['totalBytes'] = $serverMemory['totalBytes'];
-            $result['freeBytes'] = $serverMemory['freeBytes'];
+            // 0 = unknown: no PHP limit and no OS numbers. Documented in @return.
+            $totalBytes = $serverMemory['totalBytes'] ?? 0;
+            $freeBytes = $serverMemory['freeBytes'] ?? 0;
         }
 
-        $result['total'] = self::convertBytesToReadable($result['totalBytes']);
-        $result['usage'] = self::convertBytesToReadable($result['usageBytes']);
-        $result['free'] = self::convertBytesToReadable($result['freeBytes']);
-
-        $result['freePercent'] = Number::roundDecimal(
-            (100 - ($result['freeBytes'] * 100 / $result['totalBytes'])),
-            2,
-            'floor'
-        );
-
-        return $result;
+        // Assembled in the documented @return order: the key order is what json_encode() emits.
+        return [
+            'usageBytes' => $usageBytes,
+            'usage' => self::convertBytesToReadable($usageBytes),
+            'totalBytes' => $totalBytes,
+            'total' => self::convertBytesToReadable($totalBytes),
+            'freeBytes' => $freeBytes,
+            'free' => self::convertBytesToReadable($freeBytes),
+            'freePercent' => $totalBytes > 0
+                ? Number::roundDecimal(($freeBytes * 100 / $totalBytes), 2, 'floor')
+                : 0.0,
+        ];
     }
 
     /**
-     * Compares two memory size strings and returns true if memory A is greater than memory B.
+     * Compares two memory size strings and returns true if memory A is strictly greater than B.
      *
-     * @param string|null $memoryA Memory value to compare (e.g., "512MB")
-     * @param string|null $memoryB Memory value to compare (e.g., "256MB")
-     * @return bool True if A > B, otherwise false
+     * Both operands go through convertMemoryToBytes() and are compared as byte counts, so the
+     * units do not have to match and neither does their notation: "1GB" vs "2048MB" compares
+     * 1073741824 against 2147483648 and is correctly false.
+     *
+     * Unparseable input never throws; it resolves to the fail-closed answer on each side, so a
+     * typo in a configured limit tightens a guard instead of opening it.
+     *
+     * @param string|null $memoryA Memory value to compare (e.g. "512MB", "512M", "1.5gb", "1024").
+     *                             If null/""/unparseable, this returns FALSE: an unknown A is
+     *                             never treated as greater than B.
+     * @param string|null $memoryB Memory value to compare (e.g. "256MB"). If null/""/unparseable
+     *                             while A is valid, this returns TRUE: an absent or unreadable B
+     *                             is treated as no ceiling at all, so A is taken to exceed it.
+     * @return bool True if A > B, false if A <= B or A is unusable. Equal values return false.
+     *              Never throws.
      */
     public static function isMemoryGreaterThan(?string $memoryA, ?string $memoryB): bool
     {
-        if (empty($memoryA)) return false;
-        if (empty($memoryB)) return true;
-
-        $validUnits = self::getMemoryUnitOrder(); // Uses same units as getMemoryUnits()
-
-        $memoryAParsed = [
-            'num' => apenasNumeros($memoryA), //VERIFICAR
-            'unit' => my_strtolower(apenasLetras($memoryA)) //VERIFICAR
-        ];
-        if (empty($memoryAParsed['num'])) {
-            $memoryAParsed['num'] = 1;
-        }
-        $memoryAParsed['num'] *= 1;
-
-        if (!in_array($memoryAParsed['unit'], $validUnits)) {
+        $bytesA = self::convertMemoryToBytes($memoryA);
+        if ($bytesA === false) {
             return false;
         }
 
-        $memoryBParsed = [
-            'num' => apenasNumeros($memoryB), //VERIFICAR
-            'unit' => my_strtolower(apenasLetras($memoryB)) //VERIFICAR
-        ];
-        if (empty($memoryBParsed['num'])) {
-            $memoryBParsed['num'] = 1;
-        }
-        $memoryBParsed['num'] *= 1;
-
-        if (!in_array($memoryBParsed['unit'], $validUnits)) {
+        $bytesB = self::convertMemoryToBytes($memoryB);
+        if ($bytesB === false) {
             return true;
         }
 
-        // Same unit: compare numerically
-        if (
-            $memoryAParsed['unit'] === $memoryBParsed['unit'] &&
-            $memoryAParsed['num'] > $memoryBParsed['num']
-        ) {
-            return true;
-        }
-
-        // Different units: compare unit scale
-        foreach ($validUnits as $unit) {
-            if ($memoryAParsed['unit'] === $unit) {
-                return false;
-            } elseif ($memoryBParsed['unit'] === $unit) {
-                return true;
-            }
-        }
-
-        return false;
+        return $bytesA > $bytesB;
     }
 
     /**
-     * Generates a seed for random functions based on a string or the current time in microseconds.
+     * Seeds PHP's legacy rand() generator, optionally from a string, so a sequence is reproducible.
      *
-     * @param string|null $seed Optional custom seed value. If null, uses microtime and a random number.
+     * SECURITY: this seeds the generator behind rand()/shuffle()/str_shuffle(), which is NOT
+     * cryptographically secure and is fully predictable to anyone who learns or guesses the seed.
+     * Never use it for tokens, passwords, keys, OTPs, IDs or anything else that must be
+     * unguessable — use random_int() / random_bytes(), which cannot be seeded, for those.
+     *
+     * @param string|null $seed Optional seed. NULL (the default) derives a non-reproducible seed
+     *                          from the current microtime plus rand(). Any other value is honoured
+     *                          exactly, INCLUDING "" and "0": a numeric string is cast to int and
+     *                          used as-is ("42" seeds srand(42)); any other string is hashed with
+     *                          crc32(), which is what makes a string seed reproducible
+     *                          ("order-7" seeds srand(crc32("order-7"))). Note "" and "0" both
+     *                          seed srand(0), since crc32("") is 0.
      * @return void
      *
      * @see https://www.php.net/manual/en/function.srand.php
      */
     public static function makeSeed(?string $seed = null): void {
-        if (empty($seed)) {
+        if ($seed === null) {
             list($microseconds, $seconds) = explode(' ', microtime());
-            $seed = (int) (
-                ( ((int) $seconds) + ((int) $microseconds) * 1000000 ) +
+
+            srand((int) (
+                ( ((int) $seconds) + ((int) (((float) $microseconds) * 1000000)) ) +
                 rand(0, 99999)
-            );
+            ));
+            return;
         }
 
-        srand($seed);
+        // srand() takes an int: a non-numeric string would be an uncaught TypeError.
+        srand(is_numeric($seed) ? (int) $seed : crc32($seed));
     }
 
     /**
-     * Controls named timers by initializing, resetting, or retrieving timestamps.
+     * Controls named timers: starts/restarts one, reads elapsed time, or discards them.
      *
-     * This function uses a static array to store named timers (as formatted timestamps).
+     * Timers live in a static array for the lifetime of the PHP process, keyed by name. Each entry
+     * holds the wall-clock start ('started_at', a 'Y-m-d H:i:s.u' string) and a monotonic start
+     * ('started_ns', from hrtime()); elapsed time is measured from the monotonic one, so a clock
+     * adjustment cannot corrupt it. The store is process-wide and shared by every caller — a name
+     * is a global key, so prefix names you do not want another component to reset.
      *
-     * - "init" or "reset": initializes or resets the timer with the current date/time.
-     * - "get": retrieves the timestamp of a specific timer or all timers.
+     * NEVER returns a string, despite the elapsed values being time-based: every result is an
+     * array or null (the ": ?array" signature makes a string return impossible).
      *
-     * @param string|null $timerName The name of the timer to control. Required unless type is "get".
-     * @param string $type Type of control: "init", "reset", or "get". Defaults to "init".
+     * @param string|null $timerName Timer name. Required for "init" and "reset". For "get" it is
+     *                               optional: null/"" reads EVERY timer. For "clear" it is
+     *                               optional too, and null/"" discards EVERY timer.
+     * @param string $type Case-insensitive. One of:
+     *                     - "init"/"reset" (default "init"): (re)starts $timerName at now.
+     *                     - "get": reads elapsed time without stopping the timer.
+     *                     - "clear": discards $timerName, or all timers when no name is given.
+     *                     Any other value, or "", is a no-op that returns null.
      *
-     * @return string|array|null Returns the timestamp string, array of all timers, or null if not applicable.
+     * @return array{timer: string, started_at: string}|array{timer: string, started_at: string, now: string, elapsed_ms: float, elapsed_seconds: float}|list<array{timer: string, started_at: string, now: string, elapsed_ms: float, elapsed_seconds: float}>|null
+     *         Depends on $type:
+     *         - "init"/"reset": ['timer' => name, 'started_at' => 'Y-m-d H:i:s.u'].
+     *         - "get" with a name: that array plus 'now', 'elapsed_ms' and 'elapsed_seconds'
+     *           (floats, rounded to 3 and 6 decimals) — or NULL if the timer was never started
+     *           or has been cleared.
+     *         - "get" without a name: a list of those arrays, one per live timer; [] when none.
+     *         - "clear": always null (the discard still happens).
+     *         - Missing name on "init"/"reset", empty/unknown $type: null, and nothing happens.
      */
     public static function timer(?string $timerName, string $type = "init"): ?array {
         if (empty($type)) {
             return null;
         }
-    
+
         $type = Str::strToLower($type);
-        if (empty($timerName) && $type !== "get") {
+        if (empty($timerName) && $type !== "get" && $type !== "clear") {
             return null;
         }
-    
+
         static $timers = [];
-    
+
         switch ($type) {
             case "clear":
                 if (!empty($timerName)) {
-                    $timers[$timerName] = null;
-                    $timers[$timerName] = [];
+                    // unset(), not = []: an empty entry would survive isset() in "get" and then
+                    // read a missing 'started_ns'.
+                    unset($timers[$timerName]);
                 } else {
-                    $timers = null;
                     $timers = [];
                 }
                 break;

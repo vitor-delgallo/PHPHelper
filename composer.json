@@ -21,7 +21,8 @@
     "ext-ctype": "*",
     "ext-calendar": "*",
     "ext-zip": "*",
-    "ext-libxml": "*"
+    "ext-libxml": "*",
+    "phpunit/phpunit": "^11.0"
   },
   "suggest": {
     "phpmailer/phpmailer": "Requerido para envio de e-mails",
@@ -42,5 +43,13 @@
     "psr-4": {
       "VD\\PHPHelper\\": "src/"
     }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "VD\\PHPHelper\\Tests\\": "tests/"
+    }
+  },
+  "scripts": {
+    "test": "phpunit"
   }
 }

@@ -24,9 +24,21 @@ use Aws\Exception\AwsException;
  *
  * Return conventions:
  * - When S3 is disabled (no‑op), write/read methods return logical success
- *   (true) or benign values (empty string / empty array).
- * - On real errors (AWS exceptions), methods return false and populate
- *   getLastError().
+ *   (true) or benign values (empty string / empty array), without contacting AWS.
+ *   No‑op is entered ONLY by calling setNoOperation(true). It is never enabled
+ *   automatically.
+ * - On errors, methods return false and populate getLastError(). "Error" here covers
+ *   BOTH real AWS failures AND missing configuration — they are not distinguishable
+ *   from the return value alone, only from the getLastError() text.
+ *
+ * Configuration is mandatory, and missing configuration is NOT no‑op:
+ * - Without setKey() + setSecret(), and without setBucket(), every public method
+ *   returns false (or [] / null per its own signature) with a "not configured"
+ *   message in getLastError(). An unconfigured deployment therefore HARD-FAILS; it
+ *   does not degrade gracefully. Call setNoOperation(true) if graceful degradation
+ *   is what you want.
+ * - A default bucket registered with setBucket() is required even when you pass
+ *   $bucket explicitly to every method call: the client is not built without one.
  */
 class S3Storage
 {
@@ -153,6 +165,10 @@ class S3Storage
      * - Does not perform validation by itself.
      * - Recommended to pass a valid AWS region string
      *   (e.g. us-east-1, sa-east-1, eu-west-1).
+     * - Discards any cached S3 client, so the new region takes effect on the next
+     *   operation. The region is baked into the client's endpoint at construction, so
+     *   without this the client would keep addressing the previous region while
+     *   createBucket() read the new one for LocationConstraint — a guaranteed mismatch.
      *
      * @param string $region AWS region to be used by the service.
      *
@@ -161,6 +177,7 @@ class S3Storage
     public static function setRegion(string $region): void
     {
         self::$region = $region;
+        self::$client = null;
     }
 
     /**
@@ -192,6 +209,11 @@ class S3Storage
      *
      * - Overrides the current access key stored in the class.
      * - Useful when credentials need to be injected dynamically at runtime.
+     * - Discards any cached S3 client, so the new key takes effect on the next operation.
+     *   Credentials are baked into the client at construction; without this invalidation a
+     *   key rotation or a tenant switch would silently keep signing requests with the
+     *   PREVIOUS credentials for the life of the process.
+     * - Pair with setSecret(): a key without its matching secret will fail to authenticate.
      * - This value is sensitive and should be handled carefully.
      *
      * @param string $key AWS access key.
@@ -201,18 +223,24 @@ class S3Storage
     public static function setKey(string $key): void
     {
         self::$key = $key;
+        self::$client = null;
     }
     
     /**
      * Returns the AWS access key currently configured in the class.
      *
      * - Intended for internal use only.
-     * - Returns the value previously defined through setKey().
+     * - Returns the value previously defined through setKey(), or NULL when no key
+     *   has been configured (the initial state, and the state after reset()).
      * - This value is sensitive and should not be exposed outside secure internal flows.
      *
-     * @return string Currently configured AWS access key.
+     * The return type is nullable on purpose: the backing property is ?string, and the
+     * only consumer (getClient()) tests it with empty(). Declaring `: string` here made
+     * every unconfigured call raise a TypeError instead of reaching that guard.
+     *
+     * @return string|null Currently configured AWS access key, or null if not configured.
      */
-    private static function getKey(): string
+    private static function getKey(): ?string
     {
         return self::$key;
     }
@@ -222,6 +250,8 @@ class S3Storage
      *
      * - Overrides the current secret key stored in the class.
      * - Useful when credentials need to be injected dynamically at runtime.
+     * - Discards any cached S3 client, so the new secret takes effect on the next
+     *   operation. See setKey() for why this invalidation is required.
      * - This value is highly sensitive and should be handled carefully.
      *
      * @param string $secret AWS secret key.
@@ -231,18 +261,22 @@ class S3Storage
     public static function setSecret(string $secret): void
     {
         self::$secret = $secret;
+        self::$client = null;
     }
 
     /**
      * Returns the AWS secret key currently configured in the class.
      *
      * - Intended for internal use only.
-     * - Returns the value previously defined through setSecret().
+     * - Returns the value previously defined through setSecret(), or NULL when no secret
+     *   has been configured (the initial state, and the state after reset()).
      * - This value is highly sensitive and should never be exposed outside secure internal flows.
      *
-     * @return string Currently configured AWS secret key.
+     * The return type is nullable on purpose: see the note on getKey().
+     *
+     * @return string|null Currently configured AWS secret key, or null if not configured.
      */
-    private static function getSecret(): string
+    private static function getSecret(): ?string
     {
         return self::$secret;
     }
@@ -344,17 +378,32 @@ class S3Storage
      * Obtains (or initialises) the S3 client.
      *
      * Behaviour:
-     * - If one already exists, returns the singleton instance.
-     * - If AWS_S3_KEY/SECRET are missing, it enables no‑op, sets lastError and returns null.
-     * - On initialisation error, sets lastError and returns null.
      * - Clears lastError on each attempt to obtain the client.
+     * - In no‑op mode (setNoOperation(true)), returns null WITHOUT reading credentials and
+     *   without setting lastError. No‑op never depends on credential state; every caller
+     *   checks isNoOperation() before using the returned client.
+     * - If one already exists, returns the cached singleton instance.
+     * - If the key/secret are missing, sets lastError and returns null. It does NOT enable
+     *   no‑op mode: missing configuration makes callers return false, not logical success.
+     *   No‑op is entered ONLY through setNoOperation(true).
+     * - If no default bucket has been registered via setBucket(), sets lastError and returns
+     *   null — this applies even when the caller passes $bucket per method call.
+     * - On initialisation error, sets lastError and returns null.
      *
-     * @return S3Client|null S3 client or null if unavailable/disabled.
+     * @return S3Client|null S3 client, or null in no‑op mode / when unconfigured / on error.
      */
     private static function getClient(): ?S3Client
     {
         // reset last error on each attempt to obtain the client
         self::$lastError = null;
+
+        // No‑op short-circuits before any credential access, so the documented no‑op
+        // contract holds for an unconfigured deployment and a successful no‑op call
+        // leaves getLastError() null.
+        if (self::isNoOperation()) {
+            return null;
+        }
+
         if (self::$client !== null) {
             return self::$client;
         }
@@ -412,6 +461,25 @@ class S3Storage
     private static function hasExtension(string $key): bool
     {
         return pathinfo($key, PATHINFO_EXTENSION) !== '';
+    }
+
+    /**
+     * Checks whether a download() "SAVE:" destination carries the same extension as the key.
+     *
+     * The comparison is case-insensitive: an S3 key and a local path routinely disagree on
+     * extension casing ("a/REPORT.PDF" vs "/tmp/report.pdf"), and rejecting that pairing
+     * serves no purpose. Two extensionless paths compare equal ('' === ''), so the caller
+     * must reject an extensionless destination separately if the key has an extension.
+     *
+     * @param string $key    Object key in S3.
+     * @param string $saveAs Local destination path.
+     *
+     * @return bool True when both extensions match ignoring case; false otherwise.
+     */
+    private static function saveAsExtensionMatchesKey(string $key, string $saveAs): bool
+    {
+        return strtolower(pathinfo($key, PATHINFO_EXTENSION))
+            === strtolower(pathinfo($saveAs, PATHINFO_EXTENSION));
     }
 
     /**
@@ -480,10 +548,13 @@ class S3Storage
      * Creates a bucket if it does not exist.
      *
      * Behaviour:
-     * - If S3 is in no‑op mode (not configured), returns true.
+     * - If S3 is in no‑op mode (setNoOperation(true)), returns true without contacting AWS.
+     *   Note "no‑op" means exactly that flag — an unconfigured deployment is NOT no‑op and
+     *   returns false here (see the class-level Return conventions).
      * - If the bucket already exists, returns true.
      * - If it is created successfully, returns true.
-     * - On a real failure (AWS/IO), returns false and populates getLastError().
+     * - On a failure (AWS/IO, or missing key/secret/default bucket), returns false and
+     *   populates getLastError().
      *
      * Notes:
      * - The bucket name must be globally unique across AWS.
@@ -729,20 +800,35 @@ class S3Storage
      * Behaviour:
      * - If $recursive = false (default):
      *   - Removes only the exact object identified by $key.
+     *   - $key MUST end with a file extension, or the call is REJECTED (returns false,
+     *     nothing is deleted). This mirrors upload(), which refuses to write a key without
+     *     an extension, so every object this library creates satisfies it. The guard exists
+     *     to stop a folder prefix being handed to a single-object delete.
+     *   - Deleting a key that does not exist returns true: S3's DeleteObject is idempotent,
+     *     so true means "the object is not there", NOT "an object was removed".
      * - If $recursive = true:
-     *   - Treats $key as a prefix (e.g. "folders/reports/") and deletes
-     *     all objects starting with that prefix.
+     *   - Treats $key as a PREFIX (e.g. "folders/reports/") and deletes every object whose
+     *     key starts with it. The extension rule does not apply.
+     *   - The prefix is matched literally, with no folder-boundary logic: the prefix
+     *     "uploads/report" also deletes "uploads/report-2024-draft.pdf". Always end a
+     *     prefix with "/" unless you mean that. Do NOT reach for $recursive = true just to
+     *     delete one extensionless key — you may take its siblings with it.
      *
      * Rules:
      * - In no‑op mode, returns true without calling S3.
      * - On success, returns true.
      * - On error, returns false and populates getLastError().
      *
-     * @param string $key       Exact object key or folder prefix in S3.
+     * Inherited by move() and rename(): both delete the SOURCE with $recursive = false, so
+     * an extensionless $fromKey makes them fail AFTER the copy has already succeeded. They
+     * then roll the destination back and return false, and getLastError() names delete().
+     *
+     * @param string $key       Exact object key (must have an extension) when $recursive is
+     *                          false; a folder prefix when $recursive is true.
      * @param bool   $recursive If true, deletes all objects beginning with $key.
      * @param string $bucket    Bucket name (optional; uses the class default bucket if empty).
      *
-     * @return bool True on success or no‑op; false on error.
+     * @return bool True on success or no‑op; false on error or on a rejected key.
      */
     public static function delete(string $key, bool $recursive = false, string $bucket = ''): bool
     {
@@ -800,9 +886,18 @@ class S3Storage
     /**
      * Moves an object within S3.
      *
-     * Implements copy() + delete() of the source object.
+     * Implements copy() + delete() of the source object. The source is deleted only after
+     * the copy reports success; if the delete then fails, the destination is rolled back and
+     * false is returned.
      *
-     * @param string $fromKey          Source key (exact).
+     * Preconditions inherited from delete(): $fromKey MUST end with a file extension (the
+     * source is removed with $recursive = false). An extensionless $fromKey fails after the
+     * copy, triggering the rollback, with a getLastError() that names delete().
+     *
+     * With $overwrite = false, an existing destination makes copy() return false, so the
+     * source is NOT deleted and nothing is lost.
+     *
+     * @param string $fromKey          Source key (exact; must have an extension).
      * @param string $toKey            Destination key (exact).
      * @param bool   $overwrite        If false, does not overwrite the destination.
      * @param bool   $preserveMetadata If false, REPLACE metadata (you may use $options['Metadata']).
@@ -845,9 +940,12 @@ class S3Storage
     /**
      * Renames an object within the SAME bucket.
      *
-     * Shortcut to move() keeping source and destination in the same bucket.
+     * Shortcut to move() keeping source and destination in the same bucket. Metadata is
+     * always preserved; pass through move() directly if you need REPLACE.
      *
-     * @param string $fromKey   Current key.
+     * Preconditions inherited from move()/delete(): $fromKey MUST end with a file extension.
+     *
+     * @param string $fromKey   Current key (must have an extension).
      * @param string $toKey     New key.
      * @param bool   $overwrite If false, does not overwrite the destination.
      * @param string $bucket    Bucket (optional; uses the default bucket if empty).
@@ -871,16 +969,28 @@ class S3Storage
      * - If $mode begins with "STREAM": returns the file contents as a stream.
      * - If $mode begins with "DOWNLOAD_TEXT": sends HTTP headers and echoes the contents (forcing a browser download as text).
      * - If $mode begins with "DOWNLOAD_STREAM:[MiB]": sends HTTP headers and streams the contents in chunks of the specified MiB (default 8 MiB).
-     * - If $mode begins with "SAVE:/path/to/file": saves the requested file locally.
+     * - If $mode begins with "SAVE:/path/to/file": saves the requested file locally. The
+     *   destination extension is REQUIRED to match the key's (see Notes). The path may be
+     *   wrapped in square brackets — "SAVE:[/path/to/file]" — and MUST be when it contains
+     *   a colon: the path is taken as everything after the FIRST colon, so an unwrapped
+     *   Windows path ("SAVE:C:\dir\f.txt") is truncated to "C". Use "SAVE:[C:\dir\f.txt]".
      *
      * No‑op behaviour:
      * - When S3 is disabled, returns true (if saving to file or sending to output) or an empty string (if returning in memory).
      *
      * Notes:
-     * - For consistency, it is recommended that the extension of the saved file ($mode "SAVE:") matches that of the key.
+     * - "SAVE:" REQUIRES the destination path's extension to match the key's extension.
+     *   This is enforced, not advisory: on a mismatch nothing is downloaded, the method
+     *   returns false and getLastError() explains. The comparison is case-insensitive, so
+     *   key "a/REPORT.PDF" may be saved to "/tmp/report.pdf", but an extensionless
+     *   destination (e.g. the path returned by tempnam()) is REJECTED — give the temp file
+     *   the key's extension, or use "TEXT"/"STREAM" and write the bytes yourself.
+     * - Any unrecognised $mode returns false without contacting S3.
      *
      * @param string $key   Object key in S3.
-     * @param string $mode  Defines the download mode (see above).
+     * @param string $mode  Defines the download mode (see above). One of "TEXT", "STREAM",
+     *                      "DOWNLOAD_TEXT", "DOWNLOAD_STREAM[:MiB]", "SAVE:/path/to/file".
+     *                      Case-insensitive for the mode name itself; the SAVE path is not.
      * @param string $bucket Bucket name (optional; uses the class default bucket if empty).
      *
      * @return mixed File content as string, stream resource, true/false when operating on a file or direct output.
@@ -934,7 +1044,7 @@ class S3Storage
 
         // If saving to a file, validate the extension (only when $saveAs is not null)
         if ($saveAs !== null) {
-            if (pathinfo($key, PATHINFO_EXTENSION) !== pathinfo($saveAs, PATHINFO_EXTENSION)) {
+            if (!self::saveAsExtensionMatchesKey($key, $saveAs)) {
                 self::$lastError = "[AWS S3] download(): The SaveAs '{$saveAs}' and the key '{$key}' in bucket '{$bucket}' must end with the same extension.";
                 return false;
             }

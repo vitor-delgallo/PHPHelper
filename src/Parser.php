@@ -41,23 +41,41 @@ class Parser {
     }
 
     /**
-     * Converts an array into XML format.
+     * Converts an array or object into XML, filling $xml in place.
      *
-     * @param array|object $data The array to convert
-     * @param \SimpleXMLElement|null $xml XML object passed by reference to be modified
-     * @param string $rootNode The name of the root node (default: 'root')
+     * Mapping rules:
+     *  - A NON-numeric key becomes an element of that name.
+     *  - A NUMERIC key (i.e. any list element) becomes an `<item>` element, because a number is not
+     *    a legal XML element name. So `['ids' => [1, 2]]` yields `<ids><item>1</item><item>2</item></ids>`.
+     *  - Nested arrays/objects recurse; scalars become text content. NULL and FALSE become an empty
+     *    element, TRUE becomes "1" (PHP string casting).
+     *  - Values are entity-escaped, so any text (including '&' and '<') round-trips through a parser.
      *
-     * @return void
+     * @param array|object $data The data to convert. An empty array yields just the empty root node.
+     * @param \SimpleXMLElement|null $xml BY REFERENCE. Pass null (the default) to have the root node
+     *                                    created and assigned here; pass an existing node to append into it.
+     * @param string $rootNode Name of the root node, used ONLY when $xml is null. Falls back to 'root'
+     *                         when empty. MUST be a valid XML element name.
+     *
+     * @return void The result is written to $xml, which is never null after a successful call.
+     *
+     * @throws \Exception If $rootNode is not a valid XML element name (SimpleXMLElement cannot parse it).
+     *
+     * ELEMENT NAMES ARE NOT VALIDATED OR SANITIZED: non-numeric keys are used verbatim. A key that is
+     * not a legal XML name (e.g. 'bad key') is emitted as-is, producing a MALFORMED document with no
+     * warning and no exception — it only fails later, in whatever parses it. VALUES are escaped and are
+     * always safe; KEYS are not. Never build element names from untrusted input.
      *
      * @ref https://stackoverflow.com/questions/37618094/php-convert-array-to-xml
      */
     public static function arrayToXml(array|object $data, ?\SimpleXMLElement &$xml = null, string $rootNode = "root"): void {
-        if (empty($xml)) {
+        // Must be `$xml === null`, NOT `empty($xml)`: a SimpleXMLElement with no children casts to
+        // FALSE, so empty() would discard a real, caller-supplied node and build a detached root
+        // whose contents are never attached to the caller's tree.
+        if ($xml === null) {
+            // empty() is deliberate: '' and '0' are both invalid XML element names.
             if (empty($rootNode)) $rootNode = "root";
             $xml = new \SimpleXMLElement("<{$rootNode}/>");
-            if (empty($data) || (!is_array($data) && !is_object($data))) {
-                $xml->addChild($rootNode, $data);
-            }
         }
 
         if (is_object($data)) {
@@ -65,36 +83,50 @@ class Parser {
         }
 
         foreach ($data as $key => $value) {
-            if (is_array($value)) {
-                if(!is_numeric($key)) {
-                    $subnode = $xml->addChild($key);
+            $name = is_numeric($key) ? 'item' : (string) $key;
+
+            if (is_array($value) || is_object($value)) {
+                $subnode = $xml->addChild($name);
+                // addChild() returns null on an invalid element name (after warning). Never recurse
+                // with null: the by-reference param would build an orphan root that is silently
+                // dropped, losing the whole subtree without a trace.
+                if ($subnode === null) {
+                    continue;
                 }
                 self::arrayToXml($value, $subnode);
-            } else {
-                if ($value !== []) {
-                    $xml->addChild($key, $value);
-                }
+                continue;
             }
+
+            // addChild() escapes '<' and '>' but NOT '&': given a raw '&' it warns and DROPS the
+            // value entirely. Pre-escaping avoids that, and does not double-escape — addChild
+            // leaves the '&' of our own entities untouched.
+            $xml->addChild($name, htmlspecialchars((string) $value, ENT_XML1, 'UTF-8'));
         }
     }
 
     /**
      * Removes null values from an array recursively.
      *
-     * @param array|null $array The input array
-     * @return array The cleaned array without nulls
+     * KEY-PRESERVING, like array_filter(): 'name' => 'Ana' stays under 'name'. Use
+     * resetArrayIndexes() afterwards if you want a gapless 0-based list.
+     *
+     * Only the value NULL is removed. Other falsy values ('', 0, false, []) are kept. A nested array
+     * whose entries were all null survives as an empty array, it is not itself removed.
+     *
+     * @param array|null $array The input array. NULL is treated as [].
+     * @return array The same structure with every null entry removed, original keys intact.
      */
     public static function arrayRemoveNulls(?array $array): array {
         if (empty($array)) $array = [];
 
         $cleaned = [];
-        foreach ($array as $item) {
+        foreach ($array as $key => $item) {
             if ($item === null) continue;
 
             if (!is_array($item)) {
-                $cleaned[] = $item;
+                $cleaned[$key] = $item;
             } else {
-                $cleaned[] = self::arrayRemoveNulls($item);
+                $cleaned[$key] = self::arrayRemoveNulls($item);
             }
         }
 
@@ -104,34 +136,68 @@ class Parser {
     /**
      * Converts an array into a PHP object.
      *
-     * @param array $array The array to convert
-     * @return object|null The resulting object, or null if empty
+     * Performs a JSON round-trip, so only JSON-representable data survives: nested associative arrays
+     * become stdClass, nested LIST arrays stay PHP arrays, and resources/closures are lost.
+     *
+     * A top-level list (e.g. [1, 2, 3] or a result set) JSON-encodes to an array, which cannot satisfy
+     * the declared object return type, so it is cast to stdClass with the numeric keys as property
+     * names ('0', '1', ...). objectToArray() reverses that faithfully.
+     *
+     * @param array $array The array to convert. Any shape is accepted (list or associative).
+     * @return object|null NULL when $array is empty, AND ALSO when the data cannot be JSON-encoded
+     *                     (e.g. malformed UTF-8 from a latin1/cp850 source). NULL is therefore
+     *                     "no object", not proof of emptiness. Never throws.
      *
      * @ref https://stackoverflow.com/questions/9169892/how-to-convert-multidimensional-array-to-object-in-php
      */
     public static function arrayToObject(array $array): object|null {
         if (empty($array)) return null;
-        return json_decode(json_encode($array));
+
+        $json = json_encode($array);
+        if ($json === false) return null;
+
+        $decoded = json_decode($json);
+        if ($decoded === null) return null;
+
+        // A JSON array decodes to a PHP array; cast it so the declared `object` return type holds
+        // instead of throwing a TypeError on the single most common input shape (a result set).
+        return is_object($decoded) ? $decoded : (object) $decoded;
     }
 
     /**
      * Converts an object into an associative array.
      *
-     * @param object|null $object The object to convert
-     * @return array The resulting array
+     * Performs a JSON round-trip, so this is a DEEP conversion that sees only what JSON sees: public
+     * properties (private/protected are dropped, unlike a (array) cast), or whatever jsonSerialize()
+     * returns for a JsonSerializable object.
+     *
+     * @param object|null $object The object to convert. NULL/property-less objects yield [].
+     * @return array The resulting array. Returns [] — never null, never throws — when $object is
+     *               empty, when it cannot be JSON-encoded (e.g. malformed UTF-8 from a latin1/cp850
+     *               source), or when its JSON form is not an object/array (e.g. a JsonSerializable
+     *               returning a scalar). [] therefore means "nothing convertible", NOT "was empty";
+     *               validate the input yourself if you must tell those apart.
      *
      * @ref https://stackoverflow.com/questions/9169892/how-to-convert-multidimensional-array-to-object-in-php
      */
     public static function objectToArray(object|null $object): array {
         if (empty($object)) return [];
-        return json_decode(json_encode($object), true);
+
+        $json = json_encode($object);
+        if ($json === false) return [];
+
+        $decoded = json_decode($json, true);
+        return is_array($decoded) ? $decoded : [];
     }
 
     /**
      * Converts an XML string or file path into an associative array.
      *
-     * @param string $xmlSource XML content or path to XML file
-     * @return array The resulting array from the XML
+     * @param string $xmlSource XML content, OR a path to an XML file (see the warning below).
+     * @return array The resulting array. Returns [] when the simplexml extension is missing, when
+     *               $xmlSource is empty or a directory, and when the XML is malformed — a malformed
+     *               document also emits a PHP warning unless you have called
+     *               libxml_use_internal_errors(true). [] is thus "nothing parsed", not "empty document".
      *
      * @ref https://www.php.net/manual/en/function.simplexml-load-file.php
      */
@@ -152,7 +218,17 @@ class Parser {
         }
 
         if (is_file($xmlSource)) {
-            $xml = simplexml_load_file($xmlSource, \SimpleXMLElement::class, LIBXML_NONET) ?: null;
+            // Read the file and parse it as a STRING. simplexml_load_file() cannot be used while the
+            // XXE guard above is installed: libxml routes its request for the MAIN DOCUMENT through
+            // the same external-entity loader, which returns null for everything, so every file load
+            // failed with "Failed to load external entity" and this method silently returned [].
+            // Loading the bytes ourselves keeps the guard strictly intact — the loader still refuses
+            // every entity — while making the documented file-path input actually work.
+            $contents = file_get_contents($xmlSource);
+            if ($contents === false || $contents === '') {
+                return $result;
+            }
+            $xml = simplexml_load_string($contents, \SimpleXMLElement::class, LIBXML_NONET) ?: null;
         } else {
             $xml = simplexml_load_string($xmlSource, \SimpleXMLElement::class, LIBXML_NONET) ?: null;
         }
@@ -181,10 +257,17 @@ class Parser {
 
 
     /**
-     * Encodes a string to a URL-safe Base64 format.
+     * Encodes a string to a URL-safe Base64 VARIANT.
      *
-     * @param string|null $input The input string to be encoded.
-     * @return string|null Encoded string or null if input is empty.
+     * NOT RFC 4648 base64url. This uses a private alphabet — '+' => '.', '/' => '_', '=' => '-' —
+     * whereas RFC 4648 §5 uses '+' => '-', '/' => '_' and strips padding. The two disagree on the
+     * meaning of '-', so a standard decoder (JS atob after the usual replaces, or any compliant
+     * library) silently produces CORRUPT output rather than failing. Output of this method is only
+     * safe to decode with base64UrlDecode(). Kept as-is deliberately: switching alphabets would
+     * invalidate every token and URL already issued.
+     *
+     * @param string|null $input The string to encode.
+     * @return string|null Encoded string, or NULL if $input is null or ''.
      *
      * @see https://stackoverflow.com/questions/1374753/passing-base64-encoded-strings-in-url
      */
@@ -197,63 +280,99 @@ class Parser {
     }
 
     /**
-     * Decodes a URL-safe Base64 encoded string back to its original format.
+     * Decodes a string produced by base64UrlEncode() back to its original form.
+     *
+     * Only decodes this library's private alphabet ('.' => '+', '_' => '/', '-' => '='); see
+     * base64UrlEncode() — this is NOT RFC 4648 base64url and will mangle standard base64url input.
+     *
+     * Decoding is ALWAYS strict: input containing characters outside the Base64 alphabet fails. There
+     * is no strictness option (a previous version of this docblock advertised a $strict parameter that
+     * never existed — PHP silently ignores the extra argument, so passing one has no effect).
      *
      * @param string|null $input The encoded string to decode.
-     * @param bool $strict If true, decoding will return false if the input contains invalid characters.
-     * @return string|null Decoded string or null if input is empty.
+     * @return bool|string The decoded string, or FALSE if $input is null/'' or is not valid Base64.
+     *                     Mirrors base64Decode(). Test with `=== false`: a failure is never reported
+     *                     as '' or null, so a strict check is reliable.
      *
      * @see https://stackoverflow.com/questions/1374753/passing-base64-encoded-strings-in-url
      */
-    public static function base64UrlDecode(?string $input): ?string {
+    public static function base64UrlDecode(?string $input): bool|string {
         if ($input === null || $input === '') {
-            return null;
+            return false;
         }
 
+        // The `bool|string` return type is load-bearing: under `?string` PHP would coerce
+        // base64Decode()'s FALSE into '', making the documented `=== false` guard dead code and
+        // letting malformed tokens pass as a "successfully decoded" empty string.
         return self::base64Decode(strtr($input, '._-', '+/='));
     }
 
     /**
-     * Converts a string into its binary representation, separating each character's binary with spaces.
+     * Converts a string into its binary representation: one space-separated group of exactly 8 bits
+     * per BYTE, most significant bit first.
      *
-     * @param string|null $input The string to convert
-     * @return string Binary representation of the string
+     * Operates on bytes, not on Unicode characters: a multi-byte UTF-8 character produces one 8-bit
+     * group per byte (so "é" yields two groups).
+     *
+     * The fixed 8-bit width is what makes the output portable — it can be decoded by binaryToString()
+     * or by any external consumer doing the conventional str_split($bits, 8) / int-parse-base-2.
+     *
+     * @param string|null $input The string to convert.
+     * @return string Space-separated 8-bit groups, or '' if $input is null or ''.
      *
      * @ref https://stackoverflow.com/questions/6382738/convert-string-to-binary-then-back-again-using-php
      * @ref http://www.inanzzz.com/index.php/post/swf8/converting-string-to-binary-and-binary-to-string-with-php
      */
     public static function stringToBinary(?string $input): string {
-        if ($input === null) return "";
+        if ($input === null || $input === '') return "";
 
         $characters = str_split($input);
         $binary = [];
 
         foreach ($characters as $index => $char) {
             $bin = base_convert(unpack('H*', $char)[1], 16, 2);
-            $binary[$index] = str_pad($bin, strlen($bin) * 8, "0", STR_PAD_LEFT);
+            // Pad to 8, NOT to strlen($bin) * 8: the latter makes the group width depend on the
+            // byte's VALUE (56 bits for 'A', 64 for 0xFF), which no external decoder can read.
+            $binary[$index] = str_pad($bin, 8, "0", STR_PAD_LEFT);
         }
 
         return implode(' ', $binary);
     }
 
     /**
-     * Function binaryToString.
-     * Converts a binary string (with space-separated characters) back to a normal string.
+     * Converts a space-separated binary string back to a normal string. Exact inverse of
+     * stringToBinary(): binaryToString(stringToBinary($s)) === $s for every byte value, including
+     * NUL, TAB and LF.
      *
-     * @param string|null $binaryInput Binary string to convert
-     * @return string Decoded string
+     * Groups wider than 8 bits are also accepted (leading zeros are numerically irrelevant), so
+     * output written by older, ragged-width versions still decodes correctly.
+     *
+     * @param string|null $binaryInput Space-separated groups of binary digits. MUST contain only
+     *                                 '0', '1' and spaces: any other character triggers a PHP
+     *                                 deprecation from base_convert() and is silently ignored,
+     *                                 yielding garbage. Validate untrusted input before calling.
+     * @return string The decoded string, or '' if $binaryInput is null or ''.
      *
      * @ref https://stackoverflow.com/questions/6382738/convert-string-to-binary-then/-back-again-using-php
      * @ref http://www.inanzzz.com/index.php/post/swf8/converting-string-to-binary-and-binary-to-string-with-php
      */
     public static function binaryToString(?string $binaryInput): string {
-        if ($binaryInput === null) return "";
+        // '' must short-circuit: explode(' ', '') is [''], and base_convert('', 2, 16) is '0',
+        // which would emit a spurious NUL byte instead of an empty string.
+        if ($binaryInput === null || $binaryInput === '') return "";
 
         $binaries = explode(' ', $binaryInput);
         $output = "";
 
         foreach ($binaries as $binary) {
-            $output .= pack('H*', base_convert($binary, 2, 16));
+            $hex = base_convert($binary, 2, 16);
+            // base_convert() drops leading zeros, so any byte < 0x10 yields a single hex digit.
+            // pack('H*') pads an odd-length string on the RIGHT, turning 0x0A ('a') into 0xA0 —
+            // silently corrupting every byte 0x00-0x0F, i.e. LF and TAB. Pad left to even length.
+            if (strlen($hex) % 2 !== 0) {
+                $hex = '0' . $hex;
+            }
+            $output .= pack('H*', $hex);
         }
 
         return $output;
@@ -310,18 +429,60 @@ class Parser {
     }
 
     /**
-     * Determines if a value is considered truthy.
-     * Returns false if the value is considered completely empty by custom rules.
+     * Normalizes any value to a boolean, the way a human-entered flag is meant to read.
      *
-     * @param mixed $value The value to test
-     * @return bool True if the value is not considered completely empty, false otherwise
+     * FALSE is returned for:
+     *  - boolean false;
+     *  - numeric zero in any form: 0, 0.0, -0, '0', '0.0', '00', '0e0' (leading/trailing spaces ok);
+     *  - null, '' and "\0";
+     *  - the empty array [] and an object with no properties;
+     *  - these words, case-insensitively and ignoring surrounding spaces: 'false', 'null',
+     *    'undefined', 'no', 'n', 'tno', '{}', '[]'.
+     *
+     * TRUE is returned for everything else, including 'true', 'yes', any non-zero number, any
+     * non-empty array/object, and any other non-empty string.
+     *
+     * An object implementing __toString() is judged by its string value (so a wrapper around 'no' is
+     * FALSE); any other object is judged only on whether it has properties.
+     *
+     * This is NOT PHP's own (bool) cast: PHP reads '0.0', 'false' and 'no' as TRUE. It is meant for
+     * flags arriving as text from a form, a query string, JSON, or a legacy DB column.
+     *
+     * @param mixed $value The value to normalize. Any type is accepted; never throws.
+     * @return bool
      */
     public static function getBool(mixed $value): bool {
-        if (Validator::isCompletelyEmpty($value)) {
-            return false;
+        // These four guards must run BEFORE Validator::isCompletelyEmpty(). That helper is built on
+        // emptyExceptZero() (which deliberately keeps zero as non-empty) and its zero-catching branch
+        // is dead code: `filter_var($value, FILTER_VALIDATE_INT) && ...` short-circuits because
+        // filter_var returns int(0), which is itself falsy. Delegating blindly therefore reports
+        // false/0/'0' as TRUE while reporting the STRING 'false' as FALSE — an inversion that fails
+        // OPEN on a permission or visibility flag. It also casts the value to string internally,
+        // which warns on an array and throws on an object.
+        if (is_bool($value)) {
+            return $value;
+        }
+        if (is_int($value) || is_float($value)) {
+            return $value != 0;
+        }
+        if (is_array($value)) {
+            return $value !== [];
+        }
+        if ($value instanceof \Stringable) {
+            // Judge by the string value, not by the property count: emptyExceptZero() would call a
+            // property-less Stringable EMPTY, so a wrapper around 'yes' would read as false.
+            $value = (string) $value;
+        }
+        if (is_object($value)) {
+            // Matches emptyExceptZero()'s own `empty((array) $value)` rule. No non-Stringable object
+            // may reach isCompletelyEmpty(), which would throw casting it to string.
+            return (array) $value !== [];
+        }
+        if (is_string($value) && is_numeric($value)) {
+            return (float) $value != 0.0;
         }
 
-        return true;
+        return !Validator::isCompletelyEmpty($value);
     }
 
     /**
@@ -369,17 +530,26 @@ class Parser {
 
     /**
      * Splits a string into an array of lines.
-     * Supports breaking by newline characters or HTML <br> tags.
      *
-     * @param string|null $text The string to split
-     * @return array The resulting array of lines
+     * Breaks on line breaks ONLY — CRLF, CR, LF, and the HTML tags <br>, <br/>, <br /> (any case).
+     * Spaces and tabs are NOT delimiters: they stay inside the line, so an address or a full name
+     * survives a splitLines()/joinLines() round-trip intact.
+     *
+     * A <br> tag immediately followed by a newline counts as ONE break — that newline is source
+     * formatting, not a second line. Otherwise every break splits: consecutive breaks yield
+     * empty-string entries, i.e. blank lines are preserved rather than discarded.
+     *
+     * @param string|null $text The string to split.
+     * @return array The lines. Returns [] for null, '' and '0' (empty() semantics).
      */
     public static function splitLines(?string $text): array {
         if (empty($text)) {
             return [];
         }
 
-        return preg_split('/([\s\t\n\r])|(<br\s*\/?>)+/i', $text);
+        // The old pattern was `[\s\t\n\r]`, whose `\s` matches a SPACE — it split on every word, so
+        // joinLines(splitLines($address)) replaced each space with '<br />'. Match real breaks only.
+        return preg_split('/<br\s*\/?>\r?\n?|\r\n|\r|\n/i', $text);
     }
 
     /**
@@ -481,8 +651,14 @@ class Parser {
      *
      * Example: "065066067" → "ABC"
      *
-     * @param string|null $numericText String composed of 3-digit ASCII codes
+     * @param string|null $numericText String composed of 3-digit ASCII codes, as produced by
+     *                                 stringToNumericSequence(). Returned unchanged if null or ''.
      * @return string|null Decoded original string
+     *
+     * @throws \TypeError If $numericText contains anything but digits — chr() rejects a non-numeric
+     *                    string. Codes are taken in groups of 3 and reduced modulo 256, so a length
+     *                    that is not a multiple of 3 decodes the trailing group as a short number
+     *                    rather than failing. Validate untrusted input before calling.
      *
      * @link https://stackoverflow.com/questions/8087432/convert-a-string-to-number-and-back-to-string
      */
@@ -505,15 +681,24 @@ class Parser {
      *
      * Useful for applying a default or fixed value to a field across all rows.
      *
-     * @param array|null $input The array of arrays to modify
-     * @param string|null $key The key to be set or overwritten in each sub-array
-     * @param mixed $value The value to assign to the key
+     * @param array|null $input The array of arrays to modify. NULL and [] are legal and yield [].
+     *                          EVERY element must itself be an array — see @throws.
+     * @param string|null $key The key to set/overwrite in each sub-array. NULL and '' are legal and
+     *                         make the call a no-op returning $input unchanged. Note '0' IS a valid
+     *                         key here (emptyExceptZero, not empty()).
+     * @param mixed $value The value to assign to the key.
      *
-     * @return array The modified array with the key set in each sub-element
+     * @return array The modified array, outer keys preserved. Never null.
+     *
+     * @throws \Error If any element of $input is not an array — a scalar element cannot take an array
+     *                offset and an object element cannot be used as an array. A null element is
+     *                silently promoted to [$key => $value].
      */
     public static function setValueForKeyInArray(?array $input, ?string $key, mixed $value = null): array {
         if (empty($input) || Validator::emptyExceptZero($key)) {
-            return $input;
+            // `?? []`, not `$input`: returning the raw null would throw a TypeError against the
+            // declared `: array` return type on exactly the nullable input the signature invites.
+            return $input ?? [];
         }
 
         array_walk($input, function (&$item) use ($key, $value) {
@@ -523,23 +708,57 @@ class Parser {
     }
 
     /**
-     * Retrieves a specific object or array from a list of arrays or objects, based on a unique key-value pair.
+     * Retrieves the first item from a list of arrays or objects whose $keyName equals $keyValue.
      *
-     * @param array|null $arrayOfItems List of associative arrays or objects
-     * @param string|null $keyName The key/property name to search by
-     * @param string|int|null $keyValue The value to match within the specified key/property
+     * $arrayOfItems may have ANY keys — a 0-based list, an id-keyed map, or the gapped result of an
+     * array_filter() all work. Elements that are not arrays/objects, or that lack $keyName (or hold
+     * null there), are skipped rather than shifting the search.
      *
-     * @return array Returns the matched item as an array, or an empty array if not found
+     * Comparison is a non-strict STRING comparison (strval on both sides), so the int 3 matches the
+     * string '3'. Array/object values in the key are never matched.
+     *
+     * @param array|null $arrayOfItems List of associative arrays and/or objects. NULL/[] yield [].
+     * @param string|null $keyName The key (array) or public property (object) to search by. NULL/''
+     *                             yield [].
+     * @param string|int|null $keyValue The value to match. NULL and '' yield [] without searching —
+     *                                  this method cannot be used to find a null/empty-valued key.
+     *
+     * @return array The matched item. An OBJECT match is converted with objectToArray(), so only its
+     *               public/JSON-serializable properties survive, and an object that cannot be encoded
+     *               yields []. Returns [] when nothing matches.
      */
     public static function findItemByKey(?array $arrayOfItems, ?string $keyName, string|int|null $keyValue): array {
         if (empty($arrayOfItems) || empty($keyName) || $keyValue === null || $keyValue === '') {
             return [];
         }
 
-        $indexedColumn = array_column($arrayOfItems, $keyName);
-        $mappedIndexes = array_flip(array_map('strval', $indexedColumn));
+        // Deliberately a linear scan, not array_column()+array_flip(). array_column() returns a NEW
+        // 0-based list, so its indexes are positional in the COLUMN, not keys of $arrayOfItems: one
+        // key-less row shifted every later index and the lookup silently returned a DIFFERENT
+        // record, and any non-0-based input returned [] for items that were present.
+        $needle = strval($keyValue);
 
-        return $arrayOfItems[$mappedIndexes[strval($keyValue)] ?? ''] ?? [];
+        foreach ($arrayOfItems as $item) {
+            if (is_object($item)) {
+                $candidate = $item->{$keyName} ?? null;
+            } elseif (is_array($item)) {
+                $candidate = $item[$keyName] ?? null;
+            } else {
+                continue;
+            }
+
+            if ($candidate === null || is_array($candidate) || is_object($candidate)) {
+                continue;
+            }
+
+            if (strval($candidate) === $needle) {
+                // The declared `: array` return type would fatal on a raw object, though the params
+                // above explicitly invite one.
+                return is_object($item) ? self::objectToArray($item) : $item;
+            }
+        }
+
+        return [];
     }
 
 }

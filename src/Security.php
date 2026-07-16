@@ -226,10 +226,12 @@ class Security {
     }
 
     /**
-     * Returns the bytes of encryption blocks to read per iteration.
-     * If no value is set, the default (3.200.000) will be returned and set.
+     * Returns the block size (bytes) read per iteration by encryptFileV2.
      *
-     * @return int
+     * When no value is set (initial state, or after setFileEncryptBlocksBytes(null)), the default
+     * of 3.200.000 is installed and returned, so this never returns 0.
+     *
+     * @return int Always >= 1
      */
     public static function getFileEncryptBlocksBytes(): int
     {
@@ -241,16 +243,32 @@ class Security {
     }
 
     /**
-     * Sets the bytes of encryption blocks to be used during file processing.
-     * Accepts null, in which case the default will be used on next get.
+     * Sets the block size (bytes) read per iteration during file encryption.
      *
-     * @param int|null $fileEncryptBlocksBytes
+     * This is PROCESS-GLOBAL static state: on a long-lived worker (FPM child, queue worker, Swoole)
+     * a value set here survives until it is changed or reset, across requests/jobs. Pass null to
+     * reset, which makes the next getFileEncryptBlocksBytes() reinstall the 3.200.000 default.
+     *
+     * @param int|null $fileEncryptBlocksBytes Block size in bytes; must be >= 1. Pass NULL to reset
+     *                                         to the default (the reset is real: it clears any
+     *                                         previously-set value, it is not a no-op).
+     *
+     * @throws \Exception When a non-null value <= 0 is given. Such a value is a caller bug and is
+     *                    rejected LOUDLY rather than silently ignored, because a silently-kept
+     *                    previous value causes memory blowups far from this call site.
      * @return void
      */
     public static function setFileEncryptBlocksBytes(?int $fileEncryptBlocksBytes): void
     {
-        if (empty($fileEncryptBlocksBytes) || $fileEncryptBlocksBytes < 0) {
+        // NULL means "reset": 0 is the sentinel getFileEncryptBlocksBytes() treats as "unset", so
+        // it reinstalls the default. This must clear a previously-set value, not preserve it.
+        if ($fileEncryptBlocksBytes === null) {
+            self::$fileEncryptBlocksBytes = 0;
             return;
+        }
+
+        if ($fileEncryptBlocksBytes <= 0) {
+            throw new \Exception("Invalid file encryption block size: must be >= 1 byte, or null to reset to the default.");
         }
 
         self::$fileEncryptBlocksBytes = $fileEncryptBlocksBytes;
@@ -474,18 +492,37 @@ class Security {
     }
 
     /**
-     * Decrypts the given file and saves the result to a new destination file V2.
+     * Decrypts a file produced by encryptFileV2, verifying the GCM tag of every block.
+     *
+     * FAILS LOUD — this function NEVER returns false. Every failure mode (unreadable source,
+     * unresolvable destination, wrong key, tampered/reordered/spliced block, truncated file with no
+     * authenticated end marker, missing OpenSSL) throws \Exception. There is no falsy return a
+     * caller could mistake for success, matching decryptDataDB's guarantee. Callers MUST try/catch;
+     * an `if ($out === false)` guard is dead code and will not run.
+     *
+     * The \Exception messages are raw internal diagnostics ("Encrypted file is truncated ...").
+     * They are for logs — do NOT render them to end users.
+     *
+     * On failure the destination is restored to its pre-call state: in "w" mode the (freshly
+     * created/truncated) destination is deleted; in "a" mode it is truncated back to the length it
+     * had on entry, so appending a bad part NEVER destroys parts already appended. Unauthenticated
+     * plaintext is never left behind either way.
      *
      * @param string $source Path to the file to be decrypted (use tmp_name when from $_FILES)
-     * @param string $key Key used for decryption
+     * @param string $key Master key (>= 32 bytes), the same one passed to encryptFileV2
      * @param string $destination Path where the decrypted file should be saved
      * @param string|null $permissionMode Optional file permission mode to apply to the destination file
-     * @param string $outReadMode Defines how the destination file will be opened ('w' or 'a')
+     * @param string $outReadMode How the destination is opened. Accepts exactly "w"/"wb" (truncate,
+     *                            the default) or "a"/"ab" (append — for reassembling a multi-part
+     *                            payload into one destination). Any other value THROWS; it is never
+     *                            silently rewritten, because substituting a truncating mode for an
+     *                            appending one destroys the caller's data.
      *
-     * @return string|false Returns the path of the decrypted file or FALSE in case of error
-     * @throws \Exception
+     * @return string Returns the path of the decrypted file
+     * @throws \Exception On an unknown $outReadMode, or on any source/destination resolution,
+     *                    authentication, truncation or tamper failure.
      */
-    public static function decryptFileV2(string $source, string $key, string $destination, ?string $permissionMode = null, string $outReadMode = "w"): string|false {
+    public static function decryptFileV2(string $source, string $key, string $destination, ?string $permissionMode = null, string $outReadMode = "w"): string {
         if (!extension_loaded('openssl')) {
             throw new \Exception("OpenSSL not loaded");
         }
@@ -505,13 +542,20 @@ class Security {
         $iv_length = openssl_cipher_iv_length($cipher);
         $tag_length = 16;
 
-        // Defines defaults for $outReadMode options
-        if (
-            empty($outReadMode) ||
-            !in_array($outReadMode, array('wb', 'ab'))
-        ) {
-            $outReadMode = "wb";
+        // Normalize the documented modes to their binary form. An unrecognized mode is REJECTED,
+        // never silently rewritten: the old code mapped the documented "a" onto "wb", which
+        // truncated the destination a caller had asked to append to (silent data destruction).
+        $appendMode = in_array($outReadMode, array('a', 'ab'), true);
+        if (!$appendMode && !in_array($outReadMode, array('w', 'wb'), true)) {
+            throw new \Exception("Invalid \$outReadMode '{$outReadMode}': expected 'w'/'wb' (truncate) or 'a'/'ab' (append).");
         }
+        $outReadMode = ($appendMode ? "ab" : "wb");
+
+        // Length of the destination BEFORE we touch it. In append mode a failure must roll back to
+        // exactly this length, so previously-appended parts survive a bad part.
+        clearstatcache(true, $destination);
+        $destExistedBefore = is_file($destination);
+        $appendStartOffset = ($appendMode && $destExistedBefore ? (int) filesize($destination) : 0);
 
         // Sets the permission of the destination file
         $oldMask = umask(0);
@@ -636,9 +680,19 @@ class Security {
 
             // Checks if any error occurred during decryption
             if ($error) {
-                // Deletes the destination file if an error occurred
+                // Roll the destination back to its pre-call state. Unauthenticated plaintext must
+                // never survive a failure, but neither must data this call did not write: in append
+                // mode the file (and every part appended by an earlier successful call) belongs to
+                // the caller, so truncate back to the entry length instead of deleting it.
                 if (is_file($destination)) {
-                    @unlink($destination);
+                    if ($appendMode && $destExistedBefore) {
+                        if ($fpTrunc = fopen($destination, 'r+b')) {
+                            @ftruncate($fpTrunc, $appendStartOffset);
+                            @fclose($fpTrunc);
+                        }
+                    } else {
+                        @unlink($destination);
+                    }
                 }
                 throw new \Exception($error);
             }
@@ -1017,58 +1071,88 @@ class Security {
     /**
      * Applies a Security encrypt/decrypt/hash method to every scalar leaf of an array or object.
      *
-     * NOT a general callable dispatcher: $fnName is force-prefixed with "Security::", so only this
-     * class's methods can be reached. Passing your own function or another class's method produces
-     * "Security::YourClass::method" and a TypeError from call_user_func — an \Error, which a
-     * `catch (\Exception)` does NOT catch.
+     * NOT a general callable dispatcher. $fnName names a method OF THIS CLASS and nothing else; it
+     * is resolved against an ALLOWLIST, and anything outside it throws \Exception. Your own
+     * functions and other classes' methods are not reachable by design.
      *
-     * The leaf call is `$fnName($value, $key, $salt)`, so $fnName MUST accept
-     * (mixed $value, string $key, ?string $salt). Only these five qualify:
+     * The leaf call is `Security::$fnName($value, $key, $salt)`, so only methods accepting
+     * (mixed $value, string $key, ?string $salt) can be dispatched. Exactly these five qualify:
      *   encryptLocal · decryptLocal · encryptCrossPlatform · decryptCrossPlatform · generateSearchHash
      *
-     * DO NOT pass encryptDataDB or decryptDataDB. Their third parameter is $aad, not $salt, so
-     * $salt would silently bind to the AAD while their own $salt kept its "" default — every value
-     * encrypted with an unsalted derived key and an AAD nobody intended. It round-trips (both
-     * directions are wrong identically), so nothing fails and the defect stays invisible. Those two
-     * need a per-cell AAD, which is meaningless for a bulk array walk — call them directly instead.
+     * encryptDataDB / decryptDataDB are REJECTED, not merely discouraged. Their third parameter is
+     * $aad, not $salt, so dispatching them here would silently bind $salt as the AAD while their own
+     * $salt kept its "" default — every value encrypted with an unsalted key and an AAD nobody
+     * intended. It would round-trip (both directions wrong identically), so the defect would stay
+     * invisible while the per-cell relocation binding those methods exist to provide was gone. They
+     * need a per-cell AAD, which is meaningless for a bulk array walk — call them directly.
      *
-     * @param mixed $item Item to be applied
-     * @param string $key Decryption key
-     * @param string|null $salt Optional salt for key derivation, passed as the THIRD argument
-     * @param string $fnName Name of a Security method matching the signature above. A "Security::"
-     *                       or "self::" prefix is optional and stripped.
+     * @param mixed $item Value, array or object to walk. Arrays/objects recurse to every scalar
+     *                    leaf; an object is converted to an array and RETURNED AS AN ARRAY.
+     * @param string $key Master key, forwarded as the 2nd argument to $fnName
+     * @param string|null $salt Optional salt for key derivation, forwarded as the THIRD argument
+     * @param string $fnName Name of one of the five allowlisted methods above. A "Security::" or
+     *                       "self::" prefix is optional and stripped. An empty name returns $item
+     *                       unchanged.
      *
-     * @return mixed
-     * @throws \Exception
+     * @throws \Exception When $fnName is not one of the five allowlisted methods, or by $fnName
+     *                    itself (invalid key, authentication failure, ...).
+     * @return mixed The walked structure; arrays/objects come back as arrays, a scalar comes back
+     *               as $fnName's return value.
      */
     public static function applySecurityFunctionArray(mixed $item, string $key, ?string $salt, string $fnName): mixed {
         if(empty($fnName)) {
             return $item;
         }
 
-        if(Str::containsString($fnName, "self::", true)) {
-            $fnName = Str::replaceString("self::", "class::", $fnName, true);
+        // Strip an optional "self::" / "Security::" / "class::" prefix down to the bare method name.
+        foreach (["self::", "Security::", "class::"] AS $prefix) {
+            if (Str::containsString($fnName, $prefix, true)) {
+                $fnName = Str::replaceString($prefix, "", $fnName, true);
+            }
         }
-        if(Str::containsString($fnName, "Security::", true)) {
-            $fnName = Str::replaceString("Security::", "class::", $fnName, true);
+
+        // Allowlist: ONLY methods whose 3rd parameter really is $salt. This is what makes the
+        // documented contract enforceable instead of advisory — notably it turns a bulk
+        // encryptDataDB/decryptDataDB call (whose 3rd parameter is $aad) into a loud failure
+        // rather than a silent, symmetric AAD misbinding.
+        $allowed = [
+            'encryptLocal',
+            'decryptLocal',
+            'encryptCrossPlatform',
+            'decryptCrossPlatform',
+            'generateSearchHash',
+        ];
+        $method = null;
+        foreach ($allowed AS $candidate) {
+            if (strcasecmp($fnName, $candidate) === 0) {
+                $method = $candidate;
+                break;
+            }
         }
-        if(!Str::containsString($fnName, "class::", true)) {
-            $fnName = "class::" . $fnName;
+        if ($method === null) {
+            throw new \Exception(
+                "Unsupported function '{$fnName}' for applySecurityFunctionArray. Allowed: " .
+                implode(", ", $allowed) . ". (encryptDataDB/decryptDataDB take an \$aad as their " .
+                "third argument, not a \$salt, and must be called directly with a per-cell AAD.)"
+            );
         }
-        $fnName = Str::replaceString("class::", "Security::", $fnName, true);
+
+        // Bind to THIS class explicitly. A bare "Security::method" string resolves against the
+        // GLOBAL namespace and never finds VD\PHPHelper\Security, which made every call fail.
+        $callable = [self::class, $method];
 
         if (is_object($item)) {
             $item = (array) $item;
         }
         if (!is_array($item)) {
-            return call_user_func($fnName, $item, $key, $salt);
+            return call_user_func($callable, $item, $key, $salt);
         }
 
         $keyItem = null;
         $valueItem = null;
         foreach ($item AS $keyItem => $valueItem) {
             if (!is_array($valueItem) && !is_object($valueItem)) {
-                $item[$keyItem] = call_user_func($fnName, $valueItem, $key, $salt);
+                $item[$keyItem] = call_user_func($callable, $valueItem, $key, $salt);
             } else {
                 $item[$keyItem] = self::applySecurityFunctionArray($valueItem, $key, $salt, $fnName);
             }
@@ -1166,13 +1250,30 @@ class Security {
     }
 
     /**
-     * Retrieves a value from an array or variable, applying individual sanitization options.
+     * Retrieves a value from an array/object/scalar, applying the selected transformations.
      *
-     * @param mixed $source The input array or variable
-     * @param string|null $key If set, extracts a value from an array by key
-     * @param mixed $ifNull Default value to return if the key is missing or null
+     * Arrays and objects are walked recursively and the filters are applied to every scalar leaf;
+     * the container type is preserved (an object stays an object, its public properties rewritten
+     * in place). A scalar is filtered directly.
+     *
+     * MUTATION ASYMMETRY: an array $source is copied (PHP copy-on-write), so the caller's array is
+     * untouched and only the return value is filtered. An OBJECT $source is a shared handle, so its
+     * public properties are rewritten IN PLACE — the caller's object is modified and the same
+     * instance is returned. Clone before calling if you need the original intact. Only public
+     * properties are visited; private/protected ones are invisible to the walk and survive
+     * unfiltered.
+     *
+     * @param mixed $source The input array, object, or scalar
+     * @param string|null $key If set, extracts a value from $source by key. ARRAYS ONLY: if $source
+     *                         is an object (or not an array at all), or the key is absent or null,
+     *                         $ifNull is returned. Pass null to filter $source itself.
+     * @param mixed $ifNull Default value to return if $source is null, or the key is missing/null
      * @param bool $decodeStr Whether to decode the string using a custom decoder
-     * @param bool $xssClean Whether to apply XSS sanitization
+     * @param bool $xssClean Runs xssCleanRecursive(). Read that method's docblock before enabling
+     *                       this: it is a BEST-EFFORT BLACKLIST with known bypasses (e.g.
+     *                       `<svg/onload=...>` passes through untouched), NOT an XSS defence.
+     *                       Enabling this flag does NOT make untrusted input safe to render —
+     *                       escape at the point of output instead.
      * @param bool $stripTags Whether to strip HTML tags
      * @param bool $htmlEntities Whether to apply htmlentities()
      * @param bool $addSlashes Whether to apply addslashes()
@@ -1289,8 +1390,9 @@ class Security {
         };
 
         if (is_array($value) || is_object($value)) {
+            $isObject = is_object($value);
             foreach ($value as $k => $v) {
-                $value[$k] = self::filterValue(
+                $filtered = self::filterValue(
                     $v, null, $ifNull,
                     $decodeStr, $xssClean, $stripTags, $htmlEntities, $addSlashes, $escapeDB, $trim,
                     $formatDecimal, $asInteger, $asBoolean,
@@ -1298,6 +1400,15 @@ class Security {
                     $urlEncode, $urlDecode,
                     $jsonEncode, $jsonDecode
                 );
+
+                // Write back through the right accessor. Subscripting an object with [] (the old
+                // behavior) is a fatal Error for anything not implementing ArrayAccess, e.g. the
+                // stdClass every json_decode() produces. Mirrors xssCleanRecursive.
+                if ($isObject) {
+                    $value->$k = $filtered;
+                } else {
+                    $value[$k] = $filtered;
+                }
             }
         } else {
             $value = $applyFilters($value);
@@ -1307,26 +1418,50 @@ class Security {
     }
 
     /**
-     * Encrypts a password using hash algorithm.
+     * Hashes a password with Argon2id, for storage.
      *
-     * @param string|null $password Password to be encrypted
+     * Rejects an empty password LOUDLY. It previously returned "" — which is not a hash — for any
+     * empty()-y password, so a caller following the "@return string Encrypted password" contract
+     * persisted "" into the password column and permanently locked the account out (verifyPassword
+     * against "" is always false). That also swallowed the literal password "0", which empty()
+     * reports as empty. Both are now impossible: this either returns a real hash or throws.
      *
-     * @return string Encrypted password
+     * The returned hash is self-describing (algorithm, cost and salt are embedded), so no salt or
+     * algorithm needs to be stored alongside it. Store it as-is; it is never "" and never null.
+     *
+     * @param string|null $password Password to hash. Must be a non-empty string. NULL and "" are
+     *                              rejected; "0" is a perfectly valid password and IS hashed.
+     *
+     * @throws \Exception When $password is null or "". An empty password is a validation failure
+     *                    the caller must handle — it is never silently turned into a stored value.
+     * @return string Argon2id hash, always non-empty
      */
     public static function encryptPassword(?string $password): string {
-        if (empty($password)) {
-            return "";
+        // Strict test, matching this file's null/"" idiom elsewhere: empty() would also swallow the
+        // legitimate password "0".
+        if ($password === null || $password === "") {
+            throw new \Exception("Cannot hash an empty password.");
         }
 
         return password_hash($password, PASSWORD_ARGON2ID);
     }
 
     /**
-     * Verify a password using hash algorithm.
+     * Verifies a password against a hash produced by encryptPassword, in constant time.
      *
-     * @param string|null $password Password to be verified
+     * @param string $password Password to be verified. NOT nullable: passing null raises a
+     *                         \TypeError. Null-coalesce at the call site (`$input ?? ''`) rather
+     *                         than forwarding a missing form field straight in — a null password is
+     *                         a caller bug, not a failed login.
+     * @param string $hash Hash produced by encryptPassword. REQUIRED and NOT nullable: a NULL
+     *                     column (SSO-only, invited, or not-yet-activated user) raises a
+     *                     \TypeError, so check for it before calling. A non-hash value such as ""
+     *                     simply returns false.
      *
-     * @return bool
+     * @throws \TypeError When $password or $hash is null. NOTE: \TypeError is an \Error, NOT an
+     *                    \Exception — `catch (\Exception $e)` will NOT stop it.
+     * @return bool True only if $password matches $hash. False for a wrong password AND for any
+     *              malformed/empty $hash — a false is never proof the hash was valid.
      */
     public static function verifyPassword(string $password, string $hash): bool {
         return password_verify($password, $hash);

@@ -2,20 +2,39 @@
 
 namespace VD\PHPHelper;
 
+/**
+ * Static string helpers.
+ *
+ * Conventions that hold class-wide, so individual methods need not repeat them:
+ * - Every method is static and stateless. The only method with side effects is flushOutput().
+ * - Methods documented as multibyte assume valid UTF-8 input. Methods documented as byte-based
+ *   operate on raw bytes and are safe on binary/non-UTF-8 data.
+ * - NOTHING here is contextual output escaping. removeInvisibleCharacters(), removeCharacters(),
+ *   keepOnlyCharacters(), onlyLetters(), onlyNumbers() and friends REMOVE characters; they are
+ *   not HTML/JS/SQL/shell escaping and must not be relied on as an injection defense.
+ *   truncateWithTooltip() is the single method that emits HTML, and it encodes what it emits.
+ */
 class Str {
     /**
-     * Remove Invisible Characters
-     * This prevents sandwiching null characters between ascii characters, like Java\0script.
+     * Removes invisible (control) characters from a string.
      *
-     * @param string|null $str String to be read
-     * @param bool $urlEncoded Define if it needs to be encoded for URL
+     * Strips every ASCII control character except newline (10), carriage return (13) and
+     * horizontal tab (9) — i.e. 00-08, 11, 12, 14-31 and 127. Stripping repeats until a pass
+     * removes nothing, so characters sandwiched to reassemble after one pass (the classic
+     * "Java\0script" trick) cannot survive.
      *
-     * @return string
+     * Byte-based: safe on invalid UTF-8. Removal only — this is NOT an XSS defense on its own.
+     *
+     * @param string|null $str String to clean. Both null and "" yield "".
+     * @param bool $urlEncoded If true, ALSO strips the URL-encoded forms (%00-%08, %0b, %0c,
+     *                         %0e, %0f, %10-%1f). The input is neither decoded nor encoded.
+     *
+     * @return string The cleaned string; "" when $str is null or "".
      */
     public static function removeInvisibleCharacters(?string $str, bool $urlEncoded = false): string
     {
-        if(empty($str)) {
-            return $str;
+        if ($str === null || $str === '') {
+            return '';
         }
         $nonDisplayables = [];
 
@@ -36,10 +55,14 @@ class Str {
     }
 
     /**
-     * Returns a string containing only numeric characters.
+     * Returns a string containing only the ASCII digits 0-9 of the input.
      *
-     * @param string|null $str The input string to extract numbers from
-     * @return string
+     * Everything else is dropped, INCLUDING the sign and the decimal separator: "-12.50" becomes
+     * "1250". This extracts digits (document numbers, phone numbers); it does not parse numbers.
+     * Non-ASCII digits (e.g. Arabic-Indic) are not recognized and are removed.
+     *
+     * @param string|null $str The input string to extract digits from. Null yields "".
+     * @return string The digits of $str, in order; "" when there are none.
      *
      * @ref http://www.cesar.inf.br/blog/?p=191
      */
@@ -61,10 +84,13 @@ class Str {
     }
 
     /**
-     * Checks if one string contains another.
+     * Checks if one string contains another, anywhere (no word-boundary rule — see
+     * containsExactWord() for that).
      *
-     * @param string|null $text The string to be searched
-     * @param string|null $search The string to search for
+     * @param string|null $text The string to be searched. Null or "" returns false.
+     * @param string|null $search The string to search for. Null or "" returns FALSE: a blank
+     *                            needle is never reported as contained, so a blank term cannot
+     *                            match everything.
      * @param bool $ignoreCase Whether to ignore case sensitivity
      * @return bool TRUE if the string contains the search value, FALSE otherwise
      */
@@ -77,15 +103,22 @@ class Str {
     }
 
     /**
-     * Replaces all occurrences of the search string with the replacement string, with optional case sensitivity.
+     * Replaces all occurrences of the search value(s) in $subject.
      *
-     * @param string|array|null $search The value being searched for.
-     * @param string|array|null $replace The replacement value.
-     * @param string|null $subject The string or array being searched and replaced on.
-     * @param bool $ignoreCase Whether to ignore case sensitivity.
-     * @return string|array The string or array with the replaced values.
+     * @param string|array|null $search The value(s) being searched for. Null or "" returns
+     *                                  $subject unchanged.
+     * @param string|array|null $replace The replacement value(s). Null is treated as "".
+     *                                   When $search is an array and $replace is a shorter
+     *                                   array, the surplus searches are replaced with ""
+     *                                   (str_replace semantics).
+     * @param string|null $subject The string being searched and replaced on. Unlike the native
+     *                             str_replace(), an ARRAY subject is NOT accepted here and
+     *                             raises a TypeError at the call site. Null or "" returns "".
+     * @param bool $ignoreCase If true, matches case-insensitively (str_ireplace).
+     * @return string The string with the replaced values. Never an array: a string subject
+     *                can only produce a string.
      */
-    public static function replaceString(string|array|null $search, string|array|null $replace, ?string $subject, bool $ignoreCase = false): string|array {
+    public static function replaceString(string|array|null $search, string|array|null $replace, ?string $subject, bool $ignoreCase = false): string {
         if($subject === null || $subject === "") {
             return "";
         }
@@ -105,7 +138,8 @@ class Str {
      * Converts the first character of a multibyte string to uppercase.
      *
      * @param string|null $text The input string
-     * @return string|null The string with the first character capitalized
+     * @return string|null The string with the first character capitalized; null when $text is
+     *                     null, "" when $text is "".
      */
     public static function mbUcFirst(?string $text): ?string {
         if ($text === null) {
@@ -121,12 +155,16 @@ class Str {
     /**
      * Removes the given prefix from the string if it starts with it.
      *
+     * Byte-based and case-sensitive. Only ONE occurrence is removed: "aab" minus prefix "a" is
+     * "ab", not "b".
+     *
      * @param string|null $string The string to check
-     * @param string|null $prefix The prefix to remove
-     * @return string|null Resulting string without the prefix
+     * @param string|null $prefix The prefix to remove. Null or "" removes nothing.
+     * @return string|null Resulting string without the prefix, or $string unchanged (including
+     *                     null) when it does not start with $prefix.
      */
     public static function removeStringPrefix(?string $string, ?string $prefix): ?string {
-        if (empty($string) || empty($prefix)) return $string;
+        if ($string === null || $string === '' || $prefix === null || $prefix === '') return $string;
 
         if (str_starts_with($string, $prefix)) {
             $string = substr_replace($string, "", 0, strlen($prefix));
@@ -136,15 +174,18 @@ class Str {
     }
 
     /**
-     * Function removeStringSuffix.
      * Removes the given suffix from the string if it ends with it.
      *
+     * Byte-based and case-sensitive. Only ONE occurrence is removed: "abb" minus suffix "b" is
+     * "ab", not "a".
+     *
      * @param string|null $string The string to check
-     * @param string|null $suffix The suffix to remove
-     * @return string|null Resulting string without the suffix
+     * @param string|null $suffix The suffix to remove. Null or "" removes nothing.
+     * @return string|null Resulting string without the suffix, or $string unchanged (including
+     *                     null) when it does not end with $suffix.
      */
     public static function removeStringSuffix(?string $string, ?string $suffix): ?string {
-        if (empty($string) || empty($suffix)) return $string;
+        if ($string === null || $string === '' || $suffix === null || $suffix === '') return $string;
 
         if (str_ends_with($string, $suffix)) {
             $string = substr_replace($string, "", (-1 * strlen($suffix)));
@@ -154,17 +195,38 @@ class Str {
     }
 
     /**
-     * Generates a unique key string composed of random hash segments, with optional prefix, suffix, and ID column.
+     * Generates a key made of random hash segments, with an optional prefix, unique ID and suffix.
      *
-     * @param int $segmentLength Number of characters per segment (column)
-     * @param int $segmentCount Number of segments (columns) in the final key
-     * @param string $separator String used to separate each segment
-     * @param string $uniqueId Unique ID to embed in the key (padded and optionally truncated)
-     * @param string $prefix Optional prefix to prepend to the key
-     * @param string $suffix Optional suffix to append to the key
-     * @param bool $ignoreLengthOnId If true, the unique ID will not be truncated to segment length
+     * Layout, joined by $separator:
+     *     [$prefix] segment1 [$uniqueId] segment2 ... segmentN [$suffix]
+     * $prefix, $uniqueId and $suffix are EXTRA parts: none of them ever consumes one of the
+     * $segmentCount random segments, and none is ever silently dropped. The key therefore always
+     * carries exactly $segmentCount random segments, whichever optional parts are supplied.
      *
-     * @return string The generated unique key
+     * NOT cryptographically secure. Every segment is cut at a rand() offset out of ONE whirlpool
+     * hash of the current time + uniqid(), so segments within a key may repeat or overlap and the
+     * whole key is only as unpredictable as rand()/uniqid(). Use it for readable identifiers —
+     * never as a token, session ID, password-reset key or any value that must be unguessable.
+     * For those use random_bytes()/generateGuid().
+     *
+     * @param int $segmentLength Characters per random segment. Must be 1..127; ANY other value
+     *                           (including a value >= the 128-char hash length) silently falls
+     *                           back to 5.
+     * @param int $segmentCount Number of RANDOM segments. Must be >= 1; any other value silently
+     *                          falls back to 5.
+     * @param string $separator Placed between every part. "" yields a key with no separators.
+     * @param string $uniqueId Value embedded as its own part directly after the first random
+     *                         segment; "" means no ID. It is left-padded with "0" up to
+     *                         $segmentLength characters, and is never dropped for any
+     *                         $segmentCount.
+     * @param string $prefix Prepended as the first part; "" means none.
+     * @param string $suffix Appended as the last part; "" means none.
+     * @param bool $ignoreLengthOnId If false, a $uniqueId longer than $segmentLength is truncated
+     *                               to its FIRST $segmentLength characters — which can make two
+     *                               different IDs produce the same key part. If true (default),
+     *                               the ID is embedded whole and the key grows instead.
+     *
+     * @return string The generated key.
      */
     public static function generateUniqueKey(
         int $segmentLength = 5,
@@ -175,7 +237,6 @@ class Str {
         string $suffix = '',
         bool $ignoreLengthOnId = true
     ): string {
-        $key = '';
         $hash = hash('whirlpool', DateTime::getCurrentFormattedDate('Y-m-d H:i:s') . md5(uniqid((string) rand(), true)) . DateTime::getCurrentFormattedDate('Y-m-d H:i:s'));
         $hashLength = strlen($hash);
 
@@ -189,59 +250,55 @@ class Str {
             $segmentCount = 5;
         }
 
-        // Normalize optional strings
-        $prefix = $prefix !== null && $prefix !== '' ? ($prefix . $separator) : '';
-        $suffix = $suffix !== null && $suffix !== '' ? ($suffix . $separator) : '';
-
-        // Prepare unique ID
+        // Prepare unique ID. Compared against "" rather than empty(), so the legitimate ID "0"
+        // is embedded instead of silently discarded.
         $uniqueIdFormatted = '';
-        if (!empty($uniqueId)) {
-            $uniqueId = str_pad($uniqueId, max($segmentLength, strlen($uniqueId)), '0', STR_PAD_LEFT);
+        if ($uniqueId !== '') {
+            $uniqueIdFormatted = str_pad($uniqueId, max($segmentLength, strlen($uniqueId)), '0', STR_PAD_LEFT);
             if (!$ignoreLengthOnId) {
-                $uniqueId = substr($uniqueId, 0, $segmentLength);
+                $uniqueIdFormatted = substr($uniqueIdFormatted, 0, $segmentLength);
             }
-            $uniqueIdFormatted = $uniqueId . $separator;
         }
 
-        // Assemble key
+        // Assemble the parts. The optional parts are appended positionally instead of competing
+        // for a loop index, so no part can be dropped and $segmentCount always means what it says.
+        $parts = [];
+        if ($prefix !== '') {
+            $parts[] = $prefix;
+        }
+
         for ($i = 0; $i < $segmentCount; $i++) {
-            if ($i === 0) {
-                $key .= $prefix;
-                continue;
-            }
-
-            if ($i === 2 && $uniqueIdFormatted !== '') {
-                $key .= $uniqueIdFormatted;
-                continue;
-            }
-
-            if (($i + 1) === $segmentCount && $suffix !== '') {
-                $key .= $suffix;
-                continue;
-            }
-
             $start = rand(0, $hashLength - $segmentLength);
-            $segment = substr($hash, $start, $segmentLength);
-            $key .= $segment . $separator;
+            $parts[] = substr($hash, $start, $segmentLength);
+
+            if ($i === 0 && $uniqueIdFormatted !== '') {
+                $parts[] = $uniqueIdFormatted;
+            }
         }
 
-        // Remove trailing separator
-        if (str_ends_with($key, $separator)) {
-            $key = substr($key, 0, -strlen($separator));
+        if ($suffix !== '') {
+            $parts[] = $suffix;
         }
 
-        return $key;
+        return implode($separator, $parts);
     }
 
     /**
      * Generates a globally unique identifier (GUID).
      *
      * On Windows, uses `com_create_guid` if available.
-     * On other systems, uses `openssl_random_pseudo_bytes` if available.
-     * If neither is available, falls back to a manual GUID generation using MD5 and uniqid.
+     * On other systems, uses `openssl_random_pseudo_bytes` if available (a proper random,
+     * RFC 4122 version-4 UUID).
+     * If neither is available, falls back to a manual GUID built from md5(uniqid()). That
+     * fallback is NOT cryptographically secure and is NOT a version-4 UUID (no version/variant
+     * bits): it is a last resort for exotic hosts, not a source of secrets. When you need an
+     * unguessable value, verify openssl is present or use random_bytes() directly.
      *
-     * @param bool $trim If true, returns the GUID without curly braces; otherwise includes them
-     * @return string The generated GUID
+     * $trim is honored identically on all three paths.
+     *
+     * @param bool $trim If true (default), returns the GUID bare: "xxxxxxxx-xxxx-...-xxxxxxxxxxxx".
+     *                   If false, returns it wrapped in curly braces: "{xxxxxxxx-...}".
+     * @return string The generated GUID, 36 characters bare or 38 with braces.
      *
      * @see https://www.php.net/manual/en/function.com-create-guid.php
      */
@@ -257,7 +314,9 @@ class Str {
             $data[6] = chr(ord($data[6]) & 0x0f | 0x40); // set version to 0100
             $data[8] = chr(ord($data[8]) & 0x3f | 0x80); // set bits 6-7 to 10
 
-            return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($data), 4));
+            $guid = vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($data), 4));
+
+            return $trim ? $guid : '{' . $guid . '}';
         }
 
         // Fallback (PHP 4.2+)
@@ -277,22 +336,39 @@ class Str {
     }
 
     /**
-     * Removes all extra whitespace from a string.
+     * Collapses runs of whitespace (and <br> tags) and trims the ends.
      *
-     * @param mixed $str The string to be cleaned
-     * @param bool $keepSingleSpace If true, keeps only one space where multiple spaces are found. If false, removes all.
-     * @return string The cleaned string
+     * A run of ANY mix of whitespace characters (space, tab, newline, CR, ...) and <br>/<br />
+     * tags is treated as ONE run and replaced in a single shot, so "a \n <br> b" becomes "a b" —
+     * not "a    b". The result is then trimmed at both ends.
+     *
+     * @param mixed $str The value to be cleaned. Scalars and Stringable objects are cast to
+     *                   string; null, arrays and any other non-stringable value yield "".
+     *                   Note "0" is a legitimate string and is returned as "0".
+     * @param bool $keepSingleSpace If true (default), each run collapses to a SINGLE space.
+     *                              If false, runs are deleted outright ("a b" -> "ab").
+     * @return string The cleaned string; "" when there is nothing stringable to clean.
      */
     public static function removeExcessSpaces(mixed $str, bool $keepSingleSpace = true): string {
-        return empty($str)
-            ? ''
-            : trim(
-                preg_replace(
-                    '/([\s\t\n\r])|(<br\s*\/?>)+/i',
-                    $keepSingleSpace ? ' ' : '',
-                    $str
-                )
-            );
+        if (is_scalar($str) || $str instanceof \Stringable) {
+            $str = (string) $str;
+        } else {
+            return '';
+        }
+
+        if ($str === '') {
+            return '';
+        }
+
+        // The quantifier must cover the whole alternation: with the run captured as one match,
+        // N whitespace characters collapse to one space instead of being replaced one-for-one.
+        return trim(
+            preg_replace(
+                '/(?:\s|<br\s*\/?>)+/i',
+                $keepSingleSpace ? ' ' : '',
+                $str
+            )
+        );
     }
 
     /**
@@ -316,11 +392,17 @@ class Str {
     }
 
     /**
-     * Trims unnecessary spaces from the beginning and end of the string.
-     * Returns empty string if input is null.
+     * Trims whitespace from the beginning and end of the string.
+     *
+     * Null in, null out — this method preserves the difference between "absent" (null) and
+     * "blank" (""), it does NOT normalize null to "". A caller checking a required field must
+     * therefore test for both, e.g. `if (($v = Str::trim($in)) === null || $v === '')`.
+     *
+     * Trims the native trim() set " \t\n\r\0\x0B" only; it is byte-based and does not strip
+     * Unicode whitespace such as U+00A0.
      *
      * @param string|null $str String to be trimmed
-     * @return string|null Trimmed string or null
+     * @return string|null Trimmed string, or null when $str is null
      */
     public static function trim(?string $str): ?string {
         return $str === null ? null : trim($str);
@@ -340,9 +422,9 @@ class Str {
      * Returns part of a string using multibyte support.
      *
      * @param string|null $str Input string
-     * @param int $offset Starting position
-     * @param int|null $length Number of characters to extract
-     * @return string|null Substring or null
+     * @param int $offset Starting position in CHARACTERS; negative counts from the end
+     * @param int|null $length Number of characters to extract; null means "to the end"
+     * @return string|null Substring, or null when $str is null
      */
     public static function subStr(?string $str, int $offset = 0, ?int $length = null): ?string {
         return $str === null ? null : mb_substr($str, $offset, $length);
@@ -351,10 +433,14 @@ class Str {
     /**
      * Finds the position of the first occurrence of a substring in a string (case-sensitive).
      *
-     * @param string|null $str Input string
+     * @param string|null $str Input string; null returns false
      * @param string $strSearch Substring to find
-     * @param int $offset Search offset
-     * @return int|false Position of the first occurrence or false
+     * @param int $offset Search offset in CHARACTERS; negative counts from the end
+     * @return int|false Character position of the first occurrence, or false when not found
+     *                   or when $str is null
+     *
+     * @throws \ValueError If $offset lies outside $str (mb_strpos rejects it). This is an
+     *                     uncaught \Error subclass, not an \Exception — guard the offset.
      */
     public static function strPos(?string $str, string $strSearch, int $offset = 0): int|false {
         return $str === null ? false : mb_strpos($str, $strSearch, $offset);
@@ -363,23 +449,39 @@ class Str {
     /**
      * Finds the position of the first occurrence of a substring in a string (case-insensitive).
      *
-     * @param string|null $str Input string
+     * @param string|null $str Input string; null returns false
      * @param string $strSearch Substring to find
-     * @param int $offset Search offset
-     * @return int|false Position of the first occurrence or false
+     * @param int $offset Search offset in CHARACTERS; negative counts from the end
+     * @return int|false Character position of the first occurrence, or false when not found
+     *                   or when $str is null
+     *
+     * @throws \ValueError If $offset lies outside $str (mb_stripos rejects it). This is an
+     *                     uncaught \Error subclass, not an \Exception — guard the offset.
      */
     public static function strIPos(?string $str, string $strSearch, int $offset = 0): int|false {
         return $str === null ? false : mb_stripos($str, $strSearch, $offset);
     }
 
     /**
-     * Generates all possible contiguous combinations from a string array,
-     * using caching and custom comparison to optimize performance.
+     * Generates every contiguous combination of the given words, longest phrase first.
      *
-     * @param string[] $input Input array of strings
-     * @param array<string, string[]> &$cache Cache array for memoization (keyed by md5 hash of input)
+     * The result contains each original element plus every space-joined run of 2..N adjacent
+     * elements. For ['a','b','c'] that is: 'a b c', 'a b', 'b c', 'a', 'b', 'c'.
      *
-     * @return string[] List of combined strings, sorted by length descending
+     * Sorted by WORD COUNT descending — NOT by character length. A 2-word combination therefore
+     * precedes a longer 1-word string: for ['aaaaaaaaaaaa','b','c'], 'b c' (3 chars) comes before
+     * 'aaaaaaaaaaaa' (12 chars). If you are driving greedy longest-match replacement and need the
+     * character-longest candidate first, re-sort the result yourself. Ties keep their relative
+     * order (PHP's sort is stable), so equal-word-count entries stay in generation order.
+     *
+     * @param string[] $input Input array of strings, in order. An empty array returns [] and is
+     *                        not cached.
+     * @param array<string, string[]> &$cache Memoization store, keyed by md5(serialize($input)),
+     *                                        passed BY REFERENCE and populated on each miss. Pass
+     *                                        the same variable across calls to reuse it; it is
+     *                                        never invalidated, so a stale entry is returned as-is.
+     *
+     * @return string[] List of combined strings, sorted by word count descending
      */
     public static function getAdjacentCombinations(array $input, array &$cache = []): array {
         $hash = md5(serialize($input));
@@ -409,11 +511,11 @@ class Str {
             }
         }
 
-        // Sort by descending number of words
+        // Sort by descending number of words (NOT character length - see the docblock).
         usort($combinations, function ($a, $b) {
-            $lenA = count(explode(' ', $a));
-            $lenB = count(explode(' ', $b));
-            return $lenB <=> $lenA;
+            $wordsA = count(explode(' ', $a));
+            $wordsB = count(explode(' ', $b));
+            return $wordsB <=> $wordsA;
         });
 
         $cache[$hash] = $combinations;
@@ -445,8 +547,15 @@ class Str {
     /**
      * Removes all specified substrings from the main string and returns the result.
      *
+     * Byte-based, case-sensitive, and applied IN ORDER: each substring is removed from the RESULT
+     * of the previous removal, so a removal can create a new match for a later entry and the
+     * order matters. Removing ['b', 'ac'] from "abc" yields "" (dropping "b" creates "ac"), while
+     * removing ['ac', 'b'] from "abc" yields "ac".
+     *
      * @param string $input The main string from which substrings will be removed
-     * @param array $substringsToRemove An array of substrings to be removed
+     * @param string[] $substringsToRemove Substrings to remove. An empty array returns $input
+     *                                     unchanged. Entries must be strings; a null entry is
+     *                                     deprecated in PHP 8.1+ and will raise a deprecation.
      * @return string The resulting string with all specified substrings removed
      */
     public static function removeSubstrings(string $input, array $substringsToRemove): string {
@@ -462,44 +571,87 @@ class Str {
     }
 
     /**
-     * Removes all specified characters from the input string.
+     * Removes all occurrences of the given characters from the input string.
      *
-     * @param string|null $input The string from which characters will be removed
-     * @param string|null $charactersToRemove A list of characters to remove
-     * @return string The resulting string with characters removed
+     * $charactersToRemove is a SET OF INDIVIDUAL CHARACTERS, not a substring and not a regex:
+     * removeCharacters('a-b', '-') removes the dash, and removeCharacters('abc', 'a-c') removes
+     * literal 'a', '-' and 'c' — never the range a..c. Every character is escaped before use.
+     *
+     * Multibyte (UTF-8): $input and $charactersToRemove must both be valid UTF-8.
+     *
+     * @param string|null $input The string from which characters will be removed. Null yields "".
+     * @param string|null $charactersToRemove The characters to remove. Null or "" removes nothing
+     *                                        and returns $input unchanged — an empty list is a
+     *                                        no-op, not an error.
+     * @return string The resulting string with those characters removed.
+     *
+     * @throws \InvalidArgumentException If the arguments are not valid UTF-8 (or the regex engine
+     *                                   otherwise fails). Thrown deliberately: without it PCRE
+     *                                   returns null here and the string return type raises a
+     *                                   TypeError, which `catch (\Exception)` does NOT catch.
      */
     public static function removeCharacters(?string $input, ?string $charactersToRemove): string {
         if ($input === null) {
             return '';
         }
-        if ($charactersToRemove === null) {
+        if ($charactersToRemove === null || $charactersToRemove === '') {
             return $input;
         }
 
-        return preg_replace(
+        $result = preg_replace(
             sprintf('/[%s]/u', preg_quote($charactersToRemove, '/')),
             '',
             $input
         );
+
+        if ($result === null) {
+            throw new \InvalidArgumentException(
+                'Str::removeCharacters() failed: ' . preg_last_error_msg() . '. Both arguments must be valid UTF-8.'
+            );
+        }
+
+        return $result;
     }
 
     /**
      * Keeps only the specified characters in the input string and removes all others.
      *
-     * @param string|null $input The string to be filtered
-     * @param string|null $allowedCharacters The characters to keep in the result
-     * @return string The resulting string containing only allowed characters
+     * $allowedCharacters is a SET OF INDIVIDUAL CHARACTERS, not a regex: every character is
+     * escaped before use, so 'a-c' allows literal 'a', '-' and 'c', never the range a..c.
+     *
+     * Note the deliberate asymmetry with removeCharacters(): there, an empty list means "remove
+     * nothing" and returns the input; here, an empty list means "nothing is allowed" and returns
+     * "". Both follow from an empty set, and both are allowlist-safe (an empty allowlist can only
+     * ever deny, never pass input through unfiltered).
+     *
+     * Multibyte (UTF-8): $input and $allowedCharacters must both be valid UTF-8.
+     *
+     * @param string|null $input The string to be filtered. Null yields "".
+     * @param string|null $allowedCharacters The characters to keep. Null or "" yields "".
+     * @return string The resulting string containing only allowed characters.
+     *
+     * @throws \InvalidArgumentException If the arguments are not valid UTF-8 (or the regex engine
+     *                                   otherwise fails) — see removeCharacters() for why this is
+     *                                   thrown rather than left to become a TypeError.
      */
     public static function keepOnlyCharacters(?string $input, ?string $allowedCharacters): string {
         if ($input === null || $allowedCharacters === null || $allowedCharacters === "") {
             return '';
         }
 
-        return preg_replace(
+        $result = preg_replace(
             sprintf('/[^%s]/u', preg_quote($allowedCharacters, '/')),
             '',
             $input
         );
+
+        if ($result === null) {
+            throw new \InvalidArgumentException(
+                'Str::keepOnlyCharacters() failed: ' . preg_last_error_msg() . '. Both arguments must be valid UTF-8.'
+            );
+        }
+
+        return $result;
     }
 
     /**
@@ -537,19 +689,28 @@ class Str {
     }
 
     /**
-     * Truncates a string to a defined length, preserving UTF-8 characters,
-     * and wraps it in a tooltip-enabled span showing the full text on hover.
+     * Truncates a string to a defined display width, preserving UTF-8 characters, and wraps it in
+     * a span whose title attribute carries the full text.
      *
-     * @param string|null $text The text to be truncated
-     * @param int $maxLength The maximum display length
-     * @param string|null $suffix The string to append to the end (e.g., "...")
-     * @return string The truncated HTML string with tooltip
+     * Returns HTML. Any markup in $text is stripped (strip_tags) and the result is HTML-encoded
+     * with ENT_QUOTES for both the body and the title attribute, so $text may be untrusted. The
+     * surrounding markup is fixed and not caller-controlled. $suffix is encoded the same way, so
+     * it CANNOT be used to inject markup — pass "&hellip;" and you will see the literal text.
+     *
+     * @param string|null $text The text to be truncated. Null or "" yields "" (no span at all).
+     *                          Note "0" is real content and IS rendered.
+     * @param int $maxLength Maximum display WIDTH (mb_strwidth: East-Asian wide characters count
+     *                       as 2), not a character count. Zero or negative yields "".
+     * @param string|null $suffix Appended (inside the span) only when the text was actually
+     *                            truncated. Null means none. It is NOT counted against
+     *                            $maxLength, so the rendered result can exceed $maxLength.
+     * @return string The HTML span, or "" when there is nothing to render.
      */
     public static function truncateWithTooltip(?string $text, int $maxLength = 100, ?string $suffix = '...'): string {
-        if (empty($text) || empty($maxLength) || $maxLength <= 0) {
+        if ($text === null || $text === '' || $maxLength <= 0) {
             return '';
         }
-        if (empty($suffix)) {
+        if ($suffix === null) {
             $suffix = '';
         }
 
@@ -571,20 +732,45 @@ class Str {
     }
 
     /**
-     * Converts a string to camelCase format, optionally preserving words in a given ignore list.
+     * Converts a string to camelCase.
      *
-     * @param string|null $input The string to convert
-     * @param array $preserveWords Words to preserve without altering (optional)
-     * @return string The camelCased version of the string
+     * Every run of characters that is neither a-z, A-Z nor 0-9 becomes a word break; each word is
+     * then capitalized and the breaks are removed ("hello world-foo" -> "helloWorldFoo").
+     * Unicode escape sequences are decoded first (see decodeText), and accented letters are NOT
+     * alphanumeric here, so they act as word breaks and are dropped — run removeAccents() first
+     * if you need them folded to ASCII instead.
+     *
+     * $preserveCharacters preserves CHARACTERS, NOT WORDS. Each entry contributes its individual
+     * characters to the "is a word character" set, globally. Passing ['order_id'] does not keep
+     * the word "order_id" intact — it merely adds o, r, d, e, _, i to the set, so EVERY
+     * underscore anywhere in $input survives. Passing an ordinary word like ['bar'] does nothing
+     * at all, because b, a and r are already word characters. To keep a whole word verbatim,
+     * split the input and handle that word yourself; this parameter cannot do it.
+     *
+     * @param string|null $input The string to convert. Null or "" yields "". Note "0" is real
+     *                           content and is returned as "0".
+     * @param array $preserveCharacters Additional characters to treat as word characters, given
+     *                                  as one or more strings whose characters are unioned. Each
+     *                                  entry is escaped, so regex metacharacters are taken
+     *                                  literally and cannot alter the pattern.
+     * @return string The camelCased version of the string.
      *
      * @see https://stackoverflow.com/questions/34597643/how-can-i-camelcase-a-string-in-php
      */
-    public static function toCamelCase(?string $input, array $preserveWords = []): string {
-        if (empty($input)) {
+    public static function toCamelCase(?string $input, array $preserveCharacters = []): string {
+        if ($input === null || $input === '') {
             return '';
         }
 
         $input = self::decodeText($input);
+
+        // Escape each entry before splicing it into the character class: an unescaped
+        // metacharacter (a lone backslash, say) silently corrupts the pattern, and preg_replace
+        // then returns null, which used to blank the whole string.
+        $preserved = '';
+        foreach ($preserveCharacters as $preserveCharacter) {
+            $preserved .= preg_quote((string) $preserveCharacter, '/');
+        }
 
         // Replace special characters with spaces, capitalize, and remove spaces
         return lcfirst(
@@ -593,7 +779,7 @@ class Str {
                 '',
                 ucwords(
                     preg_replace(
-                        '/[^a-z0-9' . implode('', $preserveWords) . ']+/i',
+                        '/[^a-z0-9' . $preserved . ']+/i',
                         ' ',
                         $input
                     )
@@ -604,11 +790,20 @@ class Str {
 
 
     /**
-     * Immediately sends a string to the browser before the page finishes processing.
+     * Immediately sends a string to the output before the page finishes processing.
      * Useful for streaming logs or keeping long-running requests responsive.
      *
+     * Emits $message VERBATIM followed by 4096 spaces and a newline — padding that forces the
+     * proxy/server buffers of some stacks to release the response. No escaping is applied: a
+     * caller writing to an HTML page must escape $message itself.
+     *
+     * Output buffering: if no buffer is active, one is opened and closed here. If the CALLER
+     * already has a buffer open, this method flushes it but leaves it open and does not change
+     * the buffering level.
+     *
      * @param string $message The string to be printed to the output
-     * @param int $sleepSeconds Optional: seconds to sleep after flushing (default: 0)
+     * @param int $sleepSeconds Seconds to sleep after flushing (default 0). Negative values are
+     *                          clamped to 0. This blocks the request for that long.
      * @return void
      *
      * @see https://www.php.net/manual/en/function.flush.php
@@ -618,8 +813,12 @@ class Str {
             $sleepSeconds = 0;
         }
 
+        // Only close what we opened: ob_end_flush()-ing unconditionally would pop the CALLER's
+        // buffer, silently releasing output they were still holding.
+        $bufferStartedHere = false;
         if (ob_get_level() === 0) {
             ob_start();
+            $bufferStartedHere = true;
         }
 
         echo $message;
@@ -632,22 +831,38 @@ class Str {
             sleep($sleepSeconds);
         }
 
-        ob_end_flush();
+        if ($bufferStartedHere) {
+            ob_end_flush();
+        }
     }
 
     /**
-     * Checks if a string contains exactly the specified search word.
+     * Checks whether $text contains $word as a standalone word.
      *
-     * @param string|null $text The text to search in.
-     * @param string|null $word The word to search for.
-     * @param bool $caseSensitive Whether to use case sensitivity.
+     * "Standalone" is PCRE's \b word boundary, so the word must not be flanked by [A-Za-z0-9_]:
+     * containsExactWord('hello world', 'world') is true, containsExactWord('helloworld', 'world')
+     * is false. CAVEAT: \b is defined between a word and a non-word character, so a $word that
+     * begins or ends with a non-word character never matches — containsExactWord('a c++ b', 'c++')
+     * is FALSE, because "+" followed by " " is not a boundary. Use containsString() for those.
+     *
+     * The word is escaped: $word is matched literally and cannot inject a pattern.
+     *
+     * SAFE FOR GATES: a null or empty $word returns FALSE (it is not "found in everything").
+     * This method never reports a match for a blank term, so a blank blocklist/allowlist entry
+     * cannot silently match every input.
+     *
+     * @param string|null $text The text to search in. Null or "" returns false.
+     * @param string|null $word The word to search for. Null or "" returns false.
+     * @param bool $caseSensitive Whether to match case-sensitively (default true).
      * @return bool True if the word is found as a standalone word, false otherwise.
      *
      * @see https://stackoverflow.com/questions/4366730/how-do-i-check-if-a-string-contains-a-specific-word
      */
     public static function containsExactWord(?string $text, ?string $word, bool $caseSensitive = true): bool {
+        // A blank term is not found in anything. Returning true here (vacuous truth) makes every
+        // boolean gate built on this method fail OPEN on a blank config value.
         if($word === null || $word === "") {
-            return true;
+            return false;
         }
         if($text === null || $text === "") {
             return false;
@@ -662,9 +877,16 @@ class Str {
     /**
      * Removes accent characters from a UTF-8 string.
      *
-     * Replaces Latin-1 Supplement and Latin Extended-A characters with their ASCII equivalents.
+     * Replaces Latin-1 Supplement and Latin Extended-A characters with their ASCII equivalents
+     * ("Olá Ção" -> "Ola Cao"), including the multi-character expansions (Æ is not covered, but
+     * Œ -> OE and Ĳ -> IJ are). Characters OUTSIDE those two blocks — Cyrillic, Greek, CJK,
+     * Latin Extended-B, and combining marks applied to a base letter — are left untouched, so
+     * this does not guarantee an ASCII-only result. Do not use it to make a string
+     * filesystem-safe or URL-safe on its own; follow it with keepOnlyCharacters() or
+     * onlyLettersAndNumbers() if you need that guarantee.
      *
-     * @param string $text The input string with possible accented characters
+     * @param string $text The input string with possible accented characters. Must be UTF-8;
+     *                     pure-ASCII input (and "") is returned unchanged without work.
      * @return string The cleaned string with accents removed
      *
      * @link https://stackoverflow.com/questions/1017599/how-do-i-remove-accents-from-characters-in-a-php-string
@@ -777,16 +999,24 @@ class Str {
     }
 
     /**
-     * Recursively finds all positions of a substring within a string.
+     * Finds all positions of a substring within a string.
      *
-     * @param string $haystack The full string to search within
-     * @param string $needle The substring to search for
-     * @param bool $returnEndPosition If true, returns position + strlen($needle); otherwise, returns match start position
-     * @param bool $caseSensitive If false, the search will be case-insensitive
-     * @param int $offset Internal offset pointer (used by recursion)
-     * @param array $results Internal result accumulator (used by recursion)
+     * Matches do not overlap: the search resumes after each match, so searching "aaaa" for "aa"
+     * yields [0, 2], not [0, 1, 2]. Multibyte (UTF-8): positions are CHARACTER offsets, not byte
+     * offsets, so they line up with subStr()/strLen() and not with the native substr().
      *
-     * @return array List of match positions found
+     * @param string $haystack The full string to search within. "" returns [].
+     * @param string $needle The substring to search for. "" returns []. Note "0" is a legitimate
+     *                       needle and IS searched for.
+     * @param bool $returnEndPosition If true, each entry is the position just AFTER the match
+     *                                (start + length of $needle); otherwise the match start.
+     * @param bool $caseSensitive If false, the search is case-insensitive
+     * @param int $offset Internal offset pointer (used by recursion) — leave at 0
+     * @param array $results Internal result accumulator (used by recursion) — leave empty. It is
+     *                       taken BY REFERENCE and appended to, so a non-empty array passed here
+     *                       is returned with the matches appended to it.
+     *
+     * @return int[] List of match positions found, ascending; [] when there is no match.
      *
      * @ref https://gist.github.com/hassanjamal/6559484
      */
@@ -798,7 +1028,7 @@ class Str {
         int $offset = 0,
         array &$results = []
     ): array {
-        if (empty($haystack) || empty($needle)) {
+        if ($haystack === '' || $needle === '') {
             return [];
         }
 
@@ -833,13 +1063,22 @@ class Str {
      * between the specified $startDelimiter and $endDelimiter. You can optionally
      * include the delimiters in the returned substrings.
      *
-     * @param string|null $input The full string to search within
-     * @param string|null $startDelimiter The starting delimiter
-     * @param string|null $endDelimiter The ending delimiter
-     * @param bool $caseSensitive If false, the search will be case-insensitive
-     * @param bool $includeDelimiters If true, includes the start and end delimiters in the results
+     * Scanning is non-overlapping and left to right: after each pair, the scan resumes past the
+     * end delimiter, so "[a][b]" between "[" and "]" gives ['a','b']. A start delimiter with no
+     * matching end delimiter after it ends the scan and is not reported. An empty region yields
+     * an empty string entry ("[]" gives ['']). Multibyte (UTF-8) aware.
      *
-     * @return array An array of all substrings found between the delimiters
+     * @param string|null $input The full string to search within. Null or "" returns [].
+     * @param string|null $startDelimiter The starting delimiter. Null or "" returns []. "0" is a
+     *                                    legitimate delimiter and IS honored.
+     * @param string|null $endDelimiter The ending delimiter. Null or "" returns []. "0" is a
+     *                                  legitimate delimiter and IS honored.
+     * @param bool $caseSensitive If false, delimiters match case-insensitively
+     * @param bool $includeDelimiters If true, each result is wrapped back in the delimiters as
+     *                                they were PASSED (not as they were matched, which differs
+     *                                when $caseSensitive is false)
+     *
+     * @return string[] An array of all substrings found between the delimiters; [] when none.
      */
     public static function extractSubstringsBetween(
         ?string $input,
@@ -848,7 +1087,8 @@ class Str {
         bool $caseSensitive = true,
         bool $includeDelimiters = false
     ): array {
-        if (empty($input) || empty($startDelimiter) || empty($endDelimiter)) {
+        if ($input === null || $input === '' || $startDelimiter === null || $startDelimiter === ''
+            || $endDelimiter === null || $endDelimiter === '') {
             return [];
         }
 

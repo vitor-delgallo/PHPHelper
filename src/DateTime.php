@@ -136,9 +136,14 @@ class DateTime {
     /**
      * Converts a timestamp into a formatted date string.
      *
-     * @param int|null $timestamp The timestamp to convert
-     * @param string|null $format The output date format
-     * @return string|null
+     * The timestamp is rendered in PHP's current default timezone (date_default_timezone_get()),
+     * NOT in this class's default timezone — setDefaultTimezone() has no effect here.
+     *
+     * @param int|null $timestamp The Unix timestamp to convert. Negative values (pre-1970) work.
+     * @param string|null $format The output date format (Case null, use the class default)
+     * @return string|null The formatted date, or null for a null timestamp — and also for
+     *                     timestamp 0, since the guard is a falsy check: the Unix epoch itself
+     *                     cannot be formatted through this method.
      */
     public static function convertTimestampToDate(?int $timestamp, ?string $format = null): ?string {
         if(empty($format)) {
@@ -280,12 +285,20 @@ class DateTime {
     /**
      * Converts a formatted date string to a long-form textual date in Brazilian Portuguese.
      *
-     * @param string $date Date string to be converted
-     * @param string|null $fromFormat Input date format
-     * @param bool $capitalizeFirst Whether to capitalize the first letter of the result
-     * @param string|null $timeZone Timezone used for comparison (default: America/Sao_Paulo)
+     * The wording is relative to "now" ("hoje", "ontem", "amanhã", "do mês passado", ...), so the
+     * timezone below is what decides which calendar day "now" falls on — it is NOT hardcoded to
+     * Brazil. Pass 'America/Sao_Paulo' explicitly (or set it once via setDefaultTimezone()) if the
+     * output must follow Brazilian local time; otherwise a server on UTC will call a 21:00 BRT
+     * event "ontem".
      *
-     * @return string|null Formatted date string or null if invalid
+     * @param string $date Date string to be converted
+     * @param string|null $fromFormat Input date format (Case null, use the class default)
+     * @param bool $capitalizeFirst Whether to capitalize the first letter of the result
+     * @param string|null $timeZone Timezone the "now" comparison runs in
+     *                              (Case null, use the class default — see setDefaultTimezone(),
+     *                              which itself falls back to date_default_timezone_get())
+     *
+     * @return string|null Formatted date string, or null if $date does not match $fromFormat
      */
     public static function dateFullTextPtBr(
         string $date,
@@ -460,14 +473,24 @@ class DateTime {
     /**
      * Generates an array of date strings between two dates at a given interval.
      *
-     * @param string $startDate      Starting date
-     * @param string $endDate        Ending date
-     * @param string|null $formatStart    Format of the starting date
-     * @param string|null $formatEnd      Format of the ending date
-     * @param string $intervalSpec   Interval specification in ISO 8601 (e.g. 'P1D' for one day)
-     * @param string|null $outputFormat   Output format for the resulting dates
+     * The range is inclusive on both ends: the start date is always the first element, and the end
+     * date is only included when the interval lands on it exactly. If the dates arrive reversed
+     * they are swapped (together with their formats), so the result is always ascending.
      *
-     * @return array Array of formatted date strings
+     * @param string $startDate      Starting date, in $formatStart
+     * @param string $endDate        Ending date, in $formatEnd
+     * @param string|null $formatStart    Format of the starting date (Case null, use the class default)
+     * @param string|null $formatEnd      Format of the ending date (Case null, use the class default)
+     * @param string $intervalSpec   Interval specification in ISO 8601 (e.g. 'P1D' for one day).
+     *                               Must describe a strictly positive duration — see @throws.
+     * @param string|null $outputFormat   Output format for the resulting dates (Case null, use the class default)
+     *
+     * @return array<int, string> Formatted date strings, ascending. Empty array when $startDate does
+     *                            not match $formatStart or $endDate does not match $formatEnd.
+     *
+     * @throws \InvalidArgumentException If $intervalSpec is not a parseable ISO 8601 interval, or
+     *                                   describes a zero-length duration (e.g. 'PT0S') — either case
+     *                                   would otherwise never advance the cursor and hang the loop.
      */
     public static function getDateRangeList(
         string $startDate,
@@ -492,34 +515,58 @@ class DateTime {
             return $dates;
         }
         if (self::toDate($startDate, $formatStart) > self::toDate($endDate, $formatEnd)) {
-            [$startDate, $endDate] = [$endDate, $startDate];
+            // The formats travel with their own date, otherwise the swapped-in date would be
+            // parsed with the other one's format and fail to parse at all.
+            [$startDate, $endDate, $formatStart, $formatEnd] =
+                [$endDate, $startDate, $formatEnd, $formatStart];
         }
 
-        $current = self::toDate(self::convertDateToFormat($startDate, 'Y-m-d H:i:s', $formatStart));
-        $end = self::toDate(self::convertDateToFormat($endDate, 'Y-m-d H:i:s', $formatEnd));
+        // 'Y-m-d H:i:s' is the intermediate format produced right here, so it must also be the
+        // format toDate() parses with — leaving it out makes toDate() fall back to the class
+        // default format and return null for anything but 'Y-m-d H:i:s'.
+        $current = self::toDate(self::convertDateToFormat($startDate, 'Y-m-d H:i:s', $formatStart), 'Y-m-d H:i:s');
+        $end = self::toDate(self::convertDateToFormat($endDate, 'Y-m-d H:i:s', $formatEnd), 'Y-m-d H:i:s');
+        if ($current === null || $end === null) {
+            return $dates;
+        }
+
         while ($current <= $end) {
             $dates[] = $current->format($outputFormat);
-            $current = self::toDate(
-                self::applyInterval(
-                    $intervalSpec,
-                    $current->format('Y-m-d H:i:s'),
-                    true,
-                    'Y-m-d H:i:s',
-                    'Y-m-d H:i:s'
-                )
+
+            $nextDate = self::applyInterval(
+                $intervalSpec,
+                $current->format('Y-m-d H:i:s'),
+                true,
+                'Y-m-d H:i:s',
+                'Y-m-d H:i:s'
             );
+            $next = $nextDate === null ? null : self::toDate($nextDate, 'Y-m-d H:i:s');
+            if ($next === null || $next <= $current) {
+                throw new \InvalidArgumentException(
+                    "Interval specification '{$intervalSpec}' is invalid or does not advance the date."
+                );
+            }
+
+            $current = $next;
         }
 
         return $dates;
     }
 
     /**
-     * Calculates the age based on a birthdate string.
+     * Calculates the age, in whole years, based on a birthdate string.
      *
-     * @param string $birthDate The birth date to calculate from
-     * @param string|null $inputFormat The format of the input date
-     * @param string|null $timeZone The timezone to use for "today" comparison
-     * @return int The calculated age
+     * @param string $birthDate The birth date to calculate from, in $format
+     * @param string|null $format The format of the input date (Case null, use the class default).
+     *                            NOTE: this is the parameter's real name — use `format:` for named
+     *                            arguments, not `inputFormat:`.
+     * @param string|null $timeZone The timezone the "today" comparison runs in
+     *                              (Case null, use the class default)
+     *
+     * @return int The calculated age. Returns 0 — NOT null and NOT an exception — when $birthDate
+     *             does not match $format, which is indistinguishable from a genuine age of 0:
+     *             validate with validateDate() first if that difference matters. A future
+     *             birthdate yields a negative number.
      *
      * @see https://www.paulocollares.com.br/programacao/5-funcoes-uteis-em-php/
      */
@@ -561,10 +608,21 @@ class DateTime {
     /**
      * Returns the difference between two dates broken down by units.
      *
-     * @param string $startDate Start date string
-     * @param string $endDate End date string
-     * @param string|null $startFormat Format of the start date string
-     * @param string|null $endFormat Format of the end date string
+     * The breakdown is calendar-decomposed (\DateInterval), NOT a flat count: 'days' is the days
+     * left over after whole years and months, so it never exceeds 30. The result is absolute —
+     * the order of the two dates does not change it.
+     *
+     * Every value is a zero-padded numeric STRING ('04', not 4), because that is what
+     * \DateInterval::format() emits. Cast before doing arithmetic on them.
+     *
+     * WARNING: a $format without time fields (the default 'Y-m-d', say) makes createFromFormat()
+     * fill the missing time from the current clock, so the sub-day units reflect "now", not zero.
+     * Pass formats that carry the precision you intend to compare.
+     *
+     * @param string $startDate Start date string, in $startFormat
+     * @param string $endDate End date string, in $endFormat
+     * @param string|null $startFormat Format of the start date string (Case null, use the class default)
+     * @param string|null $endFormat Format of the end date string (Case null, use the class default)
      *
      * @return array{
      *     years: string,
@@ -573,8 +631,10 @@ class DateTime {
      *     hours: string,
      *     minutes: string,
      *     seconds: string,
-     *     miliseconds: string
-     * }|false Returns false if dates are invalid
+     *     milliseconds: string
+     * }|false Returns false if either date does not match its format. Note the key is
+     *         'milliseconds' (two L's); it holds the sub-second remainder as a 3-digit string
+     *         ('500'), truncated — not rounded — from the interval's microseconds.
      *
      * @see https://stackoverflow.com/questions/676824/how-to-calculate-the-difference-between-two-dates-using-php
      */
@@ -604,8 +664,10 @@ class DateTime {
         $start = self::toDate($startDate, 'Y-m-d H:i:s.u');
         $end   = self::toDate($endDate, 'Y-m-d H:i:s.u');
 
-        $formatted = $end->diff($start)->format('%Y-%M-%D-%H-%I-%S-%U');
-        [$years, $months, $days, $hours, $minutes, $seconds, $milliseconds] = explode('-', $formatted);
+        // %F = microseconds, 6 digits. (%U is NOT a \DateInterval specifier: PHP echoes unknown
+        // specifiers back verbatim, so it used to hand callers the literal string '%U'.)
+        $formatted = $end->diff($start)->format('%Y-%M-%D-%H-%I-%S-%F');
+        [$years, $months, $days, $hours, $minutes, $seconds, $microseconds] = explode('-', $formatted);
 
         return [
             'years' => $years,
@@ -614,19 +676,29 @@ class DateTime {
             'hours' => $hours,
             'minutes' => $minutes,
             'seconds' => $seconds,
-            'milliseconds' => $milliseconds,
+            'milliseconds' => str_pad((string) intdiv((int) $microseconds, 1000), 3, '0', STR_PAD_LEFT),
         ];
     }
 
     /**
-     * Returns the difference between two dates in seconds (approximate, uses 30-day months and 365-day years).
+     * Returns the difference between two dates in seconds (approximate, uses 30-day months and
+     * 365-day years).
      *
-     * @param string $startDate Start date string
-     * @param string $endDate End date string
-     * @param string|null $startFormat Format of the start date string
-     * @param string|null $endFormat Format of the end date string
+     * APPROXIMATE is literal: the year/month components of the calendar difference are converted
+     * with fixed 365-day years and 30-day months, so leap days and 28/31-day months are not
+     * accounted for. Any span crossing a month or year boundary is therefore off by hours to days.
+     * Do NOT use this for billing, expiry, or any exact-seconds guard — for an exact figure,
+     * subtract two timestamps. The sub-second remainder is rounded to the nearest second.
      *
-     * @return int Total difference in seconds (or PHP_INT_MAX on error)
+     * @param string $startDate Start date string, in $startFormat
+     * @param string $endDate End date string, in $endFormat
+     * @param string|null $startFormat Format of the start date string (Case null, use the class default)
+     * @param string|null $endFormat Format of the end date string (Case null, use the class default)
+     *
+     * @return int Total difference in seconds, always >= 0 (the difference is absolute).
+     *             Returns PHP_INT_MAX — not 0, not false — when either date does not match its
+     *             format, so an unchecked comparison like `getDateDifferenceInSeconds(...) > $ttl`
+     *             reads an invalid date as "infinitely old" rather than "brand new".
      */
     public static function getDateDifferenceInSeconds(
         string $startDate,
@@ -653,7 +725,9 @@ class DateTime {
         $seconds += (!empty($diff['hours']) ? ((int) $diff['hours']) * 3600 : 0);
         $seconds += (!empty($diff['days']) ? ((int) $diff['days']) * 86400 : 0);
         $seconds += (!empty($diff['months']) ? ((int) $diff['months']) * 30 * 86400 : 0);
-        $seconds += (!empty($diff['years']) ? ((int) $diff['years']) * 365 * 30 * 86400 : 0);
+        // 365 days, per the documented contract. The stray '* 30' that used to sit here (copied
+        // from the months line above) made every year 10,950 days: results were 30x too large.
+        $seconds += (!empty($diff['years']) ? ((int) $diff['years']) * 365 * 86400 : 0);
 
         return $seconds;
     }
@@ -661,8 +735,14 @@ class DateTime {
     /**
      * Converts a time string (HH:mm:ss) into its total equivalent in seconds.
      *
-     * @param string|null $timeString Time string in format "HH:mm:ss"
-     * @return int Total seconds, or 0 if the format is invalid
+     * This reads a DURATION, not a clock time: components are not range-checked, so "100:00:00"
+     * is a valid 360000 and "00:90:00" is 5400. A fractional-seconds tail is truncated
+     * ("00:01:30.999" → 90). A leading '-' on a component makes that component subtract.
+     *
+     * @param string|null $timeString Time string in format "HH:mm:ss". Exactly three
+     *                                colon-separated numeric components are required.
+     * @return int Total seconds, or 0 if the format is invalid — null, empty, not three
+     *             components, or any non-numeric component ("ab:cd:ef"). Never throws.
      *
      * @link https://stackoverflow.com/questions/2451165/function-for-converting-time-to-number-of-seconds
      */
@@ -677,14 +757,32 @@ class DateTime {
         }
 
         $parts[2] = substr($parts[2], 0, 2);
-        return ($parts[0] * 3600) + ($parts[1] * 60) + ($parts[2] * 1);
+
+        // Guard the arithmetic below: in PHP 8 a non-numeric string operand raises a TypeError,
+        // which would escape past the documented "0 if the format is invalid" contract.
+        foreach ($parts as $part) {
+            if (!is_numeric($part)) {
+                return 0;
+            }
+        }
+
+        return ((int) $parts[0] * 3600) + ((int) $parts[1] * 60) + ((int) $parts[2]);
     }
 
     /**
      * Converts a total number of seconds into a formatted time string (HH:mm:ss).
      *
+     * This is a clock-of-day rendering, NOT a full duration renderer, and it is therefore not a
+     * total inverse of timeToSeconds(): the hour field WRAPS at 24h (90000 → "01:00:00", not
+     * "25:00:00"). Do not use it to display durations that may reach a day.
+     *
+     * The input is coerced by stripping every non-digit before use, so a sign or a decimal point
+     * is silently swallowed: -5 → "00:00:05" and "12.5" → 125 seconds → "00:02:05". Pass a
+     * non-negative integer count.
+     *
      * @param int|string|null $seconds Number of seconds to convert (may be numeric string)
-     * @return string Time string in format "HH:mm:ss"
+     * @return string Time string in format "HH:mm:ss"; "00:00:00" for null, empty, zero, or an
+     *                input with no digits at all
      */
     public static function secondsToTime(int|string|null $seconds): string {
         $seconds = Str::onlyNumbers($seconds);
@@ -698,38 +796,52 @@ class DateTime {
     /**
      * Returns a numeric code representing the current greeting period based on time of day.
      *
-     * Mapping:
+     * Mapping (boundaries are inclusive, minute-precise):
      *  - 1 => Morning (Bom dia)      → 00:00 to 12:00
      *  - 2 => Afternoon (Boa tarde)  → 12:01 to 17:59
      *  - 3 => Evening (Boa noite)    → 18:00 and onward
      *
-     * @param string|null $timeZone Timezone identifier
+     * Noon exactly (12:00) is still morning; 12:01 is already afternoon.
+     *
+     * @param string|null $timeZone Timezone identifier the current time is read in.
+     *                              (Case null, use the class default). An identifier that is not
+     *                              valid also falls back to the class default rather than throwing.
      * @return int Greeting period code (1 = morning, 2 = afternoon, 3 = evening)
      */
     public static function getGreetingPeriodCode(?string $timeZone = null): int {
-        if(empty($timeZone)) {
+        if (empty($timeZone) || !self::isValidTimezone($timeZone)) {
             $timeZone = self::getDefaultTimezone();
         }
-        $currentHour = (int) self::getCurrentFormattedDate("H", $timeZone);
 
-        if ($currentHour >= 0 && $currentHour <= 12) {
-            return 1; // Morning
-        } elseif ($currentHour > 12 && $currentHour < 18) {
-            return 2; // Afternoon
+        // Minutes are load-bearing: reading only "H" and testing `<= 12` swallowed the whole
+        // 12:00-12:59 window into morning, an hour after the documented 12:01 boundary.
+        $currentTime = (string) self::getCurrentFormattedDate("H:i", $timeZone);
+        [$currentHour, $currentMinute] = array_map('intval', explode(':', $currentTime));
+
+        if ($currentHour < 12 || ($currentHour === 12 && $currentMinute === 0)) {
+            return 1; // Morning: 00:00 - 12:00
+        } elseif ($currentHour < 18) {
+            return 2; // Afternoon: 12:01 - 17:59
         }
 
-        return 3; // Evening
+        return 3; // Evening: 18:00 onward
     }
     /**
      * Converts a date string from one timezone to another, with optional format conversion.
      *
-     * @param string $date Date string to be converted
+     * @param string $date Date string to be converted, in $fromFormat
      * @param string $fromTimezone Timezone of the input date
      * @param string $toTimezone Timezone of the output date
-     * @param string|null $fromFormat Format of the input date
-     * @param string|null $toFormat Format of the output date
+     * @param string|null $fromFormat Format of the input date. Case null, defaults to
+     *                                'Y-m-d H:i:s' — NOT the class default format. This method is
+     *                                the exception in this class: setDefaultFormat() is ignored
+     *                                here, so pass the format explicitly if the input is not
+     *                                'Y-m-d H:i:s'.
+     * @param string|null $toFormat Format of the output date (Case null, reuses $fromFormat)
      *
-     * @return string|null
+     * @return string|null The converted date, or null if $date does not parse cleanly under
+     *                     $fromFormat (parse warnings count as failure) or if either timezone
+     *                     identifier is invalid. Never throws.
      */
     public static function convertTimezone(
         string $date,
