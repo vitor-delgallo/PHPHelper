@@ -708,8 +708,12 @@ class S3Storage
             return true;
         } catch (AwsException $e) {
             if ($e->getStatusCode() === 412) {
+                // IfNoneMatch='*' made S3 refuse: the destination exists and $overwrite is false.
+                // NOTHING was copied, so this must report failure — move()/rename() call copy() and
+                // delete the source only when it returns true. Returning true here destroyed the
+                // source object on every blocked overwrite.
                 self::$lastError = "[AWS S3] copy(): Error copying: The object '{$toKey}' in bucket '{$toBucket}' already exists and overwrite is disabled.";
-                return true;
+                return false;
             }
             self::$lastError = "[AWS S3] copy(): Error copying '{$fromKey}' from bucket '{$fromBucket}' to '{$toKey}' in bucket '{$toBucket}': " . $e->getAwsErrorMessage();
             return false;

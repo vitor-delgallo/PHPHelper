@@ -36,29 +36,38 @@ class SQL {
     /**
      * Encrypts a string using a key with the "aes-256-gcm" algorithm.
      *
+     * Thin pass-through to {@see Security::encryptDataDB()}; see it for the envelope format.
+     *
      * @param mixed $str The string to encrypt
      * @param string $key The encryption key
-     * @param string|null $salt Optional salt to use in key derivation
+     * @param string $aad Context to bind, e.g. "{table}.{column}:{row_id}". REQUIRED and should be
+     *                    unique per logical cell. An empty AAD is rejected to forbid an unbound value.
+     * @param string|null $salt Optional per-subject salt for key derivation
      *
      * @return string
      * @throws \Exception
      */
-    public static function encryptDataDB(mixed $str, string $key, ?string $salt = ""): string {
-        return Security::encryptDataDB($str, $key, $salt);
+    public static function encryptDataDB(mixed $str, string $key, string $aad, ?string $salt = ""): string {
+        return Security::encryptDataDB($str, $key, $aad, $salt);
     }
 
     /**
      * Decrypts a message after verifying its integrity using "aes-256-gcm".
      *
+     * Thin pass-through to {@see Security::decryptDataDB()}. Fails loud: on a wrong key, a wrong
+     * AAD, a tampered envelope or an unknown version it THROWS — it never returns a falsy value a
+     * caller could mistake for success.
+     *
      * @param string|null $str Encrypted message
      * @param string $key Encryption key
-     * @param string|null $salt Optional salt used during encryption
+     * @param string $aad The same context bound at encryption time. REQUIRED.
+     * @param string|null $salt The same per-subject salt used at encryption time
      *
-     * @return string|false Decrypted text or FALSE if an error occurs
+     * @return string
      * @throws \Exception
      */
-    public static function decryptDataDB(?string $str, string $key, ?string $salt = ""): string|false {
-        return Security::decryptDataDB($str, $key, $salt);
+    public static function decryptDataDB(?string $str, string $key, string $aad, ?string $salt = ""): string {
+        return Security::decryptDataDB($str, $key, $aad, $salt);
     }
 
     /**

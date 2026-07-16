@@ -6,21 +6,28 @@ class Mailer {
     /**
      * Sends an email using PHPMailer.
      *
-     * @param array $configs Configuration for email sender (e.g., host, user, pass, etc.)
-     * @param array $sendTo List of recipients with 'name' and 'email'
+     * @param array $configs Sender configuration. REQUIRED keys: 'email' (the From address; 'user'
+     *                       is used as a fallback when it is itself an address), 'name' (the From
+     *                       display name), 'pass', and — unless $useConfig is set — 'host', 'port'
+     *                       and 'secure'. A missing required key makes this function return FALSE
+     *                       without sending, throwing, or logging.
+     * @param array $sendTo List of recipients, each ['email' => string (required), 'name' => string
+     *                      (optional, the display name; defaults to '')]
      * @param string $subject Email subject
      * @param string $body Email body content
      *
      * Optional parameters:
      * @param string|null $useConfig Shortcut config for common providers ('gmail', 'yahoo', etc.)
      * @param string|null $lang Language setting for the email
-     * @param array $files File attachments ['name', 'file']
-     * @param array $stringFiles Array of string-based attachments ['name', 'string']
+     * @param array $files File attachments, each ['file' => string path (required), 'name' => string
+     *                     (optional, the attachment filename; defaults to '')]
+     * @param array $stringFiles String-based attachments, each ['string' => string contents
+     *                           (required), 'name' => string (optional, filename; defaults to '')]
      * @param int $priority Email priority (1: High, 2: Medium, 3: Low)
      * @param int $wrap Max characters per line
-     * @param array $cc List of CC recipients
-     * @param array $cco List of BCC recipients
-     * @param array $reply List of reply-to addresses
+     * @param array $cc List of CC recipients — same shape as $sendTo
+     * @param array $cco List of BCC recipients — same shape as $sendTo
+     * @param array $reply List of reply-to addresses — same shape as $sendTo
      * @param array $headers Custom headers
      * @param string|null $template Template name or raw HTML body
      * @param bool $confirm Request read confirmation
@@ -30,7 +37,13 @@ class Mailer {
      * @param bool $isSMTP Whether to use SMTP
      * @param bool $debugMode Enable debug output
      *
-     * @return bool TRUE on success, FALSE on failure
+     * @return bool TRUE on success. FALSE on a missing/invalid $configs key, on an empty $sendTo /
+     *              $subject / $body, and on any PHPMailer failure — those are caught and swallowed
+     *              here, so a FALSE carries no reason, no exception and no log line.
+     *              CAUTION: only \PHPMailer\PHPMailer\Exception is caught. Any OTHER Throwable
+     *              raised while the message is built PROPAGATES to the caller — including the
+     *              ErrorException that a strict error handler (Laravel's, for one) makes out of a
+     *              PHP warning. So this function can both return FALSE and throw.
      */
     public static function sendMail(
         array $configs,
@@ -78,7 +91,7 @@ class Mailer {
             (empty($configs['user']) && $useConfig !== 'no-config') ||
             (empty($configs['pass']) && $useConfig !== 'no-config') ||
             empty($configs['email']) ||
-            empty($configs['nome']) ||
+            empty($configs['name']) ||
             empty($sendTo) ||
             empty($subject) ||
             empty($body)
@@ -181,24 +194,27 @@ class Mailer {
                 $mail->AddCustomHeader("Disposition-Notification-To", ("<" . $configs['email'] . ">"));
             }
 
-            $mail->setFrom($configs['email'], $configs['nome']);
+            // Display names are OPTIONAL by design: they are cosmetic, so a missing one degrades to
+            // "" (PHPMailer's own default) instead of raising an undefined-key warning that a strict
+            // error handler would rethrow — killing an otherwise valid send.
+            $mail->setFrom($configs['email'], $configs['name'] ?? '');
             foreach($sendTo AS $to){
-                $mail->addAddress($to['email'], $to['nome']);
+                $mail->addAddress($to['email'], $to['name'] ?? '');
             }
             foreach($params['cc'] AS $to){
-                $mail->addCC($to['email'], $to['nome']);
+                $mail->addCC($to['email'], $to['name'] ?? '');
             }
             foreach($params['cco'] AS $to){
-                $mail->addBCC($to['email'], $to['nome']);
+                $mail->addBCC($to['email'], $to['name'] ?? '');
             }
             foreach($params['reply'] AS $to){
-                $mail->addReplyTo($to['email'], $to['nome']);
+                $mail->addReplyTo($to['email'], $to['name'] ?? '');
             }
             foreach ($params['files'] AS $file){
-                $mail->addAttachment($file['file'], $file['nome']);
+                $mail->addAttachment($file['file'], $file['name'] ?? '');
             }
             foreach ($params['stringFiles'] AS $file){
-                $mail->addStringAttachment($file['string'], $file['nome']);
+                $mail->addStringAttachment($file['string'], $file['name'] ?? '');
             }
 
             $mail->CharSet = $params['charset'];

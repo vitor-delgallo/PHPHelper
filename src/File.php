@@ -521,7 +521,12 @@ class File {
      * @throws \Exception
      */
     public static function updateEnvFile(string $filePath, array $variables): bool {
-        self::writeFile($filePath);
+        // Create the file when absent — but NEVER touch an existing one here: writeFile() defaults to
+        // $content="" with $append=false, so it opens "w" and truncates. Truncating before the read
+        // below wiped every pre-existing variable and comment, leaving only $variables behind.
+        if (!file_exists($filePath)) {
+            self::writeFile($filePath);
+        }
 
         $newContent = "";
         $lines = file($filePath, FILE_IGNORE_NEW_LINES);

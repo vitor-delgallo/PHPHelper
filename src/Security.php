@@ -1015,12 +1015,28 @@ class Security {
     }
 
     /**
-     * Apply personalized encrypt/decrypt function in array elements
+     * Applies a Security encrypt/decrypt/hash method to every scalar leaf of an array or object.
+     *
+     * NOT a general callable dispatcher: $fnName is force-prefixed with "Security::", so only this
+     * class's methods can be reached. Passing your own function or another class's method produces
+     * "Security::YourClass::method" and a TypeError from call_user_func — an \Error, which a
+     * `catch (\Exception)` does NOT catch.
+     *
+     * The leaf call is `$fnName($value, $key, $salt)`, so $fnName MUST accept
+     * (mixed $value, string $key, ?string $salt). Only these five qualify:
+     *   encryptLocal · decryptLocal · encryptCrossPlatform · decryptCrossPlatform · generateSearchHash
+     *
+     * DO NOT pass encryptDataDB or decryptDataDB. Their third parameter is $aad, not $salt, so
+     * $salt would silently bind to the AAD while their own $salt kept its "" default — every value
+     * encrypted with an unsalted derived key and an AAD nobody intended. It round-trips (both
+     * directions are wrong identically), so nothing fails and the defect stays invisible. Those two
+     * need a per-cell AAD, which is meaningless for a bulk array walk — call them directly instead.
      *
      * @param mixed $item Item to be applied
      * @param string $key Decryption key
-     * @param string|null $salt Optional salt for key derivation
-     * @param string $fnName Name of function
+     * @param string|null $salt Optional salt for key derivation, passed as the THIRD argument
+     * @param string $fnName Name of a Security method matching the signature above. A "Security::"
+     *                       or "self::" prefix is optional and stripped.
      *
      * @return mixed
      * @throws \Exception
@@ -1064,10 +1080,28 @@ class Security {
     }
 
     /**
-     * Recursively sanitizes a variable or array to prevent XSS attacks.
+     * Best-effort, defence-in-depth stripping of common HTML/JS injection vectors from a value or
+     * array.
      *
-     * @param mixed $input The variable to sanitize
-     * @return mixed The sanitized result
+     * NOT AN XSS DEFENCE. DO NOT RELY ON IT AS ONE. This is a BLACKLIST filter (adapted from the
+     * StackOverflow answer referenced below), and blacklists are bypassable by construction. Known
+     * bypasses that pass through this function COMPLETELY UNCHANGED:
+     *
+     *     <svg/onload=alert(1)>
+     *     <img/onerror=alert(1) src=x>
+     *
+     * The on*-attribute rule requires a whitespace or quote character immediately before "on", so
+     * any other valid HTML attribute separator ("/" above) evades it. `<svg onload=...>` with a
+     * SPACE is stripped — which is what makes this dangerous: it looks like it works when you test
+     * it casually.
+     *
+     * The only sound defence is CONTEXT-CORRECT OUTPUT ENCODING at the point of rendering
+     * (htmlspecialchars() for HTML text, a JSON encoder for a <script> context, a URL encoder for an
+     * attribute that becomes a URL), plus a Content-Security-Policy. Use this function only as an
+     * extra layer behind those — never as the thing that makes untrusted input safe.
+     *
+     * @param mixed $input The variable to filter
+     * @return mixed The filtered result — NOT a guarantee of safety
      */
     public static function xssCleanRecursive(mixed $input): mixed {
         if ($input === null || $input === "" || is_bool($input) || filter_var($input, FILTER_VALIDATE_INT) || filter_var($input, FILTER_VALIDATE_FLOAT)) {
