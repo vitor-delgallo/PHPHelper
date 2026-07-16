@@ -4,14 +4,39 @@ namespace VD\PHPHelper;
 
 class SQL {
     /**
-     * The only shape an identifier derived from DATA may have.
+     * The only characters an identifier derived from DATA may be built from.
      *
      * Deliberately far narrower than what MySQL accepts: identifiers cannot be escaped, so anything
      * auto-derived is either provably inert or refused. A caller who genuinely has a column outside
      * this set (a unicode name, a dot-qualified reference) passes $insertFields explicitly, which is
      * their own SQL text and is not checked against this.
+     *
+     * A CHARACTER SET checked with strspn(), not a regex, for the same reason
+     * {@see Validator::isOctal()} is: this was written as '/^[A-Za-z0-9_$]+$/', and PCRE's '$'
+     * matches before a FINAL NEWLINE, so "col\n" satisfied a pattern whose whole job was to refuse
+     * anything but [A-Za-z0-9_$] — the exact hole isOctal() documents. strspn() has no anchors, no
+     * newline exception and no backtracking, so there is nothing left to get subtly wrong. It does
+     * accept the empty string (strspn("") === strlen("") === 0), which {@see self::isAutoIdentifier()}
+     * rejects explicitly.
      */
-    private const AUTO_IDENTIFIER_PATTERN = '/^[A-Za-z0-9_$]+$/';
+    private const AUTO_IDENTIFIER_CHARS =
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_$';
+
+    /**
+     * Whether $column is a name this class is willing to render as an identifier on its own.
+     *
+     * @param string $column The candidate name.
+     * @return bool TRUE only if $column is non-empty and made solely of AUTO_IDENTIFIER_CHARS.
+     *              FALSE for the empty string and for any name carrying anything else — including
+     *              a trailing newline, a NUL byte or a backtick.
+     */
+    private static function isAutoIdentifier(string $column): bool {
+        if ($column === '') {
+            return false;
+        }
+
+        return strspn($column, self::AUTO_IDENTIFIER_CHARS) === strlen($column);
+    }
 
     /**
      * Escapes a value and renders it as a literal usable inside a MySQL statement.
@@ -149,25 +174,33 @@ class SQL {
      *    literals from your own code — never user input, never a request key.
      *  - When $insertFields is null the column list is derived from THE KEYS OF THE FIRST ROW of
      *    $data — names that come from the data rather than from your source. Those are NOT trusted:
-     *    each must match /^[A-Za-z0-9_$]+$/ or the call THROWS, and they are rendered backtick-
-     *    quoted. A crafted array key cannot reach the statement. Pass $insertFields explicitly when
-     *    you need a column this pattern refuses (a unicode or dot-qualified name).
+     *    each must be non-empty and built solely from [A-Za-z0-9_$] or the call THROWS, and they
+     *    are rendered backtick-quoted. The check is a strspn() character-set test, so it holds for
+     *    the WHOLE name — a trailing newline ("col\n") is refused like any other stray byte. A
+     *    crafted array key cannot reach the statement. Pass $insertFields explicitly when you need
+     *    a column this refuses (a unicode or dot-qualified name).
      *  - Row VALUES are escaped by the default formatter via {@see self::escapeString()}, with
      *    that method's documented limits. A custom $rowFormatter escapes its own values; nothing
      *    here checks it. Prefer real prepared statements for untrusted values.
      *
-     * @param array $data BY REFERENCE. The dataset; each item must be an associative array. The
-     *        rows written into the returned statement are removed from it, and the surviving rows
-     *        keep their original keys. Left untouched when the function returns false.
+     * @param array $data BY REFERENCE. The dataset; each item must be an associative array — a row
+     *        that is not an array THROWS, and $data is left untouched, rather than being skipped
+     *        and consumed. The rows written into the returned statement are removed from it, and
+     *        the surviving rows keep their original keys. Left untouched when the function returns
+     *        false.
      * @param string $table Target table name. Trusted identifier, interpolated raw; empty returns
      *        false.
      * @param string|null $insertFields Comma-separated column names for the INSERT clause, e.g.
-     *        "id,name". Trusted identifiers, interpolated raw. Null auto-derives them from the
+     *        "id,name" or "`order`,`key`". Trusted identifiers: interpolated raw into the INSERT
+     *        clause exactly as written, including any backticks. Null auto-derives them from the
      *        first row's keys, skipping keys whose value is an array or object; auto-derived names
-     *        are validated against /^[A-Za-z0-9_$]+$/ and rendered backtick-quoted.
+     *        must be non-empty and built solely from [A-Za-z0-9_$] and are rendered backtick-quoted.
      * @param string|null $updateFields Comma-separated "col=expr" pairs for the ON DUPLICATE KEY
      *        UPDATE clause. Trusted fragment, interpolated raw. Null auto-generates
-     *        "col=VALUES(col)" for every insert column.
+     *        "col=VALUES(col)" for every insert column, KEEPING each column's quoting as it appears
+     *        in $insertFields (the library's own backticks when auto-derived) — so an explicit
+     *        "`order`,`key`" yields "`order`=VALUES(`order`),`key`=VALUES(`key`)" and stays valid
+     *        SQL for a column that needs quoting. Only surrounding whitespace is trimmed.
      * @param callable|null $rowFormatter fn(array $row, int|string $key, array &$global): string|false
      *        formatting a single row. Must return:
      *        - string: a complete value group, e.g. "(1,'abc')", holding exactly as many values as
@@ -187,10 +220,12 @@ class SQL {
      *
      * @throws \InvalidArgumentException When an auto-derived column name (a key of the first row,
      *         used only when $insertFields is null) is not a valid identifier — see the SECURITY
-     *         note above. $data is left untouched. Also from the default formatter, through
-     *         self::escapeString(), when a column of $insertFields holds a value with no safe
-     *         literal form (array/object/resource/NAN/INF). A custom formatter throws whatever it
-     *         throws.
+     *         note above. $data is left untouched. Also when a row of $data is not an array (an
+     *         object row included: it has no columns to read, and passing it to the formatter
+     *         raised an uncaught \Error), again leaving $data untouched. Also from the default
+     *         formatter, through self::escapeString(), when a column of $insertFields holds a value
+     *         with no safe literal form (array/object/resource/NAN/INF). A custom formatter throws
+     *         whatever it throws.
      */
     public static function prepareInsertOrUpdateMySQL(
         array &$data,
@@ -214,23 +249,33 @@ class SQL {
         // only input, and it is what keeps every value group aligned with the INSERT column list.
         // Deriving it only when a field list was omitted left the fully documented call
         // (both field lists given, default formatter) reading an undefined $global['__insert'].
+        //
+        // Two views of the same column list, built together and kept index-aligned:
+        //  - $insertColumns:   the BARE name. What the formatter indexes the row with, and what
+        //                      $global['__insert'] publishes.
+        //  - $renderedColumns: the SQL TEXT for that column. What any identifier this method writes
+        //                      itself must be built from — see the ON DUPLICATE KEY UPDATE clause.
+        $insertColumns = [];
+        $renderedColumns = [];
+
         if (!$autoDerived) {
             // Columns come from what the caller actually asked to insert, NOT from the row keys:
             // a row carrying extra keys must not desynchronise the value groups.
-            $insertColumns = [];
-
             foreach (explode(',', $insertFields) as $column) {
-                $column = trim($column, " \t\n\r\0\x0B`");
+                // The bare name drops the caller's quoting; the rendered form KEEPS it. Stripping
+                // the backticks off an explicit "`order`,`key`" and rebuilding the update clause
+                // from the bare names emitted "ON DUPLICATE KEY UPDATE order=VALUES(order)" — a
+                // syntax error on precisely the columns that needed the quoting the caller supplied.
+                $bare = trim($column, " \t\n\r\0\x0B`");
 
-                if ($column === '') {
+                if ($bare === '') {
                     continue;
                 }
 
-                $insertColumns[] = $column;
+                $insertColumns[] = $bare;
+                $renderedColumns[] = trim($column, " \t\n\r\0\x0B");
             }
         } else {
-            $insertColumns = [];
-
             foreach ($data as $row) {
                 if (!is_array($row)) {
                     break;
@@ -248,7 +293,7 @@ class SQL {
                     // from user input, the array key is attacker-chosen. It is about to be
                     // interpolated as an IDENTIFIER, and no escaping makes an identifier safe, so
                     // the only defence is to refuse anything that is not provably inert.
-                    if (!preg_match(self::AUTO_IDENTIFIER_PATTERN, $column)) {
+                    if (!self::isAutoIdentifier($column)) {
                         throw new \InvalidArgumentException(sprintf(
                             'SQL::prepareInsertOrUpdateMySQL(): cannot auto-derive the column name %s '
                                 . 'from the dataset — an identifier cannot be escaped, so only '
@@ -265,6 +310,15 @@ class SQL {
             }
 
             $insertColumns = array_values(array_unique($insertColumns));
+
+            // This method wrote these identifiers, so it quotes them. Validated above to hold
+            // nothing but AUTO_IDENTIFIER_CHARS — no backtick — so the quoting cannot be broken out
+            // of, and it is what lets an ordinary column named after a reserved word ("order",
+            // "key") survive at all. Built AFTER array_unique() to stay aligned with the bare list.
+            $renderedColumns = array_map(
+                static fn (string $col): string => '`' . $col . '`',
+                $insertColumns
+            );
         }
 
         if (empty($insertColumns)) {
@@ -276,22 +330,18 @@ class SQL {
 
         $global['__insert'] = $insertColumns;
 
-        // How each column is RENDERED into SQL. $global['__insert'] keeps the bare names, because
-        // that is what the formatter indexes the row with; quoting belongs to the SQL text only.
-        //  - auto-derived: this method wrote those identifiers, so it quotes them. Validated above
-        //    to contain no backtick, so the quoting cannot be broken out of, and it is what lets an
-        //    ordinary column named after a reserved word ("order", "key") survive at all.
-        //  - explicit: the caller's own SQL text, interpolated raw and untouched, as documented.
-        $renderedColumns = $autoDerived
-            ? array_map(static fn (string $col): string => '`' . $col . '`', $insertColumns)
-            : $insertColumns;
-
         if ($autoDerived) {
             $insertFields = implode(',', $renderedColumns);
         }
 
+        // Built from the RENDERED names, never the bare ones: this clause is SQL text this method
+        // writes, so every identifier in it must carry the same quoting the INSERT clause uses —
+        // the library's backticks when auto-derived, the caller's own when explicit.
         if ($updateFields === null) {
-            $updateFields = implode(',', array_map(fn($col) => "$col=VALUES($col)", $renderedColumns));
+            $updateFields = implode(',', array_map(
+                static fn (string $col): string => "$col=VALUES($col)",
+                $renderedColumns
+            ));
         }
 
         // Define default row formatter if not provided
@@ -324,11 +374,26 @@ class SQL {
         $query = '';
 
         foreach ($data as $key => $row) {
-            $processedRows++;
-
-            if (!is_array($row) && !is_object($row)) {
-                continue;
+            // The SAME guard the derive path applies, which is where it was missing: that path
+            // refuses to read columns off a non-array row, but this one waved objects through with
+            // `!is_array($row) && !is_object($row)` and the default formatter then hit
+            // `$row[$column]` on a stdClass — an uncaught \Error out of a method whose documented
+            // failures are \InvalidArgumentException. Scalars fared worse: they were skipped AND
+            // consumed, so a bad row vanished from the by-ref $data while the call reported success.
+            // A row that is not an array is a contract violation ("each item must be an associative
+            // array"), and the only safe answer is to say so before anything is consumed.
+            if (!is_array($row)) {
+                throw new \InvalidArgumentException(sprintf(
+                    'SQL::prepareInsertOrUpdateMySQL(): row %s of $data is a %s, not an associative '
+                        . 'array. Convert the dataset at the call site (e.g. (array) $row, or '
+                        . 'json_decode($json, true)) — skipping the row would consume it out of '
+                        . '$data and report success while dropping its data.',
+                    var_export($key, true),
+                    get_debug_type($row)
+                ));
             }
+
+            $processedRows++;
 
             $currentUsage = memory_get_usage(true) - $initialUsage;
             $values = $rowFormatter($row, $key, $global);

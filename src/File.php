@@ -18,10 +18,10 @@ class File {
     private const DEFAULT_MODE = "755";
 
     /**
-     * @var int|float Default permission mode, as an octal integer, or 0 when not yet resolved.
-     *                Lazily initialised to DEFAULT_MODE by getDefaultMode().
+     * @var int Default permission mode, as an octal integer, or 0 when not yet resolved.
+     *          Lazily initialised to DEFAULT_MODE by getDefaultMode().
      */
-    private static int|float $defaultMode = 0;
+    private static int $defaultMode = 0;
 
     /**
      * @var int Number of bytes read per loop iteration by downloadFile(), or 0 when not yet
@@ -79,9 +79,9 @@ class File {
      * DIRECTORY mode: createDir() is the only method that falls back to it — writeFile() applies
      * a mode only when one is explicitly passed.
      *
-     * @return int|float The default permission mode as an octal integer (e.g., 0755 === 493)
+     * @return int The default permission mode as an octal integer (e.g., 0755 === 493)
      */
-    public static function getDefaultMode(): int|float {
+    public static function getDefaultMode(): int {
         if(empty(self::$defaultMode)) {
             self::setDefaultMode(self::DEFAULT_MODE);
         }
@@ -92,35 +92,65 @@ class File {
      * Sets the process-wide default permission mode used when a caller passes no explicit mode.
      *
      * @param string $defaultMode Permission mode as an octal string: octal digits with an optional
-     *                            leading zero (e.g., "755", "0700"). Anything else is SILENTLY
-     *                            IGNORED and the previous default is kept, so read getDefaultMode()
-     *                            back if the value is not a literal.
+     *                            leading zero (e.g., "755", "0700"). Anything else — including an
+     *                            octal string too large to fit a PHP int (see parseOctalMode()) —
+     *                            is SILENTLY IGNORED and the previous default is kept, so read
+     *                            getDefaultMode() back if the value is not a literal.
      * @return void
      */
     public static function setDefaultMode(string $defaultMode): void {
-        if(!Validator::isOctal($defaultMode)) {
+        $mode = self::parseOctalMode($defaultMode);
+        if($mode === null) {
             return;
         }
-        self::$defaultMode = octdec($defaultMode);
+        self::$defaultMode = $mode;
+    }
+
+    /**
+     * Parses an octal permission string into the int chmod()/mkdir() expect, or NULL if it is not
+     * one this library can honour.
+     *
+     * Validator::isOctal() only checks the CHARACTER SET, so it happily accepts an arbitrarily long
+     * run of octal digits. octdec() then silently returns a FLOAT for anything above PHP_INT_MAX
+     * (8^21 - 1 on a 64-bit build), and that float reached mkdir()/chmod() as an uncaught
+     * TypeError — "must be of type int, float given" — from inside createDir()/writeFile(), which
+     * document a return code as their error channel and never a throw. The overflow is rejected
+     * here instead, so it joins every other malformed mode on the documented fallback path.
+     *
+     * The bound is is_int(), NOT the raw string length: "0000000000000000000000700" is 25
+     * characters but a perfectly good 0700, and rejecting it on length would silently WIDEN it to
+     * the 0755 default — the exact class of bug this check exists to prevent.
+     *
+     * @param string|null $value Permission mode as an octal string (e.g., "0700").
+     * @return int|null The mode as an octal integer, or NULL if $value is not a valid octal string
+     *                  or does not fit a PHP int.
+     */
+    private static function parseOctalMode(?string $value): ?int {
+        if(!Validator::isOctal($value)) {
+            return null;
+        }
+
+        $mode = octdec($value);
+        // octdec() returns int|float; a float here means the value overflowed PHP_INT_MAX.
+        return is_int($mode) ? $mode : null;
     }
 
     /**
      * Converts an octal permission string into the octal integer chmod()/mkdir() expect.
      *
      * @param string|null $permissionMode Permission mode as an octal string (e.g., "0700").
-     *                                    NULL — or any value that is not a valid octal string —
+     *                                    NULL — or any value that is not a valid octal string, or
+     *                                    is too large to fit a PHP int (see parseOctalMode()) —
      *                                    falls back to getDefaultMode() rather than failing, so a
      *                                    malformed mode silently becomes the default (which may be
      *                                    WIDER than what the caller asked for). Callers that must
      *                                    not silently widen permissions have to reject a malformed
      *                                    mode themselves before calling; writeFile() does.
-     * @return int|float The resolved permission mode as an octal integer
+     * @return int The resolved permission mode as an octal integer. Never a float: mkdir()/chmod()
+     *             reject one with a TypeError.
      */
-    public static function getPermissionMode(?string $permissionMode): int|float {
-        if(!Validator::isOctal($permissionMode)) {
-            return self::getDefaultMode();
-        }
-        return octdec($permissionMode);
+    public static function getPermissionMode(?string $permissionMode): int {
+        return self::parseOctalMode($permissionMode) ?? self::getDefaultMode();
     }
 
     /**
@@ -346,7 +376,11 @@ class File {
             return $ret;
         }
 
-        if($createPath === null || (!is_bool($createPath) && !Validator::isOctal($createPath))) {
+        // parseOctalMode(), not Validator::isOctal(): isOctal() accepts an unbounded run of octal
+        // digits, and such a mode used to survive this guard and reach createDir() -> mkdir() as an
+        // uncaught TypeError (octdec() overflows to float). An unusable mode means "do not create"
+        // here, exactly like every other non-octal string already did.
+        if($createPath === null || (!is_bool($createPath) && self::parseOctalMode($createPath) === null)) {
             $createPath = false;
         }
 
@@ -413,9 +447,10 @@ class File {
      *                    first — a chmod failure means the content IS on disk but is NOT protected
      *                    by the requested mode).
      * @throws \InvalidArgumentException If $permissionMode is given but is not a valid octal
-     *                                   string. It is rejected rather than silently falling back
-     *                                   to the default mode, which would widen permissions on
-     *                                   exactly the call that asked to restrict them.
+     *                                   string, or is too large to fit a PHP int. It is rejected
+     *                                   rather than silently falling back to the default mode,
+     *                                   which would widen permissions on exactly the call that
+     *                                   asked to restrict them.
      *
      * @ref https://chmodcommand.com/chmod-2777/
      */
@@ -424,8 +459,17 @@ class File {
             throw new \Exception("File path not provided for writing!");
         };
 
-        if($permissionMode !== null && !Validator::isOctal($permissionMode)) {
-            throw new \InvalidArgumentException("Invalid permission mode provided for writing: '{$permissionMode}'!");
+        // parseOctalMode(), not Validator::isOctal(): isOctal() accepts an unbounded run of octal
+        // digits, so a 22-digit mode passed this guard and then resolved, via getPermissionMode(),
+        // to the 0755 DEFAULT down at the chmod() below — silently widening the file on the very
+        // call that asked to restrict it, which is what this throw exists to prevent. Parsed once
+        // here and reused, so the guard and the chmod() can never disagree about the mode.
+        $fileMode = null;
+        if($permissionMode !== null) {
+            $fileMode = self::parseOctalMode($permissionMode);
+            if($fileMode === null) {
+                throw new \InvalidArgumentException("Invalid permission mode provided for writing: '{$permissionMode}'!");
+            }
         }
 
         $filePath = self::getPathInfo($filePath, keepFileNotExists: true, createPath: true);
@@ -457,7 +501,7 @@ class File {
         // It used to run BEFORE fopen() created the file (so the mode was silently dropped for
         // every new file), and a null mode used to resolve to the 0777 default and be applied
         // anyway (so a plain write relaxed an existing secret file to world-writable).
-        if ($permissionMode !== null && !chmod($filePath['path'], self::getPermissionMode($permissionMode))) {
+        if ($fileMode !== null && !chmod($filePath['path'], $fileMode)) {
             throw new \Exception("Failed to apply permission mode '{$permissionMode}' to the file!");
         }
     }
@@ -1251,14 +1295,22 @@ class File {
      * result is safe to use as a path segment, but it can still be a reserved Windows device name
      * ("con", "nul"), so callers on Windows should not rely on this alone.
      *
-     * Uniqueness is best-effort: the suffix is a per-second timestamp plus rand(0, 999), so two
-     * uploads within the same second collide at roughly 1/1000. Callers that must not overwrite
-     * (uploadFileTo() does not check) should verify the target does not exist.
+     * The result NEVER starts with '-': leading dashes are stripped, because a file name beginning
+     * with one is parsed as an OPTION rather than a path by most CLI tools that might later be run
+     * over the upload directory ("-rf.txt" reaching rm). A '-' elsewhere in the name is kept.
+     *
+     * Uniqueness is best-effort: the suffix is a per-second timestamp plus a zero-padded
+     * rand(0, 999), so two uploads within the same second collide at roughly 1/1000. Callers that
+     * must not overwrite (uploadFileTo() does not check) should verify the target does not exist.
      *
      * @param string $originalFileName The original file name before uploading. Empty returns "".
      * @param int $maxLength Maximum number of characters allowed in the FINAL name, extension
      *                       included. Default (and fallback for a value <= 0) is 125. Must leave
-     *                       room for the ~17-character suffix plus ".<extension>".
+     *                       room for the suffix — a FIXED 18 characters ('_' + 14-digit timestamp
+     *                       + 3 padded random digits) — plus ".<extension>". The width is fixed so
+     *                       that whether this method throws depends only on its arguments: an
+     *                       unpadded random part made the suffix 16-18 characters and the
+     *                       InvalidArgumentException below fire per DRAW, for identical arguments.
      * @return string The formatted name: "<base><suffix>.<extension>", never longer than
      *                $maxLength. An extension that sanitises away to nothing is dropped along with
      *                its dot, so the result never ends in '.' (Windows would silently strip it,
@@ -1303,7 +1355,12 @@ class File {
         if (empty($formattedDate)) {
             throw new \Exception("Unable to read the current date to build a unique file name suffix!");
         }
-        $timestampSuffix = '_' . $formattedDate . rand(0, 999);
+        // The random part is padded to a FIXED 3 digits. Unpadded, rand(0, 999) made the suffix 16,
+        // 17 or 18 characters depending on the DRAW, so the $reserved check below — and therefore
+        // the InvalidArgumentException — fired only for some draws: renameUploadFile('a', 17) threw
+        // roughly 9 times out of 10 and returned a name the rest of the time. A function that
+        // rejects its arguments non-deterministically passes CI all week and throws in production.
+        $timestampSuffix = '_' . $formattedDate . str_pad((string) rand(0, 999), 3, '0', STR_PAD_LEFT);
 
         $fileParts = explode('.', $originalFileName);
 
@@ -1325,7 +1382,17 @@ class File {
             );
         }
 
-        $name = Str::subStr($formatFileName(implode('.', $fileParts)), 0, $maxLength - $reserved) . $timestampSuffix;
+        // A stored name STARTING with '-' is read as an OPTION rather than a path by most CLI tools
+        // a consumer might later run over the upload directory ("-rf.txt" becomes flags to rm, and
+        // tar/ffmpeg/imagemagick parse it the same way), which hands the uploader control of the
+        // first character. '-' stays legal INSIDE the name, where nothing can parse it as a flag.
+        // Stripped rather than replaced, so nothing is silently welded together, and stripped
+        // BEFORE the truncation: truncation only ever removes from the END, so it cannot bring a
+        // leading '-' back, and the budget below is still respected. A base that is nothing but
+        // dashes empties out, leaving the suffix's own leading '_' as the first character.
+        $base = ltrim($formatFileName(implode('.', $fileParts)), '-');
+
+        $name = Str::subStr($base, 0, $maxLength - $reserved) . $timestampSuffix;
 
         return $extension === '' ? $name : $name . '.' . $extension;
     }

@@ -503,6 +503,34 @@ final class ParserTest extends TestCase {
         $this->assertTrue(Parser::getBool((object) ['a' => 1]));
     }
 
+    /**
+     * FINDING (low) — the docblock claimed the sentinels match "ignoring surrounding spaces". They
+     * do not: Validator::isCompletelyEmpty() runs the string through
+     * Str::removeExcessSpaces($v, false), which deletes whitespace runs OUTRIGHT, internal ones
+     * included. So 'fa lse' and 'n o' are FALSE — genuinely surprising for a boolean parser, and
+     * nothing in the doc warned you.
+     *
+     * DOCUMENTED rather than changed, deliberately. The normalisation lives in isCompletelyEmpty(),
+     * which also backs Security's `asBoolean` sanitize option. Loosening it here — and only here —
+     * would fork the two doors: 'n o' would read false when parsed and true when sanitised, a
+     * silent disagreement between sibling paths that is far nastier than a parser being generous
+     * about spaces. It is one shared helper: fix it for both callers or neither.
+     *
+     * DOC-ONLY FIX: this test passes before and after it. It pins the surprising truth so the doc
+     * and the behavior cannot drift apart again without a red test.
+     */
+    public function testGetBoolStripsInternalWhitespaceBeforeMatchingSentinels(): void {
+        foreach (['fa lse', 'n o', 'F A L S E', 'n u l l', '{ }', '[ ]', "fal\tse", "n\no", 'u n defined'] as $value) {
+            $this->assertFalse(Parser::getBool($value), var_export($value, true) . ' must be falsy');
+        }
+
+        // A string that does NOT collapse onto a sentinel stays truthy, so the stripping is not a
+        // blanket "any spaced string is false".
+        $this->assertTrue(Parser::getBool('ye s'));
+        $this->assertTrue(Parser::getBool('fa lsey'));
+        $this->assertTrue(Parser::getBool('n ope'));
+    }
+
     /** Pins the fix: a non-empty array made the internal string cast emit "Array to string conversion". */
     public function testGetBoolHandlesArraysWithoutEmittingAWarning(): void {
         $this->assertTrue(Parser::getBool(['a', 'b']));

@@ -179,6 +179,71 @@ final class NumberTest extends TestCase
         $this->assertSame(8250.0, Number::roundDecimal(8253.0, -1, 'floor'));
     }
 
+    /**
+     * FINDING (medium) — the docblock's worked example for negative $precision was FALSE for the
+     * DEFAULT $method. It claimed "$precision = -2 turns 8250.0 into 8200.0", which is the 'floor'
+     * answer: 8250 scaled by 10^-2 is 82.5, a tie, and round-half-up sends a tie to 83 => 8300.0.
+     * The behavior is right (it is the documented round-half-up); the prose was wrong, so the doc
+     * was corrected to state all three answers.
+     *
+     * The sibling test above pinned 'floor' and 'ceil' at -2 but never the default — which is
+     * exactly how a false example survived a green suite. This pins the default.
+     *
+     * DOC-ONLY FIX: this test passes before and after it. It is here so that anyone who "corrects"
+     * the behavior to match the old prose trips over it instead of silently changing money math.
+     */
+    public function testRoundDecimalNegativePrecisionRoundsHalfUpUnderTheDefaultMethod(): void
+    {
+        $this->assertSame(8300.0, Number::roundDecimal(8250.0, -2));
+        $this->assertSame(8300.0, Number::roundDecimal(8250.0, -2, 'round'));
+        $this->assertSame(8200.0, Number::roundDecimal(8250.0, -2, 'floor'));
+        $this->assertSame(8300.0, Number::roundDecimal(8250.0, -2, 'ceil'));
+    }
+
+    /**
+     * FINDING (low) — roundDecimal(1.5, 309) returned NAN for perfectly finite input: 10**309 is
+     * INF, and INF/INF is NAN. A rounding helper that answers NAN is worse than one that refuses.
+     */
+    public function testRoundDecimalRejectsAPrecisionWhoseFactorOverflowsToInf(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('$precision must be between -323 and 308');
+        Number::roundDecimal(1.5, 309);
+    }
+
+    /**
+     * FINDING (low) — roundDecimal(1.5, -324) threw DivisionByZeroError, because 10**-324 is 0.0.
+     * That is an \Error, NOT an \Exception: it is outside the hierarchy a caller would catch, it
+     * was undocumented, and it is a different type from every other bad-argument rejection in this
+     * class. It is now an InvalidArgumentException like the rest.
+     */
+    public function testRoundDecimalRejectsAPrecisionWhoseFactorUnderflowsToZero(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('$precision must be between -323 and 308');
+        Number::roundDecimal(1.5, -324);
+    }
+
+    /**
+     * The bound is not a guess: [-323, 308] is exactly the set of $precision values for which
+     * 10**$precision is a finite, non-zero double. Pin both endpoints as ACCEPTED, so a future
+     * tightening of the range has to argue with a test, and pin that finite input can never come
+     * back non-finite anywhere inside it.
+     */
+    public function testRoundDecimalAcceptsTheWholeDocumentedPrecisionRange(): void
+    {
+        $this->assertSame(1.5, Number::roundDecimal(1.5, 308));
+        $this->assertSame(0.0, Number::roundDecimal(1.5, -323));
+
+        foreach ([-323, -308, -2, 0, 2, 15, 308] as $precision) {
+            foreach (['round', 'floor', 'ceil'] as $method) {
+                $result = Number::roundDecimal(1.5, $precision, $method);
+                $this->assertIsFloat($result);
+                $this->assertFalse(is_nan($result), "precision $precision / $method returned NAN");
+            }
+        }
+    }
+
     public function testRoundDecimalPropagatesNonFiniteInput(): void
     {
         $this->assertNan(Number::roundDecimal(NAN));
@@ -332,6 +397,51 @@ final class NumberTest extends TestCase
             $this->assertGreaterThanOrEqual(1.0E-20, $value);
             $this->assertLessThanOrEqual(1.0E-19, $value);
         }
+    }
+
+    /**
+     * FINDING (low) — the internal round(..., 9) is a TOLERANCE, and a tolerance cuts both ways.
+     * It rescues 0.29 * 100 = 28.999999999999996 onto the grid point 29 the caller meant, but it
+     * also snapped a bound sitting just INSIDE an integer to the far side of it, so the draw came
+     * back outside [$min, $max] — breaking the inclusive-range guarantee the docblock leads with.
+     *
+     * $min = 2.0000000001 is within 1e-9 of 2.0, so ceil(round($min * 1, 9)) took the low endpoint
+     * to 2 and the method returned 2.0 — strictly BELOW $min. No 0-decimal value exists anywhere in
+     * this interval, so refusing is the only correct answer.
+     */
+    public function testRandomDecimalNeverDrawsBelowAMinTheToleranceWouldSnapDown(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('no value with 0 decimal place(s) exists');
+        Number::randomDecimal(2.0000000001, 2.0000000001, 0);
+    }
+
+    /**
+     * The same tolerance defect at the other end: 2.9999999999 rounds to 3.0 at 9 decimals, so
+     * floor() took the high endpoint to 3 and 3.0 — strictly ABOVE $max — was a reachable draw.
+     * 3.0 is one of 4 grid points here, so 300 draws miss it with probability (3/4)^300 ~ 1e-38.
+     */
+    public function testRandomDecimalNeverDrawsAboveAMaxTheToleranceWouldSnapUp(): void
+    {
+        for ($i = 0; $i < self::DRAWS; $i++) {
+            $value = Number::randomDecimal(0.0, 2.9999999999, 0);
+            $this->assertLessThanOrEqual(2.9999999999, $value, 'draw escaped above $max');
+            $this->assertGreaterThanOrEqual(0.0, $value, 'draw escaped below $min');
+        }
+    }
+
+    /**
+     * The other half of that fix: pulling the endpoints in must NOT undo the tolerance it sits on
+     * top of. These bounds do not scale to exact integers (0.29 * 100 = 28.999999999999996,
+     * 2.3 * 10 = 22.999999999999996), and each must remain a reachable, in-range draw rather than
+     * become a spurious "no value exists".
+     */
+    public function testRandomDecimalStillHonoursBoundsThatDoNotScaleToExactIntegers(): void
+    {
+        $this->assertSame(0.29, Number::randomDecimal(0.29, 0.29));
+        $this->assertSame(2.3, Number::randomDecimal(2.3, 2.3, 1));
+        $this->assertSame(-10.2, Number::randomDecimal(-10.2, -10.2));
+        $this->assertSame(0.07, Number::randomDecimal(0.07, 0.07));
     }
 
     // ------------------------------- randomDecimal(): SECURITY — the draw must come from the CSPRNG

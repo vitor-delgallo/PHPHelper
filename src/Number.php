@@ -27,13 +27,25 @@ class Number
      * @param float $value Value to be rounded. Non-finite input passes through: NAN returns NAN,
      *                     INF returns INF.
      * @param int $precision Number of decimal places. Defaults to 2. May be negative, which rounds
-     *                       to tens/hundreds/... ($precision = -2 turns 8250.0 into 8200.0).
+     *                       to tens/hundreds/... — and, being $method-dependent like every other
+     *                       precision, $precision = -2 turns 8250.0 into 8300.0 under the default
+     *                       'round' (82.5 is a tie, and ties go up), but into 8200.0 under 'floor'
+     *                       and 8300.0 under 'ceil'.
+     *                       MUST satisfy -323 <= $precision <= 308, the exact range over which
+     *                       10**$precision is a finite, non-zero double. Outside it the arithmetic
+     *                       cannot be carried out at all (see the throws clause), so it is rejected
+     *                       rather than answered wrongly.
      * @param string $method Rounding mode. Exactly one of 'round', 'floor' or 'ceil',
      *                       case-sensitive. Anything else — including the wrong-case 'Floor' and
      *                       the plausible-but-unsupported 'trunc' — is REJECTED.
      * @return float Rounded number.
      *
-     * @throws InvalidArgumentException If $method is not exactly 'round', 'floor' or 'ceil'.
+     * @throws InvalidArgumentException If $method is not exactly 'round', 'floor' or 'ceil'; or if
+     *                       $precision is outside [-323, 308]. Previously $precision >= 309 made
+     *                       10**$precision INF and returned NAN for finite input, and
+     *                       $precision <= -324 made it 0.0 and raised DivisionByZeroError — an
+     *                       \Error, which the `catch (\Exception)` a caller would reasonably write
+     *                       around this method cannot catch.
      *
      * @ref https://stackoverflow.com/questions/12277945/php-how-do-i-round-down-to-two-decimal-places
      */
@@ -51,6 +63,18 @@ class Number
 
         $factor = pow(10, $precision);
 
+        // Validate the FACTOR rather than hardcode a bound: this is exactly the set of $precision
+        // values the arithmetic below can carry out, with no magic number to drift out of date.
+        // 10**309 is INF, so INF/INF handed back NAN for perfectly finite input; 10**-324 is 0.0,
+        // so the final division raised DivisionByZeroError — an \Error, undocumented and outside
+        // the \Exception hierarchy a caller would think to catch. Both are caller bugs; say so.
+        if (!is_finite((float)$factor) || (float)$factor === 0.0) {
+            throw new InvalidArgumentException(
+                'roundDecimal(): $precision must be between -323 and 308 (10**$precision must be a '
+                . 'finite, non-zero double); got ' . $precision . '.'
+            );
+        }
+
         // round(..., 9) neutralises the scaling error before floor/ceil see it; it is a no-op for
         // the 'round' branch, which already corrects internally.
         return $method(round($value * $factor, 9)) / $factor;
@@ -60,7 +84,10 @@ class Number
      * Generates a random decimal number between two values, inclusive of both bounds.
      *
      * The draw happens on a fixed grid of 10^$decimals steps. Every returned value satisfies
-     * $min <= $value <= $max.
+     * $min <= $value <= $max. That is enforced, not merely intended: both grid endpoints are
+     * checked against the original bounds with the same division the return performs, so a bound
+     * that the internal rounding tolerance would otherwise snap past yields either an in-range
+     * value or an InvalidArgumentException — never an out-of-range draw.
      *
      * The value is derived from a single integer drawn uniformly over the WHOLE scaled range
      * [$min * 10^$decimals, $max * 10^$decimals] and then divided back down, so every grid point
@@ -131,7 +158,28 @@ class Number
         $low = (int)$lowScaled;
         $high = (int)$highScaled;
 
-        if ($low > $high) {
+        // The round(..., 9) above is a TOLERANCE, and a tolerance cuts both ways: it rescues
+        // 0.29 * 100 = 28.999999999999996 into the grid point 29 the caller meant, but it also
+        // snaps a bound that sits just INSIDE an integer to the far side of it, handing back a
+        // value outside [$min, $max] and breaking the inclusive-range contract this method leads
+        // with. randomDecimal(2.0000000001, 2.0000000001, 0) returned 2.0 — below $min — and
+        // randomDecimal(0.0, 2.9999999999, 0) could return 3.0 — above $max.
+        //
+        // So verify the endpoints against the ORIGINAL bounds, using the very same division the
+        // return statement performs, and pull each one in by a single grid step if the snap
+        // overshot. One step always suffices: round($x, 9) moves $x by at most 5e-10 scaled units,
+        // so the snapped endpoint is off the true one by at most 1. Correcting by exactly one step
+        // (rather than looping) keeps this bounded — $high - $low can be ~1e18, and a loop over
+        // that is a hang, not a fix. Anything still outside afterwards means the interval holds no
+        // grid point at all, which is the same "no value exists" condition reported below.
+        if ($low <= $high && $low / $scale < $min) {
+            $low++;
+        }
+        if ($low <= $high && $high / $scale > $max) {
+            $high--;
+        }
+
+        if ($low > $high || $low / $scale < $min || $high / $scale > $max) {
             throw new InvalidArgumentException('randomDecimal(): no value with ' . $decimals . ' decimal place(s) exists within [' . $min . ', ' . $max . '].');
         }
 

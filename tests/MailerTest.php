@@ -76,12 +76,49 @@ SINK;
     {
         $this->killSink();
 
-        if ($this->tmpDir !== '' && is_dir($this->tmpDir)) {
-            foreach ((array) glob($this->tmpDir . DIRECTORY_SEPARATOR . '*') as $file) {
-                @unlink($file);
-            }
-            @rmdir($this->tmpDir);
+        if ($this->tmpDir !== '') {
+            self::removeTree($this->tmpDir);
         }
+    }
+
+    /**
+     * Removes a directory and everything under it.
+     *
+     * A symlink is UNLINKED, never followed and never descended into: the allow-list tests plant
+     * links that point OUT of the fixture on purpose, and a cleanup that recursed through one would
+     * delete the very thing the test aimed it at.
+     */
+    private static function removeTree(string $dir): void
+    {
+        if (is_link($dir)) {
+            @unlink($dir);
+            return;
+        }
+        if (!is_dir($dir)) {
+            @unlink($dir);
+            return;
+        }
+
+        foreach ((array) scandir($dir) as $entry) {
+            if ($entry === '.' || $entry === '..') {
+                continue;
+            }
+            $path = $dir . DIRECTORY_SEPARATOR . $entry;
+            if (is_link($path)) {
+                // A Windows link to a directory is a junction/dir-symlink: rmdir, not unlink.
+                if (!@unlink($path)) {
+                    @rmdir($path);
+                }
+                continue;
+            }
+            if (is_dir($path)) {
+                self::removeTree($path);
+                continue;
+            }
+            @unlink($path);
+        }
+
+        @rmdir($dir);
     }
 
     // ---------------------------------------------------------------- sink plumbing
@@ -631,22 +668,7 @@ SINK;
             [['email' => 'to@example.com', 'name' => 'To']],
             'Subject',
             '<p>unauthenticated relay</p>',
-            null,
-            null,
-            [],
-            [],
-            0,
-            0,
-            [],
-            [],
-            [],
-            [],
-            null,
-            false,
-            false,
-            null,
-            'UTF-8',
-            false // $useAuth
+            useAuth: false
         ));
 
         $capture = $this->sinkCapture();
@@ -696,20 +718,8 @@ SINK;
             [['email' => 'to@example.com', 'name' => 'To']],
             'Subject',
             '<p>before</p><img src="' . $png . '"><p>after</p>',
-            null,
-            null,
-            [],
-            [],
-            0,
-            0,
-            [],
-            [],
-            [],
-            [],
-            null,
-            false,
-            true,           // $useEmbeddedImages
-            $this->tmpDir   // $embeddedImagesBaseDir — the png lives here
+            useEmbeddedImages: true,
+            embeddedImagesBaseDir: $this->tmpDir // the png lives here
         );
 
         self::assertTrue($ok);
@@ -739,20 +749,8 @@ SINK;
             [['email' => 'to@example.com', 'name' => 'To']],
             'Subject',
             '<img src="' . $first . '">MIDDLE-TEXT<img src="' . $second . '">',
-            null,
-            null,
-            [],
-            [],
-            0,
-            0,
-            [],
-            [],
-            [],
-            [],
-            null,
-            false,
-            true,
-            $this->tmpDir
+            useEmbeddedImages: true,
+            embeddedImagesBaseDir: $this->tmpDir
         );
 
         self::assertTrue($ok);
@@ -763,6 +761,136 @@ SINK;
         self::assertStringContainsString('MIDDLE-TEXT', $eml);
         self::assertStringContainsString('Content-ID: <attach-0>', $eml);
         self::assertStringContainsString('Content-ID: <attach-1>', $eml);
+    }
+
+    /**
+     * REGRESSION. The lazy `[\w\W]*?` that replaced the greedy quantifier expands ONE CHARACTER AT A
+     * TIME, and every one of those steps counts against pcre.backtrack_limit (1,000,000 by default).
+     * A single <img> carrying an ordinary inline base64 logo is enough to exhaust it, at which point
+     * preg_match_all() and preg_split() both return FALSE — quietly. The FALSE was never checked, so
+     * it reached `foreach (false)` AFTER Body had already been reset to "", and the message went out
+     * EMPTY while sendMail() still reported success.
+     *
+     * The regex must therefore be linear, and a failed scan must never be able to blank the body.
+     */
+    public function testSendMailDeliversTheBodyWhenAnInlineImageExceedsThePcreBacktrackLimit(): void
+    {
+        $port = $this->startSink();
+
+        // ~600KB of base64 in one src: an unremarkable inline logo, and 600K lazy steps.
+        $dataUri = 'data:image/png;base64,' . str_repeat('A', 600000);
+        $body    = '<p>Your invoice</p><img src="' . $dataUri . '"><p>Total: 42</p>';
+
+        $ok = Mailer::sendMail(
+            $this->configs($port),
+            [['email' => 'to@example.com', 'name' => 'To']],
+            'Subject',
+            $body,
+            useEmbeddedImages: true,
+            embeddedImagesBaseDir: $this->tmpDir
+        );
+
+        self::assertTrue($ok);
+
+        $eml = $this->sinkCapture()['eml'];
+        self::assertNotSame('', trim($eml), 'the message was delivered EMPTY');
+        // The body the caller wrote must actually be on the wire.
+        self::assertStringContainsString('Your invoice', $eml);
+        self::assertStringContainsString('Total: 42', $eml);
+    }
+
+    /**
+     * The same defect, in the shape that does not need 600KB: proof the scan is linear rather than
+     * merely under the limit for this input.
+     */
+    public function testSendMailScansABodyOfManyImagesWithoutExhaustingPcre(): void
+    {
+        $port = $this->startSink();
+        $png  = $this->makePng();
+
+        $body = '<p>start</p>';
+        for ($i = 0; $i < 200; $i++) {
+            $body .= '<img src="' . $png . '">TEXT-' . $i;
+        }
+        $body .= '<p>end</p>';
+
+        $ok = Mailer::sendMail(
+            $this->configs($port),
+            [['email' => 'to@example.com', 'name' => 'To']],
+            'Subject',
+            $body,
+            useEmbeddedImages: true,
+            embeddedImagesBaseDir: $this->tmpDir
+        );
+
+        self::assertTrue($ok);
+
+        $eml = $this->sinkCapture()['eml'];
+        self::assertStringContainsString('start', $eml);
+        self::assertStringContainsString('end', $eml);
+        // Every separator between two images survives the split/rejoin.
+        self::assertStringContainsString('TEXT-0', $eml);
+        self::assertStringContainsString('TEXT-199', $eml);
+    }
+
+    /**
+     * A '>' inside a QUOTED attribute does not end the tag — HTML says so, and the old regex did
+     * not. It matched up to that first '>', embedded a truncated tag, and spilled the rest of the
+     * attribute ("height\">TAIL") into the delivered body as visible text.
+     */
+    public function testSendMailDoesNotEndAnImgTagAtAGreaterThanInsideAQuotedAttribute(): void
+    {
+        $port = $this->startSink();
+        $png  = $this->makePng();
+
+        $tag  = '<img src="' . $png . '" alt="width > height">';
+        $body = '<p>x</p>' . $tag . 'TAIL';
+
+        $ok = Mailer::sendMail(
+            $this->configs($port),
+            [['email' => 'to@example.com', 'name' => 'To']],
+            'Subject',
+            $body,
+            useEmbeddedImages: true,
+            embeddedImagesBaseDir: $this->tmpDir
+        );
+
+        self::assertTrue($ok);
+
+        $eml = $this->sinkCapture()['eml'];
+        // The whole tag was recognised, so it is replaced whole...
+        self::assertStringContainsString('<img src="cid:attach-0">', $eml);
+        // ...and no remnant of the attribute leaked into the body as text.
+        self::assertStringNotContainsString('height', $eml);
+        self::assertStringContainsString('TAIL', $eml);
+    }
+
+    /**
+     * The mojibake of getImageSrc(), end to end: an image whose FILENAME is not ASCII. The src was
+     * parsed as ISO-8859-1, so the path handed to the allow-list named a file that does not exist,
+     * and a perfectly ordinary "ação.png" logo silently never embedded.
+     */
+    public function testSendMailEmbedsAnImageWhoseFilenameIsNotAscii(): void
+    {
+        $name = 'ação-日本.png';
+        $png  = $this->makePng($name);
+        // The filesystem must really hold that name, or this proves nothing about the parser.
+        if (!is_file($png) || $png !== $this->tmpDir . DIRECTORY_SEPARATOR . $name) {
+            self::markTestSkipped('this filesystem did not store the non-ASCII filename verbatim');
+        }
+
+        $port = $this->startSink();
+        $ok   = Mailer::sendMail(
+            $this->configs($port),
+            [['email' => 'to@example.com', 'name' => 'To']],
+            'Subject',
+            '<p>x</p><img src="' . $name . '">', // relative: resolved against the base dir
+            useEmbeddedImages: true,
+            embeddedImagesBaseDir: $this->tmpDir
+        );
+
+        self::assertTrue($ok);
+        self::assertStringContainsString('<img src="cid:attach-0">', $this->sinkCapture()['eml']);
     }
 
     /**
@@ -793,20 +921,8 @@ SINK;
             [['email' => 'to@example.com', 'name' => 'To']],
             'Subject',
             '<p>x</p>' . $tag,
-            null,
-            null,
-            [],
-            [],
-            0,
-            0,
-            [],
-            [],
-            [],
-            [],
-            null,
-            false,
-            true,
-            $this->tmpDir
+            useEmbeddedImages: true,
+            embeddedImagesBaseDir: $this->tmpDir
         );
 
         self::assertTrue($ok, 'an unembeddable image must not fail the send');
@@ -826,20 +942,8 @@ SINK;
             [['email' => 'to@example.com', 'name' => 'To']],
             'Subject',
             '<p>no images here</p>',
-            null,
-            null,
-            [],
-            [],
-            0,
-            0,
-            [],
-            [],
-            [],
-            [],
-            null,
-            false,
-            true,
-            $this->tmpDir
+            useEmbeddedImages: true,
+            embeddedImagesBaseDir: $this->tmpDir
         );
 
         self::assertTrue($ok);
@@ -935,20 +1039,8 @@ SINK;
             [['email' => 'to@example.com', 'name' => 'To']],
             'Subject',
             '<p>x</p>' . $tag,
-            null,
-            null,
-            [],
-            [],
-            0,
-            0,
-            [],
-            [],
-            [],
-            [],
-            null,
-            false,
-            true,
-            $fixture['base']
+            useEmbeddedImages: true,
+            embeddedImagesBaseDir: $fixture['base']
         );
 
         self::assertTrue($ok, 'a rejected image must not fail the send');
@@ -974,20 +1066,8 @@ SINK;
             [['email' => 'to@example.com', 'name' => 'To']],
             'Subject',
             '<p>x</p>' . $tag,
-            null,
-            null,
-            [],
-            [],
-            0,
-            0,
-            [],
-            [],
-            [],
-            [],
-            null,
-            false,
-            true,
-            $fixture['base']
+            useEmbeddedImages: true,
+            embeddedImagesBaseDir: $fixture['base']
         );
 
         self::assertTrue($ok);
@@ -998,6 +1078,85 @@ SINK;
         self::assertStringNotContainsString('cid:attach-', $eml);
 
         $this->tearDownAllowListFixture();
+    }
+
+    /**
+     * THE SIBLING-PREFIX ESCAPE — the case the containment guard exists for, and the one nothing
+     * tested. Every other allow-list test here passes with the guard's trailing separator deleted;
+     * this one does not.
+     *
+     * Containment is a string-prefix test, and "/srv/imgs-evil/x.png" starts with "/srv/imgs".
+     * Comparing against the base plus DIRECTORY_SEPARATOR is the entire defence: it demands the next
+     * character be a separator, so a sibling directory that merely begins with the base dir's name
+     * is outside, exactly as it looks.
+     */
+    public function testSendMailRefusesToEmbedFromASiblingDirSharingTheBaseDirNamePrefix(): void
+    {
+        $port = $this->startSink();
+
+        $base = $this->tmpDir . DIRECTORY_SEPARATOR . 'imgs';
+        $evil = $this->tmpDir . DIRECTORY_SEPARATOR . 'imgs-evil'; // NOT under $base — a sibling
+        mkdir($base);
+        mkdir($evil);
+        file_put_contents($evil . DIRECTORY_SEPARATOR . 'x.png', self::OFF_LIMITS_MARKER);
+
+        // The prefix really does collide, or this test proves nothing.
+        self::assertStringStartsWith($base, $evil);
+
+        $tag = '<img src="' . $evil . DIRECTORY_SEPARATOR . 'x.png">';
+        $ok  = Mailer::sendMail(
+            $this->configs($port),
+            [['email' => 'to@example.com', 'name' => 'To']],
+            'Subject',
+            '<p>x</p>' . $tag,
+            useEmbeddedImages: true,
+            embeddedImagesBaseDir: $base
+        );
+
+        self::assertTrue($ok, 'a rejected image must not fail the send');
+
+        $eml = $this->sinkCapture()['eml'];
+        $this->assertNotExfiltrated($eml);
+        self::assertStringNotContainsString('cid:attach-', $eml);
+    }
+
+    /**
+     * A symlink INSIDE the allow-list pointing OUT of it. The docblock promises "neither ../ nor a
+     * symlink can escape", and containment is checked after realpath() has followed the link — so
+     * what is compared is where the file truly is, not the innocent name inside the base dir.
+     */
+    public function testSendMailRefusesToEmbedThroughASymlinkLeavingTheBaseDir(): void
+    {
+        $base      = $this->tmpDir . DIRECTORY_SEPARATOR . 'imgs';
+        $offLimits = $this->tmpDir . DIRECTORY_SEPARATOR . 'off-limits.txt';
+        mkdir($base);
+        file_put_contents($offLimits, self::OFF_LIMITS_MARKER);
+
+        $link = $base . DIRECTORY_SEPARATOR . 'innocent.png';
+        if (!@symlink($offLimits, $link)) {
+            // Windows needs SeCreateSymbolicLinkPrivilege (admin or Developer Mode).
+            self::markTestSkipped('this platform/user cannot create symlinks');
+        }
+
+        // The link really resolves out of the base dir, or this test proves nothing.
+        self::assertSame(realpath($offLimits), realpath($link));
+
+        $port = $this->startSink();
+        $tag  = '<img src="' . $link . '">';
+        $ok   = Mailer::sendMail(
+            $this->configs($port),
+            [['email' => 'to@example.com', 'name' => 'To']],
+            'Subject',
+            '<p>x</p>' . $tag,
+            useEmbeddedImages: true,
+            embeddedImagesBaseDir: $base
+        );
+
+        self::assertTrue($ok);
+
+        $eml = $this->sinkCapture()['eml'];
+        $this->assertNotExfiltrated($eml);
+        self::assertStringNotContainsString('cid:attach-', $eml);
     }
 
     /** A file genuinely inside the base dir is still embedded — the allow-list allows, not just denies. */
@@ -1011,20 +1170,8 @@ SINK;
             [['email' => 'to@example.com', 'name' => 'To']],
             'Subject',
             '<img src="' . $fixture['png'] . '">',
-            null,
-            null,
-            [],
-            [],
-            0,
-            0,
-            [],
-            [],
-            [],
-            [],
-            null,
-            false,
-            true,
-            $fixture['base']
+            useEmbeddedImages: true,
+            embeddedImagesBaseDir: $fixture['base']
         );
 
         self::assertTrue($ok);
@@ -1047,20 +1194,8 @@ SINK;
             [['email' => 'to@example.com', 'name' => 'To']],
             'Subject',
             '<img src="logo.png">',
-            null,
-            null,
-            [],
-            [],
-            0,
-            0,
-            [],
-            [],
-            [],
-            [],
-            null,
-            false,
-            true,
-            $fixture['base']
+            useEmbeddedImages: true,
+            embeddedImagesBaseDir: $fixture['base']
         );
 
         self::assertTrue($ok);
@@ -1081,20 +1216,8 @@ SINK;
             [['email' => 'to@example.com', 'name' => 'To']],
             'Subject',
             '<p>x</p>' . $tag,
-            null,
-            null,
-            [],
-            [],
-            0,
-            0,
-            [],
-            [],
-            [],
-            [],
-            null,
-            false,
-            true,
-            $fixture['base']
+            useEmbeddedImages: true,
+            embeddedImagesBaseDir: $fixture['base']
         );
 
         self::assertTrue($ok);
@@ -1131,20 +1254,8 @@ SINK;
             [['email' => 'to@example.com', 'name' => 'To']],
             'Subject',
             '<img src="logo.png">',
-            null,
-            null,
-            [],
-            [],
-            0,
-            0,
-            [],
-            [],
-            [],
-            [],
-            null,
-            false,
-            true,
-            $baseDir
+            useEmbeddedImages: true,
+            embeddedImagesBaseDir: $baseDir
         ));
     }
 
@@ -1158,20 +1269,8 @@ SINK;
             [['email' => 'to@example.com', 'name' => 'To']],
             'Subject',
             '<img src="dot.png">',
-            null,
-            null,
-            [],
-            [],
-            0,
-            0,
-            [],
-            [],
-            [],
-            [],
-            null,
-            false,
-            true,
-            $png
+            useEmbeddedImages: true,
+            embeddedImagesBaseDir: $png
         ));
     }
 
@@ -1185,20 +1284,8 @@ SINK;
             [['email' => 'to@example.com', 'name' => 'To']],
             'Subject',
             '<p>Body</p>',
-            null,
-            null,
-            [],
-            [],
-            0,
-            0,
-            [],
-            [],
-            [],
-            [],
-            null,
-            false,
-            false,                      // $useEmbeddedImages OFF
-            '/no/such/directory/at/all' // ...so this is never looked at
+            useEmbeddedImages: false,                          // OFF...
+            embeddedImagesBaseDir: '/no/such/directory/at/all' // ...never looked at
         ));
 
         self::assertStringContainsString('<p>Body</p>', $this->sinkCapture()['eml']);
@@ -1348,7 +1435,17 @@ SINK;
         self::assertStringContainsString('Disposition-Notification-To: <from@example.com>', $eml);
     }
 
-    public function testSendMailAppliesTheRequestedCharset(): void
+    /**
+     * The charset asked for is the charset sent — proven with a NON-default value, because asserting
+     * the default 'UTF-8' arrives passes just as happily when $charset is dropped on the floor.
+     *
+     * It is passed POSITIONALLY on purpose. $charset is the 18th parameter, and this pins it there:
+     * when $embeddedImagesBaseDir was inserted mid-signature next to the $useEmbeddedImages it reads
+     * nicely beside, it pushed $charset/$useAuth/$isSMTP/$debugMode one slot right, and every
+     * positional caller silently handed its charset to a parameter that ignored it. Named arguments
+     * elsewhere in this file cannot catch that; only a positional call can.
+     */
+    public function testSendMailAppliesTheRequestedCharsetGivenPositionally(): void
     {
         $port = $this->startSink();
 
@@ -1370,11 +1467,31 @@ SINK;
             null,
             false,
             false,
-            null,
-            'UTF-8'
+            'ISO-8859-1' // the 18th argument, and it must land on $charset
         ));
 
-        self::assertStringContainsString('charset=utf-8', strtolower($this->sinkCapture()['eml']));
+        self::assertStringContainsString('charset=iso-8859-1', strtolower($this->sinkCapture()['eml']));
+    }
+
+    /**
+     * The parameter ORDER is part of the contract for every positional caller, so it is pinned
+     * whole. $embeddedImagesBaseDir belongs at the END: a new parameter is APPENDED, never slotted
+     * in beside the one it relates to, however much better that reads.
+     */
+    public function testSendMailParameterOrderIsTheDocumentedOne(): void
+    {
+        $names = array_map(
+            static fn (\ReflectionParameter $p): string => $p->getName(),
+            (new \ReflectionMethod(Mailer::class, 'sendMail'))->getParameters()
+        );
+
+        self::assertSame([
+            'configs', 'sendTo', 'subject', 'body',
+            'useConfig', 'lang', 'files', 'stringFiles', 'priority', 'wrap',
+            'cc', 'cco', 'reply', 'headers', 'template', 'confirm', 'useEmbeddedImages',
+            'charset', 'useAuth', 'isSMTP', 'debugMode',
+            'embeddedImagesBaseDir',
+        ], $names);
     }
 
     // ---------------------------------------------------------------- validateMail
@@ -1488,5 +1605,29 @@ SINK;
         // Documented explicitly: the src comes back raw, whatever it is.
         self::assertSame('javascript:alert(1)', Mailer::getImageSrc('<img src="javascript:alert(1)">'));
         self::assertSame('../../etc/passwd', Mailer::getImageSrc('<img src="../../etc/passwd">'));
+    }
+
+    /**
+     * DOMDocument::loadHTML() assumes ISO-8859-1 when the markup declares no encoding, so every
+     * non-ASCII src came back mojibake'd — "ação.png" as "aÃ§Ã£o.png" — and could never match the
+     * file it names. UTF-8 is this library's charset everywhere else; it must be this parser's too.
+     *
+     * @return array<string, array{0: string}>
+     */
+    public static function nonAsciiSrcProvider(): array
+    {
+        return [
+            'latin accents'   => ['logotipo-ação.png'],
+            'cjk'             => ['日本語.png'],
+            'diacritics+path' => ['café/naïve.png'],
+            'cyrillic'        => ['логотип.png'],
+            'emoji'           => ['logo-🚀.png'],
+        ];
+    }
+
+    #[DataProvider('nonAsciiSrcProvider')]
+    public function testGetImageSrcReturnsANonAsciiSrcUnmangled(string $src): void
+    {
+        self::assertSame($src, Mailer::getImageSrc('<img src="' . $src . '">'));
     }
 }

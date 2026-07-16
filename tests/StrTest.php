@@ -377,6 +377,66 @@ final class StrTest extends TestCase {
         self::assertNotSame(Str::generateGuid(), Str::generateGuid());
     }
 
+    /**
+     * FINDING (low) — the no-openssl fallback opened with
+     * `mt_srand((int)(microtime(true) * 10000))`, RESEEDING the process-global Mt19937 from the
+     * clock. Two harms, both undocumented, on a reachable path: the seed carries only ~14 bits of
+     * real entropy, so every later rand()/shuffle()/str_shuffle() ANYWHERE in the process became
+     * reconstructible by anyone who knew roughly when the GUID was made; and a library has no
+     * business reaching into its host's global RNG at all. It bought nothing — PHP already seeds
+     * Mt19937 from a secure source on first use.
+     *
+     * Reached by reflection: this host has openssl, so generateGuid() never takes this branch and
+     * no black-box test can hold the fix down.
+     *
+     * The assertion is that the mt19937 stream after the call is a function of the CALLER'S seed
+     * and nothing else. usleep() guarantees >= 1ms, i.e. >= 10 whole units of the old seed
+     * expression, so with the reseed the two halves seeded differently and diverged — this fails
+     * deterministically, not by luck. Without it, the fallback draws one rand() (deterministic
+     * given the seed) and the two streams must agree exactly.
+     */
+    public function testGenerateGuidFallbackDoesNotReseedTheGlobalMt19937(): void {
+        $fallback = new \ReflectionMethod(Str::class, 'generateGuidFallback');
+
+        mt_srand(777);
+        $fallback->invoke(null, true);
+        $first = mt_rand();
+
+        usleep(1000);
+
+        mt_srand(777);
+        $fallback->invoke(null, true);
+        $second = mt_rand();
+
+        self::assertSame(
+            $first,
+            $second,
+            'generateGuid() fallback reseeded the process-global Mt19937 from the clock'
+        );
+    }
+
+    /** The fallback must still do its actual job after losing the reseed. */
+    public function testGenerateGuidFallbackStillReturnsAWellFormedGuid(): void {
+        $fallback = new \ReflectionMethod(Str::class, 'generateGuidFallback');
+
+        $bare = $fallback->invoke(null, true);
+        $braced = $fallback->invoke(null, false);
+
+        self::assertMatchesRegularExpression(
+            '/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/',
+            $bare
+        );
+        self::assertSame(36, strlen($bare));
+
+        self::assertMatchesRegularExpression(
+            '/^\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}$/',
+            $braced
+        );
+        self::assertSame(38, strlen($braced));
+
+        self::assertNotSame($fallback->invoke(null, true), $fallback->invoke(null, true));
+    }
+
     // ----------------------------------------------------------------------- removeExcessSpaces
 
     public function testRemoveExcessSpacesCollapsesRunsOfSpacesIntoASingleSpace(): void {

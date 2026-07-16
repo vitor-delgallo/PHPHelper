@@ -162,6 +162,38 @@ final class URLTest extends TestCase {
         ];
     }
 
+    /**
+     * FINDING (medium) — parse_url() reports a scheme for 'http:example.com' (RFC 3986 permits a
+     * scheme with no '//'), but the strip pattern '#^(https?:)?//#i' DEMANDED the slashes. Nothing
+     * matched, so the scheme was emitted into the result AND retained in the remainder: the method
+     * returned the corrupt 'http://http:example.com' while its docblock promised a start-anchored
+     * scheme prefix. This is what that promise means.
+     */
+    public function testGetFormattedUrlStripsASchemeThatCarriesNoDoubleSlash(): void {
+        $this->assertSame('http://example.com', URL::getFormattedUrl('http:example.com'));
+        $this->assertSame('https://example.com', URL::getFormattedUrl('https:example.com'));
+        $this->assertSame('https://example.com/a/b', URL::getFormattedUrl('https:example.com/a/b', false));
+        // $scheme is lowercased before it drives the strip, while $url keeps its original casing.
+        $this->assertSame('http://example.com', URL::getFormattedUrl('HTTP:example.com'));
+        $this->assertSame('https://example.com', URL::getFormattedUrl('http:example.com', true, 'https'));
+    }
+
+    /**
+     * The other half of that fix. The strip is now driven by the scheme parse_url() ACTUALLY
+     * found, rather than by a second, independent pattern that could disagree with it — a
+     * disagreement between the two is precisely what produced the bug above. So a host that merely
+     * STARTS with 'http', and a scheme sitting mid-string, must both survive untouched.
+     */
+    public function testGetFormattedUrlDoesNotStripASchemeLookalike(): void {
+        $this->assertSame('httpsfoo.com', URL::getFormattedUrl('httpsfoo.com'));
+        $this->assertSame('httpfoo.com', URL::getFormattedUrl('httpfoo.com'));
+        $this->assertSame('http.example.com', URL::getFormattedUrl('http.example.com'));
+        $this->assertSame(
+            'https://site/r?to=http:evil.com',
+            URL::getFormattedUrl('https://site/r?to=http:evil.com', false)
+        );
+    }
+
     public function testGetFormattedUrlRejectsUnparseableUrl(): void {
         $this->expectException(\InvalidArgumentException::class);
         $this->expectExceptionMessage('malformed');

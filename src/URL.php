@@ -177,7 +177,23 @@ class URL {
 
         // Anchored: strip the scheme (or scheme-relative '//') prefix and 'www.' only at the start,
         // never mid-string, so a nested URL in a query string is not silently rewritten.
-        $url = preg_replace('#^(https?:)?//#i', '', $url);
+        //
+        // The '//' after the scheme must be OPTIONAL. parse_url() reports a scheme for
+        // 'http:example.com' (no '//' — RFC 3986 permits it), but the old '#^(https?:)?//#i'
+        // required the slashes, so nothing matched: the scheme was emitted into $result AND left
+        // in $url, and 'http:example.com' came back as the corrupt 'http://http:example.com'.
+        //
+        // Strip the scheme parse_url() ACTUALLY found rather than re-detecting it with a second,
+        // independent pattern. The two cannot then disagree about what the scheme is — and a
+        // disagreement is precisely what produced the bug above. $scheme is already vetted against
+        // ALLOWED_SCHEMES, and preg_quote keeps it inert; /i because $scheme was lowercased while
+        // $url still carries the original casing ('HTTPS://Example.com').
+        if ($scheme !== '') {
+            $url = preg_replace('#^' . preg_quote($scheme, '#') . ':(?://)?#i', '', $url);
+        } else {
+            // No scheme: only the scheme-relative '//example.com' form is left to strip.
+            $url = preg_replace('#^//#', '', $url);
+        }
         $url = preg_replace('#^www\.#i', '', $url);
         $url = rtrim(trim($url), '/');
 

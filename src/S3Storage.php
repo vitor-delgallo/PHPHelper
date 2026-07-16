@@ -47,6 +47,42 @@ use Aws\Exception\AwsException;
 class S3Storage
 {
     /**
+     * Characters allowed inside a single endpoint host label (see validateEndpointHost()).
+     *
+     * Underscore is included deliberately: it is not legal DNS, but a Docker-hosted MinIO
+     * ("http://minio_1:9000") is the main reason setEndpoint() exists, and rejecting it would
+     * break the option's primary use case to enforce a rule nothing here depends on.
+     */
+    private const HOST_LABEL_CHARS = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_';
+
+    /**
+     * $options keys upload() owns — each is derived from an upload() argument and validated.
+     *
+     * - Bucket:      resolved and validated by requireBucket().
+     * - Key:         checked for the mandatory extension by hasExtension().
+     * - SourceFile:  checked by is_file()/is_readable(), and ContentType is detected FROM it.
+     * - Body:        unusable, not merely redundant — the SDK's sourceFile middleware
+     *                overwrites Body with SourceFile, which upload() always sends, so a
+     *                caller's Body is silently discarded.
+     * - IfNoneMatch: derived from $overwrite.
+     *
+     * @var string[]
+     */
+    private const UPLOAD_RESERVED_OPTIONS = ['Bucket', 'Key', 'SourceFile', 'Body', 'IfNoneMatch'];
+
+    /**
+     * $options keys copy() owns — each is derived from a copy() argument and validated.
+     *
+     * - Bucket/Key:        the validated destination.
+     * - CopySource:        built from the requireBucket()-validated $fromBucket and $fromKey.
+     * - MetadataDirective: derived from $preserveMetadata.
+     * - IfNoneMatch:       derived from $overwrite.
+     *
+     * @var string[]
+     */
+    private const COPY_RESERVED_OPTIONS = ['Bucket', 'Key', 'CopySource', 'MetadataDirective', 'IfNoneMatch'];
+
+    /**
      * Singleton instance of the S3 client.
      *
      * Initialised on demand in getClient(). Null when the service is
@@ -196,6 +232,16 @@ class S3Storage
      *   malformed endpoint such as "not a url" is accepted silently (it becomes the relative
      *   "not%20a%20url"), producing a client that signs requests for a nonsense host instead
      *   of failing. A rejected value leaves the previous endpoint untouched.
+     * - The HOST SHAPE is validated too, and for the same reason: parse_url() is not a
+     *   validator. It parses "http://minio internal:9000" and "http://h\r\nX-Injected: 1"
+     *   without complaint, and the RAW string — control characters and all — is what gets
+     *   stored and baked into the client. Rejecting that here turns a config error the caller
+     *   can still fix into a failure at the setter, instead of an unexplained failure on
+     *   every later call. Accepted: a DNS hostname, an IPv4 address, or a bracketed IPv6
+     *   literal ("http://[::1]:9000"). Underscores are allowed in a label — they are not
+     *   legal DNS, but "http://minio_1:9000" is exactly what a Docker-hosted MinIO answers
+     *   to, which is this option's main use case. Non-ASCII is rejected: the SDK does not
+     *   punycode an IDN host, so pass it already encoded ("xn--mnchen-3ya.de").
      * - A trailing slash is stripped for stable comparison; the path, if any, is preserved
      *   (some gateways expose S3 under a prefix).
      * - Discards any cached S3 client, so the new endpoint takes effect on the next
@@ -235,9 +281,82 @@ class S3Storage
             return false;
         }
 
+        // Spaces, control characters and DEL anywhere in the RAW value — which is what gets
+        // stored, not parse_url()'s cleaned-up view of it. Deliberately checked AFTER the
+        // scheme/host and query/fragment rules, so a plain "not a url" still reports the
+        // specific complaint it always has rather than this generic one.
+        // The offending value is escaped into the message: a raw CRLF here would be a log
+        // injection in whatever writes getLastError() out.
+        if (preg_match('/[\x00-\x20\x7F]/', $endpoint) === 1) {
+            $shown = addcslashes($endpoint, "\0..\37\177");
+            self::$lastError = "[AWS S3] setEndpoint(): The endpoint '{$shown}' must not contain spaces or control characters.";
+            return false;
+        }
+
+        $hostError = self::validateEndpointHost($parts['host']);
+        if ($hostError !== null) {
+            self::$lastError = "[AWS S3] setEndpoint(): {$hostError}";
+            return false;
+        }
+
         self::$endpoint = rtrim($endpoint, '/');
         self::$client = null;
         return true;
+    }
+
+    /**
+     * Applies the host-shape rules described in setEndpoint() to a parse_url() host.
+     *
+     * Accepts a DNS hostname, an IPv4 address, or a bracketed IPv6 literal. Implemented with
+     * explode()/strspn() rather than one hostname regex ON PURPOSE, and the reason is not
+     * style:
+     * - The obvious pattern for this shape is /^([\w-]+\.)*[\w-]+$/ — nested quantifiers over
+     *   overlapping classes, which backtracks catastrophically on a long non-matching host and
+     *   would trade a config bug for a PCRE denial of service.
+     * - '$' additionally matches BEFORE a trailing newline, so that same regex would accept
+     *   "minio.internal\n" — reintroducing exactly the control-character hole this method
+     *   exists to close.
+     * strspn() scans linearly, has no anchors and no backtracking, so neither trap applies.
+     *
+     * @param string $host Host component as returned by parse_url() (never '').
+     *
+     * @return string|null Null when the host is usable; the error detail otherwise.
+     */
+    private static function validateEndpointHost(string $host): ?string
+    {
+        // IPv6 literal: parse_url() keeps the brackets ("http://[::1]:9000" -> "[::1]").
+        if ($host[0] === '[') {
+            $inner = substr($host, -1) === ']' ? substr($host, 1, -1) : '';
+            if ($inner === '' || filter_var($inner, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) === false) {
+                return "The endpoint host '{$host}' is not a valid IPv6 literal (expected e.g. http://[::1]:9000).";
+            }
+
+            return null;
+        }
+
+        if (strlen($host) > 253) {
+            return "The endpoint host '{$host}' exceeds the 253-character DNS limit.";
+        }
+
+        // A single trailing dot is the legal FQDN root ("minio.internal.").
+        $probe = substr($host, -1) === '.' ? substr($host, 0, -1) : $host;
+        if ($probe === '') {
+            return "The endpoint host '{$host}' is not a valid hostname or IP address.";
+        }
+
+        foreach (explode('.', $probe) as $label) {
+            if (
+                $label === ''
+                || strlen($label) > 63
+                || $label[0] === '-'
+                || $label[strlen($label) - 1] === '-'
+                || strspn($label, self::HOST_LABEL_CHARS) !== strlen($label)
+            ) {
+                return "The endpoint host '{$host}' is not a valid hostname or IP address.";
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -555,6 +674,56 @@ class S3Storage
     }
 
     /**
+     * Rejects $options keys that the calling method derives from its own arguments.
+     *
+     * $options carries EXTRA S3 parameters (ACL, StorageClass, Metadata, Tagging …). It is
+     * merged OVER the method's own arguments, so any key the method already owns silently
+     * wins over the validated value. That was not hypothetical:
+     * - $options['Bucket'] overrode the name requireBucket() had just validated, so the guard
+     *   checked one bucket while the request went to another — including names like
+     *   'ATTACKER-BUCKET' that validateBucketName() rejects outright, and after createBucket()
+     *   had already ensured the *validated* bucket existed.
+     * - $options['CopySource'] re-opened the exact cross-bucket redirect requireBucket() was
+     *   written to close, pointing a copy at an arbitrary bucket and key.
+     * - $options['IfNoneMatch'] contradicted $overwrite, making upload() answer true with
+     *   "already exists and overwrite is disabled" to a caller that asked to overwrite.
+     *
+     * Rejecting, rather than "validate the merged result", is the deliberate choice: for
+     * CopySource, SourceFile and Key there is no equivalent validation to re-run, and the
+     * method's error messages would still name the argument instead of the value actually
+     * used. A colliding call is a caller bug and fails here — locally, before any AWS request
+     * and before createBucket() can have a side effect.
+     *
+     * Matching is case-insensitive: S3 parameter names are unique PascalCase, so a lowercase
+     * 'bucket' is never some other legitimate parameter — it is the same mistake, silently
+     * dropped by the SDK rather than applied. Non-string keys are ignored: array_merge()
+     * appends those instead of overriding anything.
+     *
+     * @param string   $method   Calling method name, for the getLastError() prefix convention.
+     * @param array    $options  Caller-supplied options.
+     * @param string[] $reserved Parameter names the method owns.
+     *
+     * @return bool True when $options is clean; false on a collision (getLastError() populated).
+     */
+    private static function requireNoReservedOptions(string $method, array $options, array $reserved): bool
+    {
+        foreach (array_keys($options) as $name) {
+            if (!is_string($name)) {
+                continue;
+            }
+
+            foreach ($reserved as $owned) {
+                if (strcasecmp($name, $owned) === 0) {
+                    self::$lastError = "[AWS S3] {$method}(): \$options may not contain '{$owned}': {$method}() derives it from its own arguments and validates it, so an \$options value would silently override a checked one. Use the {$method}() parameter instead.";
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    /**
      * Enables or disables debug mode for testing purposes.
      *
      * - Should not be enabled in production, as it may expose sensitive information.
@@ -836,6 +1005,13 @@ class S3Storage
      * - The file provided in $filePath must exist on the server; otherwise,
      *   the method returns false and populates getLastError() with an appropriate message.
      * - The Content‑Type is detected from the local file (fallback to "application/octet-stream").
+     *   Pass $options['ContentType'] to state it yourself; that override is honoured.
+     * - $options may NOT carry a parameter upload() owns — Bucket, Key, SourceFile, Body or
+     *   IfNoneMatch. Such a call is REJECTED (returns false, nothing is uploaded, no AWS
+     *   request is made). $options is merged over upload()'s own arguments, so these used to
+     *   win silently: an $options['Bucket'] sent the object to a bucket requireBucket() never
+     *   validated, while createBucket() had ensured the validated one. See
+     *   requireNoReservedOptions().
      *
      * Behaviour of the $overwrite parameter:
      * - If true (default), the object will be overwritten if it already exists in the bucket.
@@ -850,7 +1026,9 @@ class S3Storage
      * @param string $key       Object key in S3 (must have an extension).
      * @param string $filePath  Local file path to send (must exist).
      * @param bool   $overwrite If true, overwrites the existing object; if false, does not allow overwriting.
-     * @param array  $options   Additional putObject options (ACL, StorageClass, Metadata, Tagging etc.).
+     * @param array  $options   ADDITIONAL putObject options (ACL, StorageClass, Metadata, Tagging,
+     *                          ContentType, ChecksumAlgorithm …). Must not contain Bucket, Key,
+     *                          SourceFile, Body or IfNoneMatch (case-insensitive) — see above.
      * @param string $bucket    Destination bucket name (optional; uses the class default bucket if empty).
      *
      * @return string|bool string(ObjectURL) on success; true on no‑op or success without ObjectURL; false on error.
@@ -871,6 +1049,11 @@ class S3Storage
 
         $bucket = self::requireBucket('upload', $bucket);
         if ($bucket === false) {
+            return false;
+        }
+
+        // Before createBucket(), so a colliding call costs no AWS request and creates nothing.
+        if (!self::requireNoReservedOptions('upload', $options, self::UPLOAD_RESERVED_OPTIONS)) {
             return false;
         }
 
@@ -933,12 +1116,20 @@ class S3Storage
      * - Preserves metadata by default (MetadataDirective = COPY). If $preserveMetadata = false,
      *   uses REPLACE and you may pass new metadata via $options['Metadata'].
      * - In no‑op, returns true.
+     * - $options may NOT carry a parameter copy() owns — Bucket, Key, CopySource,
+     *   MetadataDirective or IfNoneMatch. Such a call is REJECTED (returns false, nothing is
+     *   copied, no AWS request is made). $options is merged over copy()'s own arguments, so
+     *   these used to win silently, and $options['CopySource'] in particular re-opened the very
+     *   cross-bucket redirect requireBucket() exists to close. See requireNoReservedOptions().
      *
      * @param string $fromKey          Source key (exact).
      * @param string $toKey            Destination key (exact).
      * @param bool   $overwrite        If false, does not overwrite the destination if it exists.
      * @param bool   $preserveMetadata If false, REPLACE metadata (you may use $options['Metadata']).
-     * @param array  $options          Additional copyObject options (ACL, StorageClass, Metadata, Tagging etc.).
+     * @param array  $options          ADDITIONAL copyObject options (ACL, StorageClass, Metadata,
+     *                                 Tagging, ContentType, ChecksumAlgorithm …). Must not contain
+     *                                 Bucket, Key, CopySource, MetadataDirective or IfNoneMatch
+     *                                 (case-insensitive) — see above.
      * @param string $fromBucket       Source bucket (optional; uses the default bucket if empty).
      * @param string $toBucket         Destination bucket (optional; uses the default bucket if empty).
      *
@@ -967,6 +1158,11 @@ class S3Storage
 
         $toBucket = self::requireBucket('copy', $toBucket);
         if ($toBucket === false) {
+            return false;
+        }
+
+        // Before createBucket(), so a colliding call costs no AWS request and creates nothing.
+        if (!self::requireNoReservedOptions('copy', $options, self::COPY_RESERVED_OPTIONS)) {
             return false;
         }
 
@@ -1129,11 +1325,16 @@ class S3Storage
      * With $overwrite = false, an existing destination makes copy() return false, so the
      * source is NOT deleted and nothing is lost.
      *
+     * $options is forwarded to copy() untouched, so copy()'s reserved-key rule applies here
+     * too: Bucket, Key, CopySource, MetadataDirective and IfNoneMatch are rejected. The
+     * rejection happens inside copy(), i.e. before anything is copied or deleted, and
+     * getLastError() names copy().
+     *
      * @param string $fromKey          Source key (exact; must have an extension).
      * @param string $toKey            Destination key (exact).
      * @param bool   $overwrite        If false, does not overwrite the destination.
      * @param bool   $preserveMetadata If false, REPLACE metadata (you may use $options['Metadata']).
-     * @param array  $options          Additional copyObject options (ACL, StorageClass, Metadata, Tagging etc.).
+     * @param array  $options          ADDITIONAL copyObject options; see copy() for the reserved keys.
      * @param string $fromBucket       Source bucket (optional; uses the default bucket if empty).
      * @param string $toBucket         Destination bucket (optional; uses the default bucket if empty).
      *

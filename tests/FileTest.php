@@ -251,6 +251,110 @@ final class FileTest extends TestCase {
     }
 
     /**
+     * An octal string of 22+ significant digits: every character is a legal octal digit, so
+     * Validator::isOctal() (a CHARACTER SET check) passes it, but the value is above PHP_INT_MAX
+     * (8^21 - 1) and octdec() silently returns a FLOAT for it.
+     */
+    public static function overlongOctalModeProvider(): array {
+        return [
+            '22 sevens (just over PHP_INT_MAX)' => [str_repeat('7', 22)],
+            '30 sevens' => [str_repeat('7', 30)],
+            'leading zero then 22 sevens' => ['0' . str_repeat('7', 22)],
+        ];
+    }
+
+    /**
+     * REGRESSION: octdec() returns int|float and overflows to FLOAT above PHP_INT_MAX. That float
+     * flowed straight out of getPermissionMode() into mkdir()/chmod(), which reject it with an
+     * uncaught TypeError ("must be of type int, float given") — thrown from inside createDir(),
+     * which documents a NEGATIVE RETURN CODE as its only error channel and no throw at all.
+     */
+    #[DataProvider('overlongOctalModeProvider')]
+    public function testGetPermissionModeNeverReturnsAFloatForAnOctalStringTooLargeForAnInt(string $mode): void {
+        $resolved = File::getPermissionMode($mode);
+
+        $this->assertIsInt($resolved, 'getPermissionMode() must never hand mkdir()/chmod() a float.');
+        $this->assertSame(
+            File::getDefaultMode(),
+            $resolved,
+            'A mode that cannot fit an int is malformed and must land on the documented fallback.'
+        );
+    }
+
+    #[DataProvider('overlongOctalModeProvider')]
+    public function testCreateDirSucceedsInsteadOfRaisingATypeErrorForAnOverlongOctalMode(string $mode): void {
+        $dir = $this->path('overlong_octal');
+
+        // Under the old code this line raised TypeError, which is not an \Exception and would not
+        // even be caught by a consumer's catch (\Exception) block.
+        $result = File::createDir($dir, $mode);
+
+        $this->assertSame(2, $result, 'createDir() must report through its documented return code.');
+        $this->assertDirectoryExists($dir);
+    }
+
+    #[DataProvider('overlongOctalModeProvider')]
+    public function testSetDefaultModeIgnoresAnOctalStringTooLargeForAnInt(string $mode): void {
+        File::setDefaultMode('700');
+        File::setDefaultMode($mode);
+
+        $this->assertSame(
+            octdec('700'),
+            File::getDefaultMode(),
+            'A mode that cannot fit an int must keep the previous default, like any other malformed mode.'
+        );
+        $this->assertIsInt(File::getDefaultMode());
+    }
+
+    /**
+     * writeFile() exists to REJECT a malformed mode rather than fall back to the default, because
+     * falling back widens permissions on exactly the call that asked to restrict them. Its guard
+     * used Validator::isOctal() alone, which an overlong mode passes — so bounding only
+     * getPermissionMode() would have converted a loud TypeError into a SILENT chmod to the 0755
+     * default. The guard and the chmod must agree on what a usable mode is.
+     */
+    #[DataProvider('overlongOctalModeProvider')]
+    public function testWriteFileRejectsAnOverlongOctalModeInsteadOfWideningToTheDefault(string $mode): void {
+        $file = $this->path('overlong.txt');
+
+        try {
+            File::writeFile($file, 'secret', false, $mode);
+            $this->fail('writeFile() must reject a mode it cannot honour.');
+        } catch (\InvalidArgumentException $e) {
+            $this->assertStringContainsString('Invalid permission mode', $e->getMessage());
+        }
+
+        // The rejection must happen BEFORE the content is written: a file left on disk carrying
+        // the default 0755 would be the silent widening this guard exists to prevent.
+        $this->assertFileDoesNotExist($file, 'A rejected mode must not write the file at all.');
+    }
+
+    /**
+     * The bound on an octal mode is "does it fit an int", NOT the string length. A mode padded with
+     * many leading zeros is long but perfectly valid — 0700 is 0700 however it is written — and
+     * rejecting it on length would silently WIDEN it to the 0755 default, re-creating the exact bug
+     * the bound exists to prevent.
+     */
+    public function testGetPermissionModeHonoursAValidModePaddedWithManyLeadingZeros(): void {
+        $this->assertSame(octdec('700'), File::getPermissionMode(str_repeat('0', 24) . '700'));
+        $this->assertSame(octdec('644'), File::getPermissionMode(str_repeat('0', 40) . '644'));
+    }
+
+    /**
+     * getPathInfo() gates $createPath on the same character-set check, so an overlong octal reached
+     * createDir() -> mkdir() as the same uncaught TypeError. An unusable mode means "do not create",
+     * exactly as every other non-octal string already did.
+     */
+    public function testGetPathInfoTreatsAnOverlongOctalCreatePathAsNoCreationInsteadOfRaisingATypeError(): void {
+        $dir = $this->path('never_made');
+
+        $info = File::getPathInfo($dir, createPath: str_repeat('7', 22));
+
+        $this->assertIsArray($info);
+        $this->assertDirectoryDoesNotExist($dir, 'A mode that cannot be honoured must not create the directory.');
+    }
+
+    /**
      * writeFile() rejects a malformed mode rather than silently widening to the default. That
      * guard now runs through Validator::isOctal(), so the newline hole is closed there too.
      */
@@ -1201,6 +1305,144 @@ final class FileTest extends TestCase {
         }
     }
 
+    /**
+     * Number of draws each non-determinism test below takes. rand(0, 999) produced a SHORT (16-17
+     * char) suffix on 100 of its 1000 possible draws, so a single call reproduced the old bug only
+     * 10% of the time. Over 200 draws the old code fails with probability 1 - 0.9^200, i.e. about
+     * 1 - 7e-10: high enough that "it passed" means the fix is real, not that the dice were kind.
+     */
+    private const SUFFIX_DRAWS = 200;
+
+    /**
+     * REGRESSION: the suffix was '_' + a 14-digit timestamp + an UNPADDED rand(0, 999), so it was
+     * 16, 17 or 18 characters depending purely on the draw. Its length is what the $maxLength
+     * budget is checked against, so identical arguments produced different outcomes: the width is
+     * now fixed at 18 for every draw.
+     */
+    public function testRenameUploadFileBuildsAFixedWidthSuffixOnEveryDraw(): void {
+        $lengths = [];
+        for ($i = 0; $i < self::SUFFIX_DRAWS; $i++) {
+            $name = File::renameUploadFile('a');
+            $lengths[strlen($name)] = true;
+            // 14 timestamp digits + exactly 3 random digits, zero-padded — never 1 or 2.
+            $this->assertMatchesRegularExpression('/^a_\d{17}$/', $name, "Draw produced '{$name}'.");
+        }
+
+        $this->assertSame(
+            [strlen('a') + 18 => true],
+            $lengths,
+            'The suffix width must not depend on the random draw.'
+        );
+    }
+
+    /**
+     * REGRESSION, THE CORE OF THE BUG: renameUploadFile('a', 17) threw InvalidArgumentException on
+     * ~90% of draws and returned a name on the other ~10%, for the SAME arguments. A function that
+     * rejects its input non-deterministically is green in CI all week and throws in production, on
+     * an upload the caller cannot retry into success. 17 is one character below what the suffix
+     * needs, so it must ALWAYS be rejected.
+     */
+    public function testRenameUploadFileRejectsATooSmallMaxLengthOnEveryDrawNotJustSomeDraws(): void {
+        for ($i = 0; $i < self::SUFFIX_DRAWS; $i++) {
+            try {
+                $name = File::renameUploadFile('a', 17);
+                $this->fail(
+                    "maxLength 17 cannot fit the 18-character suffix and must be rejected on EVERY "
+                    . "draw, but draw {$i} returned '{$name}'."
+                );
+            } catch (\InvalidArgumentException $e) {
+                $this->assertStringContainsString('too small', $e->getMessage());
+            }
+        }
+    }
+
+    /**
+     * The mirror of the test above, and the half that catches an over-correction: a fix that simply
+     * threw more often would pass that one. 18 is EXACTLY what the suffix needs, so it must ALWAYS
+     * be accepted — and the result must actually honour the budget.
+     */
+    public function testRenameUploadFileAcceptsTheExactMaxLengthTheSuffixNeedsOnEveryDraw(): void {
+        for ($i = 0; $i < self::SUFFIX_DRAWS; $i++) {
+            $name = File::renameUploadFile('a', 18);
+
+            $this->assertSame(18, strlen($name), "Draw {$i} produced '{$name}'.");
+            $this->assertMatchesRegularExpression('/^_\d{17}$/', $name);
+        }
+    }
+
+    /**
+     * A file name STARTING with '-' is parsed as an OPTION, not a path, by most CLI tools that a
+     * consumer might later run over the upload directory: `rm -rf.txt`, `tar --output=x`. The
+     * allow-list [A-Za-z0-9_-] let the uploader choose the first character of the stored name.
+     */
+    public static function leadingDashNameProvider(): array {
+        return [
+            'rm-style flags' => ['-rf.txt'],
+            'long option' => ['--output=x.sh'],
+            'nothing but dashes' => ['---.txt'],
+            'bare dash' => ['-'],
+            'dash then space' => ['- a b.csv'],
+            'dashes survive accent folding' => ['-relatório.csv'],
+            'dash-only base with extension' => ['-.tar.gz'],
+        ];
+    }
+
+    #[DataProvider('leadingDashNameProvider')]
+    public function testRenameUploadFileNeverReturnsANameThatStartsWithADash(string $original): void {
+        $name = File::renameUploadFile($original);
+
+        $this->assertNotSame('', $name);
+        $this->assertStringStartsNotWith(
+            '-',
+            $name,
+            "'{$original}' produced '{$name}', which a CLI tool would read as an option."
+        );
+    }
+
+    /**
+     * The strip must be surgical: a '-' anywhere but the FIRST character cannot be parsed as an
+     * option, so it stays. Replacing or stripping every dash would mangle the many real names built
+     * out of them ('2024-05-01-report.csv') and quietly weld words together.
+     */
+    public function testRenameUploadFileKeepsDashesInsideTheName(): void {
+        $name = File::renameUploadFile('2024-05-01-report.csv');
+
+        $this->assertMatchesRegularExpression('/^2024-05-01-report_\d{17}\.csv$/', $name);
+    }
+
+    /**
+     * Only the leading run goes, and what follows it is preserved rather than swallowed.
+     */
+    public function testRenameUploadFileStripsOnlyTheLeadingDashRunAndKeepsTheRest(): void {
+        $this->assertMatchesRegularExpression('/^rf_\d{17}\.txt$/', File::renameUploadFile('-rf.txt'));
+        $this->assertMatchesRegularExpression('/^a-b_\d{17}\.txt$/', File::renameUploadFile('--a-b.txt'));
+    }
+
+    /**
+     * A base name that is nothing but dashes empties out, so the first character of the result is
+     * the suffix's own '_'. It must NOT end up starting with the dash, and must still carry the
+     * extension and the uniqueness suffix.
+     */
+    public function testRenameUploadFileFallsBackToTheSuffixWhenTheBaseIsOnlyDashes(): void {
+        $name = File::renameUploadFile('---.txt');
+
+        $this->assertMatchesRegularExpression('/^_\d{17}\.txt$/', $name);
+    }
+
+    /**
+     * The dash strip must not break the budget it shares with the suffix: stripping happens BEFORE
+     * the truncation, and truncation only removes from the END, so it can never reintroduce a
+     * leading '-' nor overflow $maxLength.
+     */
+    public function testRenameUploadFileStillHonoursMaxLengthForADashPrefixedName(): void {
+        foreach ([30, 40, 125] as $maxLength) {
+            $name = File::renameUploadFile('---' . str_repeat('x', 200) . '.jpeg', $maxLength);
+
+            $this->assertLessThanOrEqual($maxLength, strlen($name), "maxLength {$maxLength} exceeded by '{$name}'.");
+            $this->assertStringStartsNotWith('-', $name);
+        }
+    }
+
     // ---------------------------------------------------------------------
     // uploadFileTo
     // ---------------------------------------------------------------------
@@ -1297,10 +1539,96 @@ final class FileTest extends TestCase {
     // ---------------------------------------------------------------------
     // downloadFile
     //
-    // The streaming path cannot run under PHPUnit: it echoes the body (phpunit.xml sets
-    // beStrictAboutOutputDuringTests) and exit(0)s the runner by default. Only the guard
-    // branches, which are reachable and produce no output, are exercised here.
+    // The guard branches run in-process (they are reachable and produce no output). The STREAMING
+    // SUCCESS path cannot: it echoes the body (phpunit.xml sets beStrictAboutOutputDuringTests) and
+    // exit(0)s the runner by default. That is not a reason to leave it untested — it is the only
+    // DATA-DESTROYING branch in this class (deleteAfterDownload unlink()s the caller's file), so it
+    // runs in a CHILD PHP process instead: see runDownloadInChildProcess().
     // ---------------------------------------------------------------------
+
+    /**
+     * Runs downloadFile() in a CHILD PHP process, which is the honest way to test a function that
+     * terminates the process: the child can exit(0) and echo a body without taking the PHPUnit
+     * runner with it, and the parent gets to observe what a real client would.
+     *
+     * The child echoes $trailer AFTER downloadFile() returns, so the trailer's presence in stdout
+     * is the proof of whether exit() was called: absent => it terminated, present => it returned.
+     *
+     * Child diagnostics go to STDERR (-d display_errors=stderr) so stdout stays byte-exact and can
+     * be compared against the file's bytes directly.
+     *
+     * @return array{stdout: string, stderr: string, exit: int, fileExists: bool}
+     */
+    private function runDownloadInChildProcess(
+        string $filePath,
+        ?string $downloadName,
+        bool $deleteAfterDownload = false,
+        bool $terminateAfterDownload = true,
+        ?int $blockSize = null,
+        string $trailer = ''
+    ): array {
+        if (!function_exists('proc_open')) {
+            $this->markTestSkipped('proc_open() is disabled, cannot spawn the child PHP process.');
+        }
+
+        $script = $this->path('download_child_' . bin2hex(random_bytes(6)) . '.php');
+        $code = <<<'PHP'
+<?php
+require %s;
+
+$config = %s;
+
+if ($config['blockSize'] !== null) {
+    \VD\PHPHelper\File::setDownloadBlockSize($config['blockSize']);
+}
+
+\VD\PHPHelper\File::downloadFile(
+    $config['file'],
+    $config['name'],
+    $config['delete'],
+    $config['terminate']
+);
+
+// Reachable ONLY when downloadFile() returns rather than exit()ing.
+echo $config['trailer'];
+PHP;
+        file_put_contents($script, sprintf(
+            $code,
+            var_export(dirname(__DIR__) . '/vendor/autoload.php', true),
+            var_export([
+                'file' => $filePath,
+                'name' => $downloadName,
+                'delete' => $deleteAfterDownload,
+                'terminate' => $terminateAfterDownload,
+                'blockSize' => $blockSize,
+                'trailer' => $trailer,
+            ], true)
+        ));
+
+        $process = proc_open(
+            [PHP_BINARY, '-d', 'display_errors=stderr', '-d', 'error_reporting=E_ALL', $script],
+            [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+            $pipes
+        );
+        $this->assertIsResource($process, 'Could not spawn the child PHP process.');
+
+        fclose($pipes[0]);
+        $stdout = stream_get_contents($pipes[1]);
+        fclose($pipes[1]);
+        $stderr = stream_get_contents($pipes[2]);
+        fclose($pipes[2]);
+        $exit = proc_close($process);
+
+        @unlink($script);
+        clearstatcache(true, $filePath);
+
+        return [
+            'stdout' => $stdout,
+            'stderr' => $stderr,
+            'exit' => $exit,
+            'fileExists' => is_file($filePath),
+        ];
+    }
 
     public function testDownloadFileWithAnEmptyNameReturnsImmediatelyAndDeletesNothing(): void {
         $file = $this->seedFile('keep.txt', 'still here');
@@ -1360,5 +1688,144 @@ final class FileTest extends TestCase {
         } catch (\Exception $e) {
             $this->assertStringContainsString('does not exist or is not readable', $e->getMessage());
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // downloadFile — streaming success path (child process; see runDownloadInChildProcess)
+    // ---------------------------------------------------------------------
+
+    /**
+     * The baseline nobody had ever asserted: the bytes the client receives are the bytes on disk,
+     * and the documented exit(0) really happens.
+     */
+    public function testDownloadFileStreamsTheFileToTheClientAndExitsZero(): void {
+        $file = $this->seedFile('report.bin', 'hello download world');
+
+        $result = $this->runDownloadInChildProcess($file, 'report.bin', trailer: 'TRAILER');
+
+        $this->assertSame('hello download world', $result['stdout'], "Child stderr:\n" . $result['stderr']);
+        $this->assertSame(0, $result['exit']);
+        $this->assertStringNotContainsString(
+            'TRAILER',
+            $result['stdout'],
+            'terminateAfterDownload=true (the DEFAULT) must exit() and never reach the caller code after it.'
+        );
+        $this->assertTrue($result['fileExists'], 'deleteAfterDownload defaults to false: the file must survive.');
+    }
+
+    /**
+     * The read/echo/flush loop, exercised for real: a block size far smaller than the file forces
+     * many iterations, and binary content (NUL bytes, CR/LF pairs, high bytes) proves the stream is
+     * byte-exact rather than mangled by text-mode translation or a truncated final block.
+     */
+    public function testDownloadFileStreamsBinaryContentIntactAcrossManyBlocks(): void {
+        $content = random_bytes(9_000) . "\r\n\x00\x1a" . random_bytes(1_000);
+        $file = $this->seedFile('blob.bin', $content);
+
+        $result = $this->runDownloadInChildProcess($file, 'blob.bin', blockSize: 7);
+
+        $this->assertSame(strlen($content), strlen($result['stdout']), "Child stderr:\n" . $result['stderr']);
+        $this->assertSame(
+            $content,
+            $result['stdout'],
+            'The streamed bytes must be identical to the file, block boundaries included.'
+        );
+        $this->assertSame(0, $result['exit']);
+    }
+
+    /**
+     * THE DATA-DESTROYING BRANCH. deleteAfterDownload=true unlink()s the caller's file, and it had
+     * no test at all: nothing proved the delete happens, and nothing would have caught it deleting
+     * a file it should have kept (see the sibling test below).
+     */
+    public function testDownloadFileDeletesTheFileAfterStreamingItWhenAsked(): void {
+        $file = $this->seedFile('temp-export.csv', 'id,name');
+
+        $result = $this->runDownloadInChildProcess(
+            $file,
+            'export.csv',
+            deleteAfterDownload: true,
+            terminateAfterDownload: false,
+            trailer: 'TRAILER'
+        );
+
+        // The body must be sent BEFORE the file is destroyed — a delete on a failed stream would
+        // lose the data with nothing to show for it.
+        $this->assertSame('id,nameTRAILER', $result['stdout'], "Child stderr:\n" . $result['stderr']);
+        $this->assertSame(0, $result['exit']);
+        $this->assertFalse($result['fileExists'], 'deleteAfterDownload=true must remove the file after the download.');
+    }
+
+    /**
+     * The other half of the delete contract, and the one that would catch an over-eager unlink():
+     * a plain download must never touch the caller's file.
+     */
+    public function testDownloadFileKeepsTheFileWhenDeleteAfterDownloadIsFalse(): void {
+        $file = $this->seedFile('keepme.csv', 'id,name');
+
+        $result = $this->runDownloadInChildProcess(
+            $file,
+            'keepme.csv',
+            deleteAfterDownload: false,
+            terminateAfterDownload: false,
+            trailer: 'TRAILER'
+        );
+
+        $this->assertSame('id,nameTRAILER', $result['stdout'], "Child stderr:\n" . $result['stderr']);
+        $this->assertTrue($result['fileExists'], 'A download must not delete the file unless asked to.');
+        $this->assertSame('id,name', file_get_contents($file), 'The file content must be untouched.');
+    }
+
+    /**
+     * deleteAfterDownload and terminateAfterDownload are independent: the delete runs BEFORE the
+     * exit(0), so the default terminate=true must not skip it. The absent trailer proves the child
+     * really exited rather than returning.
+     */
+    public function testDownloadFileDeletesTheFileEvenWhenItTerminatesTheProcess(): void {
+        $file = $this->seedFile('once.bin', 'one-shot payload');
+
+        $result = $this->runDownloadInChildProcess(
+            $file,
+            'once.bin',
+            deleteAfterDownload: true,
+            terminateAfterDownload: true,
+            trailer: 'TRAILER'
+        );
+
+        $this->assertSame('one-shot payload', $result['stdout'], "Child stderr:\n" . $result['stderr']);
+        $this->assertSame(0, $result['exit']);
+        $this->assertStringNotContainsString('TRAILER', $result['stdout'], 'terminateAfterDownload=true must exit().');
+        $this->assertFalse($result['fileExists'], 'The delete must happen before the exit(0), not be skipped by it.');
+    }
+
+    /**
+     * terminateAfterDownload=false is the branch a caller uses to keep working after sending the
+     * body; the trailer proves control really came back.
+     */
+    public function testDownloadFileReturnsToTheCallerWhenTerminateAfterDownloadIsFalse(): void {
+        $file = $this->seedFile('back.bin', 'body');
+
+        $result = $this->runDownloadInChildProcess(
+            $file,
+            'back.bin',
+            terminateAfterDownload: false,
+            trailer: 'TRAILER'
+        );
+
+        $this->assertSame('bodyTRAILER', $result['stdout'], "Child stderr:\n" . $result['stderr']);
+        $this->assertSame(0, $result['exit']);
+    }
+
+    /**
+     * The child process must not be masking diagnostics: a clean stderr proves the streaming path
+     * raises no warning/deprecation on the way through.
+     */
+    public function testDownloadFileStreamsWithoutRaisingAnyDiagnostic(): void {
+        $file = $this->seedFile('quiet.bin', str_repeat('x', 5_000));
+
+        $result = $this->runDownloadInChildProcess($file, 'quiet.bin', blockSize: 512);
+
+        $this->assertSame('', trim($result['stderr']), 'The streaming path must emit no diagnostics.');
+        $this->assertSame(0, $result['exit']);
     }
 }

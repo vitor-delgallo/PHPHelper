@@ -97,10 +97,16 @@ class Security {
      * The numeric length is read until the "-" separator, then the corresponding
      * number of bytes is read and base64-decoded before being returned.
      *
+     * NEVER raises: a hostile length header is rejected by the guards rather than forwarded to
+     * fread(), which raises a ValueError (an \Error) on a zero length and would escape the
+     * \Exception-based error handling of every caller.
+     *
      * @param resource $fp File pointer opened for reading
      *
-     * @return string|bool  Returns the decoded block content, 
-     *                      false if the block length is invalid or the data cannot be fully read
+     * @return string|bool  Returns the decoded block content,
+     *                      false if the block length is invalid (absent, zero, over
+     *                      MAX_ENCODED_BLOCK_BYTES), the data cannot be fully read, or the payload
+     *                      is not strict base64,
      *                      true if it has reached the end of file
      */
     private static function readLengthEncodedBlock($fp): string|bool {
@@ -132,15 +138,25 @@ class Security {
         $len = (int) $lenData;
         // Bound the declared length BEFORE allocating: a crafted/corrupt file must not be able
         // to force a huge fread() before any authentication runs (memory-exhaustion DoS).
-        if ($len < 0 || $len > self::MAX_ENCODED_BLOCK_BYTES) {
+        //
+        // $len === 0 is REJECTED, not read: fread($fp, 0) raises a ValueError, which is an \Error
+        // and NOT an \Exception, so it escaped decryptFileV2's documented catch and skipped the
+        // rollback — leaving unauthenticated plaintext behind on disk. writeLengthEncodedBlock()
+        // never emits a zero-length block (every block written carries a cipher name, version,
+        // salt, file id, IV, tag or ciphertext, all non-empty), so "0-" only ever means a corrupt
+        // or hostile file. Fail closed.
+        if ($len <= 0 || $len > self::MAX_ENCODED_BLOCK_BYTES) {
             return false;
         }
+
         $data = fread($fp, $len);
         if ($data === false || mb_strlen($data, '8bit') !== $len) {
             return false;
         }
 
-        return ($data !== "" ? base64_decode($data, true) : true);
+        // $data is non-empty here ($len >= 1), so a "" result can only come from base64_decode
+        // itself; strict mode returns false on any invalid byte.
+        return base64_decode($data, true);
     }
     
     /**
@@ -506,7 +522,13 @@ class Security {
      * On failure the destination is restored to its pre-call state: in "w" mode the (freshly
      * created/truncated) destination is deleted; in "a" mode it is truncated back to the length it
      * had on entry, so appending a bad part NEVER destroys parts already appended. Unauthenticated
-     * plaintext is never left behind either way.
+     * plaintext is never left behind either way. This holds even when the failure is a raised
+     * \Error rather than a detected tamper: nothing leaves this function without the rollback.
+     *
+     * A failure raised BEFORE the destination is opened (missing OpenSSL, unresolvable source or
+     * destination, an invalid $outReadMode, a header that does not match, a key deriveKey rejects)
+     * leaves an existing destination file untouched — this call never wrote to it, so it has
+     * nothing to undo and does not delete the caller's file.
      *
      * @param string $source Path to the file to be decrypted (use tmp_name when from $_FILES)
      * @param string $key Master key (>= 32 bytes), the same one passed to encryptFileV2
@@ -565,10 +587,26 @@ class Security {
         umask($oldMask);
 
         // Attempts to open the source file for reading
-        if ($fpIn = fopen($source, 'rb')) {
-            // Initializes the error flag
-            $error = false;
+        if (!($fpIn = fopen($source, 'rb'))) {
+            throw new \Exception("Error while reading the source file.");
+        }
 
+        // Initializes the error flag. It holds either false, a diagnostic string, or the \Throwable
+        // that aborted the read.
+        $error = false;
+
+        // Declared BEFORE the try so the close/rollback below can see them even if the body aborts
+        // before the destination is ever opened. $destinationOpened is what licenses the rollback:
+        // until fopen() succeeds, this call has not touched the destination, so it has nothing to
+        // roll back and no right to delete the caller's file.
+        $fpOut = false;
+        $destinationOpened = false;
+
+        // EVERYTHING from here to the rollback runs inside try/catch, because no failure may leave
+        // this function without the rollback running. A raised \Error (ValueError, TypeError) is
+        // NOT an \Exception, so it would sail straight through the callers' documented
+        // `catch (\Exception)` AND past the cleanup, stranding unauthenticated plaintext on disk.
+        try {
             // Reads the cipher in source file
             $fCipher = self::readLengthEncodedBlock($fpIn);
             if (is_bool($fCipher) || $fCipher !== $cipher) {
@@ -603,9 +641,14 @@ class Security {
             $sawTrailer = false;
 
             // Attempts to open the destination file for writing
-            $fpOut = false;
-            if (!$error && !($fpOut = fopen($destination, $outReadMode))) {
-                $error = "Error while writing to the destination file.";
+            if (!$error) {
+                if (!($fpOut = fopen($destination, $outReadMode))) {
+                    $error = "Error while writing to the destination file.";
+                } else {
+                    // From here on the destination has been created or truncated by US, so a
+                    // failure must roll it back.
+                    $destinationOpened = true;
+                }
             }
 
             while (!$error) {
@@ -673,33 +716,50 @@ class Security {
             if (!$error && !$sawTrailer) {
                 $error = "Encrypted file is truncated (missing authenticated end marker)";
             }
+        } catch (\Throwable $e) {
+            // Carry the failure into the shared cleanup path below instead of unwinding here, so a
+            // raised \Error rolls back exactly like a detected tamper does.
+            $error = $e;
+        }
 
-            // Closes the source and destination file
-            @fclose($fpIn);
-            if ($fpOut) {
-                @fclose($fpOut);
-            }
+        // Closes the source and destination file
+        @fclose($fpIn);
+        if ($fpOut) {
+            @fclose($fpOut);
+        }
 
-            // Checks if any error occurred during decryption
-            if ($error) {
-                // Roll the destination back to its pre-call state. Unauthenticated plaintext must
-                // never survive a failure, but neither must data this call did not write: in append
-                // mode the file (and every part appended by an earlier successful call) belongs to
-                // the caller, so truncate back to the entry length instead of deleting it.
-                if (is_file($destination)) {
-                    if ($appendMode && $destExistedBefore) {
-                        if ($fpTrunc = fopen($destination, 'r+b')) {
-                            @ftruncate($fpTrunc, $appendStartOffset);
-                            @fclose($fpTrunc);
-                        }
-                    } else {
-                        @unlink($destination);
+        // Checks if any error occurred during decryption
+        if ($error) {
+            // Roll the destination back to its pre-call state. Unauthenticated plaintext must
+            // never survive a failure, but neither must data this call did not write: in append
+            // mode the file (and every part appended by an earlier successful call) belongs to
+            // the caller, so truncate back to the entry length instead of deleting it.
+            //
+            // $destinationOpened gates the whole thing. A failure raised BEFORE the destination
+            // was opened (an unreadable header, a key deriveKey rejects) has not touched the file,
+            // so deleting it would destroy a caller file this call never wrote a byte of — the
+            // opposite of "restored to its pre-call state".
+            if ($destinationOpened && is_file($destination)) {
+                if ($appendMode && $destExistedBefore) {
+                    if ($fpTrunc = fopen($destination, 'r+b')) {
+                        @ftruncate($fpTrunc, $appendStartOffset);
+                        @fclose($fpTrunc);
                     }
+                } else {
+                    @unlink($destination);
                 }
-                throw new \Exception($error);
             }
-        } else {
-            throw new \Exception("Error while reading the source file.");
+
+            // Honor the documented contract: this function signals failure with an \Exception and
+            // nothing else. An \Exception raised inside (deriveKey's short-key rejection) keeps its
+            // identity and message; an \Error is wrapped, preserving the original as ->getPrevious().
+            if ($error instanceof \Exception) {
+                throw $error;
+            }
+            if ($error instanceof \Throwable) {
+                throw new \Exception($error->getMessage(), 0, $error);
+            }
+            throw new \Exception($error);
         }
 
         // Returns the path of the decrypted file
@@ -1358,15 +1418,41 @@ class Security {
         // Hostile input is expected to be malformed; libxml must not emit warnings for it. Restore
         // the caller's error mode rather than clobbering it.
         $previousErrorMode = libxml_use_internal_errors(true);
+
+        // Drain the buffer FIRST. libxml's error queue is process-wide: if the caller already had
+        // internal errors enabled and left a fatal queued from their own unrelated parse, the
+        // inspection below would attribute it to OUR parse and escape every valid input from here
+        // on. Only errors raised by the loadHTML() on the next line may be judged. (The clear that
+        // already ran after the parse discarded the caller's queue regardless, so this drains
+        // nothing the old code preserved.)
+        libxml_clear_errors();
+
         $loaded = $document->loadHTML(
             '<html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"></head>'
             . '<body>' . $data . '</body></html>',
             LIBXML_NONET | LIBXML_NOERROR | LIBXML_NOWARNING
         );
+
+        // A FATAL libxml error does NOT make loadHTML() return false. "Excessive depth in document:
+        // 256" is the one that matters: the tree is TRUNCATED at depth 255 and everything deeper is
+        // discarded, yet $loaded is true — so the guard below never fired and the sanitizer silently
+        // dropped content. Inspect the errors BEFORE clearing them, and fail closed on a fatal.
+        //
+        // Only level >= LIBXML_ERR_FATAL counts. LIBXML_ERR_ERROR (level 2) is the normal, expected
+        // response to hostile-but-parseable markup (`<svg/onload=1>`, mismatched tags, a raw `&`);
+        // failing closed on those would escape almost every real input and destroy the allow-list.
+        $fatalParseError = false;
+        foreach (libxml_get_errors() as $parseError) {
+            if ($parseError->level >= LIBXML_ERR_FATAL) {
+                $fatalParseError = true;
+                break;
+            }
+        }
+
         libxml_clear_errors();
         libxml_use_internal_errors($previousErrorMode);
 
-        if (!$loaded) {
+        if (!$loaded || $fatalParseError) {
             return self::xssEscape($data);
         }
 
@@ -1381,6 +1467,77 @@ class Security {
         }
 
         return $html;
+    }
+
+    /**
+     * Walks a container object and rewrites its sanitizable slots IN PLACE via $sanitize.
+     *
+     * Shared by xssCleanRecursive() and filterValue() so the two walks cannot drift apart — they
+     * did drift, and the drift was the bug: `foreach ($object as $k => $v)` dispatches to the
+     * ITERATOR on any Traversable, so `$object->$k = ...` wrote a PHANTOM DYNAMIC property while
+     * the real storage (an ArrayObject's) kept the live payload, and the caller got a sanitized
+     * copy reachable only through a property nothing reads.
+     *
+     * Two disjoint slot kinds are visited:
+     *  - STORAGE, for an ArrayAccess container: the only way an ArrayObject/ArrayIterator is
+     *    actually read is offsetGet, so the write-back must go through offsetSet.
+     *  - PUBLIC PROPERTIES, via get_object_vars(), which sees exactly the public properties the
+     *    contract promises and is NOT hijacked by a custom iterator.
+     *
+     * @param object $object   Container to walk, mutated in place
+     * @param callable $sanitize fn(mixed $value): mixed applied to every visited slot
+     * @return void
+     */
+    private static function walkObjectInPlace(object $object, callable $sanitize): void {
+        // An enum case is a process-wide singleton whose name/value are readonly constants, not
+        // caller data: there is nothing to sanitize, and writing to it is an \Error.
+        if ($object instanceof \UnitEnum) {
+            return;
+        }
+
+        // Array-like storage. SplObjectStorage is excluded on purpose: it is ArrayAccess, but its
+        // OFFSETS are objects while iteration yields integer positions, so writing back by
+        // iteration key is a TypeError — its attached data is not addressable by the keys foreach
+        // hands us, and pretending otherwise would trade one broken walk for another.
+        if ($object instanceof \ArrayAccess && $object instanceof \Traversable && !($object instanceof \SplObjectStorage)) {
+            // Snapshot first: writing through offsetSet while the iterator is live is undefined.
+            foreach (iterator_to_array($object) as $key => $value) {
+                $object->offsetSet($key, $sanitize($value));
+            }
+        }
+
+        // Public properties. get_object_vars() is called from this scope, so private/protected
+        // properties are invisible here — which IS the documented contract.
+        foreach (get_object_vars($object) as $key => $value) {
+            // A readonly property cannot be rewritten in place from outside its declaring scope:
+            // the assignment is an \Error, even when the value needs no change at all. Skip it
+            // rather than crash on an object that merely has a readonly id.
+            if (self::isReadOnlyProperty($object, $key)) {
+                continue;
+            }
+
+            $object->$key = $sanitize($value);
+        }
+    }
+
+    /**
+     * True when $name is a declared readonly property of $object (so assigning to it would raise
+     * an \Error). A dynamic property is never readonly.
+     *
+     * @param object $object
+     * @param string $name
+     * @return bool
+     */
+    private static function isReadOnlyProperty(object $object, string $name): bool {
+        if (!property_exists($object, $name)) {
+            return false;
+        }
+
+        try {
+            return (new \ReflectionProperty($object, $name))->isReadOnly();
+        } catch (\ReflectionException) {
+            return false;
+        }
     }
 
     /**
@@ -1417,13 +1574,27 @@ class Security {
      *    reordered/quoted, unknown tags unwrapped, `&` escaped). Do not use it on a value you need
      *    back byte-for-byte, and sanitize on OUTPUT (or store both forms) rather than destroying
      *    the original on input.
-     *  - If ext-dom is unavailable, or the input is not valid UTF-8, it falls back to escaping the
-     *    whole string (htmlspecialchars, ENT_QUOTES|ENT_SUBSTITUTE): still safe, but it destroys
-     *    legitimate markup.
+     *  - If ext-dom is unavailable, the input is not valid UTF-8, or libxml reports a FATAL parse
+     *    error (notably "Excessive depth in document: 256" — HTML nested deeper than 255 elements),
+     *    it falls back to escaping the whole string (htmlspecialchars, ENT_QUOTES|ENT_SUBSTITUTE):
+     *    still safe, but it destroys legitimate markup. This is deliberate: loadHTML() returns TRUE
+     *    on the depth error while SILENTLY TRUNCATING the tree at depth 255, so trusting it would
+     *    discard content without a word. Escaping keeps the content visible and inert.
+     *  - ARRAY KEYS ARE NOT WALKED — only values are. A key is a structural identifier, and
+     *    rewriting it could collide two entries into one and silently drop data, so keys are left
+     *    byte-for-byte intact and MAY STILL CONTAIN LIVE MARKUP (the keys of $_POST are
+     *    attacker-controlled). If you render keys, escape them at output.
+     *  - Of an object, only ArrayAccess STORAGE and PUBLIC PROPERTIES are walked. Private/protected
+     *    state, READONLY properties (they cannot be rewritten in place — the assignment is an
+     *    \Error, so they are skipped), data reachable only through a custom Iterator/IteratorAggregate,
+     *    and SplObjectStorage's attached data are ALL left unsanitized. Sanitize those before
+     *    construction, or sanitize on output.
      *
-     * @param mixed $input The value to sanitize. Arrays and objects are walked recursively to every
-     *                     scalar leaf (an object's public properties are rewritten IN PLACE, and
-     *                     the same instance is returned). Non-string scalars are returned unchanged.
+     * @param mixed $input The value to sanitize. Arrays are copied (copy-on-write); objects are
+     *                     walked recursively and rewritten IN PLACE, and the same instance is
+     *                     returned — see HONEST LIMITS for exactly which slots are visited. An enum
+     *                     case is returned untouched (its cases are constants, not caller data).
+     *                     Non-string scalars are returned unchanged.
      * @return mixed The sanitized value
      */
     public static function xssCleanRecursive(mixed $input): mixed {
@@ -1432,13 +1603,12 @@ class Security {
         }
 
         if (is_array($input)) {
+            // Keys are deliberately NOT sanitized — see HONEST LIMITS.
             foreach ($input as $key => $value) {
                 $input[$key] = self::xssCleanRecursive($value);
             }
         } elseif (is_object($input)) {
-            foreach ($input as $key => $value) {
-                $input->$key = self::xssCleanRecursive($value);
-            }
+            self::walkObjectInPlace($input, static fn (mixed $value): mixed => self::xssCleanRecursive($value));
         }
 
         if (is_string($input)) {
@@ -1456,11 +1626,16 @@ class Security {
      * in place). A scalar is filtered directly.
      *
      * MUTATION ASYMMETRY: an array $source is copied (PHP copy-on-write), so the caller's array is
-     * untouched and only the return value is filtered. An OBJECT $source is a shared handle, so its
-     * public properties are rewritten IN PLACE — the caller's object is modified and the same
-     * instance is returned. Clone before calling if you need the original intact. Only public
-     * properties are visited; private/protected ones are invisible to the walk and survive
-     * unfiltered.
+     * untouched and only the return value is filtered. An OBJECT $source is a shared handle, so it
+     * is rewritten IN PLACE — the caller's object is modified and the same instance is returned.
+     * Clone before calling if you need the original intact.
+     *
+     * WHAT THE OBJECT WALK VISITS: ArrayAccess storage (via offsetSet, so an ArrayObject is really
+     * filtered rather than shadowed by a phantom dynamic property) and PUBLIC properties. NOT
+     * visited, and therefore surviving UNFILTERED: private/protected state, readonly properties
+     * (they cannot be rewritten in place), data reachable only through a custom Iterator, and
+     * SplObjectStorage's attached data. An enum case is returned untouched. Array KEYS are never
+     * filtered — only values are.
      *
      * @param mixed $source The input array, object, or scalar
      * @param string|null $key If set, extracts a value from $source by key. ARRAYS ONLY: if $source
@@ -1589,27 +1764,35 @@ class Security {
             return $val;
         };
 
-        if (is_array($value) || is_object($value)) {
-            $isObject = is_object($value);
-            foreach ($value as $k => $v) {
-                $filtered = self::filterValue(
-                    $v, null, $ifNull,
-                    $decodeStr, $xssClean, $stripTags, $htmlEntities, $addSlashes, $escapeDB, $trim,
-                    $formatDecimal, $asInteger, $asBoolean,
-                    $base64Encode, $base64Decode, $base64UrlEncode, $base64UrlDecode,
-                    $urlEncode, $urlDecode,
-                    $jsonEncode, $jsonDecode
-                );
+        $recurse = function (mixed $v) use (
+            $ifNull,
+            $decodeStr, $xssClean, $stripTags, $htmlEntities, $addSlashes, $escapeDB, $trim,
+            $formatDecimal, $asInteger, $asBoolean,
+            $base64Encode, $base64Decode, $base64UrlEncode, $base64UrlDecode,
+            $urlEncode, $urlDecode,
+            $jsonEncode, $jsonDecode
+        ): mixed {
+            return self::filterValue(
+                $v, null, $ifNull,
+                $decodeStr, $xssClean, $stripTags, $htmlEntities, $addSlashes, $escapeDB, $trim,
+                $formatDecimal, $asInteger, $asBoolean,
+                $base64Encode, $base64Decode, $base64UrlEncode, $base64UrlDecode,
+                $urlEncode, $urlDecode,
+                $jsonEncode, $jsonDecode
+            );
+        };
 
-                // Write back through the right accessor. Subscripting an object with [] (the old
-                // behavior) is a fatal Error for anything not implementing ArrayAccess, e.g. the
-                // stdClass every json_decode() produces. Mirrors xssCleanRecursive.
-                if ($isObject) {
-                    $value->$k = $filtered;
-                } else {
-                    $value[$k] = $filtered;
-                }
+        if (is_array($value)) {
+            // Keys are not walked, matching xssCleanRecursive.
+            foreach ($value as $k => $v) {
+                $value[$k] = $recurse($v);
             }
+        } elseif (is_object($value)) {
+            // Route every write through the SAME walk xssCleanRecursive uses. Branching on
+            // is_object() and assigning `$value->$k` was the wrong discriminator: on an
+            // ArrayAccess+Traversable container (ArrayObject) it wrote a phantom dynamic property
+            // and left the real storage holding the unfiltered value.
+            self::walkObjectInPlace($value, $recurse);
         } else {
             $value = $applyFilters($value);
         }

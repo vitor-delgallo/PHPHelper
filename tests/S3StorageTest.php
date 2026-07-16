@@ -1158,4 +1158,267 @@ final class S3StorageTest extends TestCase
         $this->assertFalse(S3Storage::delete('p/', true), 'a failed listing must not be reported as a successful delete');
         $this->assertNotContains('DeleteObjects', $this->awsCommands);
     }
+
+    // ---------------------------------------------------------------------
+    // $options must not override what the method already validated.
+    //
+    // $options is merged OVER each method's own arguments, so a caller-supplied
+    // key silently won: the per-call bucket guard validated one bucket while the
+    // request went to another. The guard checked nothing that mattered.
+    // ---------------------------------------------------------------------
+
+    public function testUploadRejectsAnOptionsBucketInsteadOfLettingItOverrideTheValidatedOne(): void
+    {
+        $this->installMockS3([
+            new Result([]), // headBucket — must never be reached
+            new Result([]), // putObject — must never be reached
+        ]);
+
+        // Uppercase: a name validateBucketName() rejects outright, which used to reach AWS
+        // anyway — while createBucket() had just ensured the *validated* bucket existed.
+        $this->assertFalse(
+            S3Storage::upload('a/b.txt', $this->tempFile(), true, ['Bucket' => 'ATTACKER-BUCKET']),
+            "an \$options['Bucket'] must not override the bucket requireBucket() validated"
+        );
+        $this->assertStringContainsString("may not contain 'Bucket'", (string)S3Storage::getLastError());
+        $this->assertSame(
+            [],
+            $this->awsCommands,
+            'a rejected call must not reach AWS at all — not even createBucket(), which would '
+            . 'otherwise leave a bucket behind for a call that never ran'
+        );
+    }
+
+    public function testUploadRejectsEveryOptionItDerivesFromItsOwnArguments(): void
+    {
+        $owned = [
+            'Key'         => 'somewhere/else.txt', // would dodge the mandatory-extension guard
+            'SourceFile'  => __FILE__,             // would dodge the is_file()/is_readable() check
+            'Body'        => 'replacement bytes',  // silently discarded: SourceFile always wins
+            'IfNoneMatch' => '*',                  // would contradict $overwrite
+        ];
+
+        foreach ($owned as $name => $value) {
+            S3Storage::reset();
+            $this->awsCommands = [];
+            $this->awsParams = [];
+            $this->installMockS3([new Result([]), new Result([])]);
+
+            $this->assertFalse(
+                S3Storage::upload('a/b.txt', $this->tempFile(), true, [$name => $value]),
+                "\$options['{$name}'] would override an upload() argument that was already validated"
+            );
+            $this->assertStringContainsString("may not contain '{$name}'", (string)S3Storage::getLastError());
+            $this->assertSame([], $this->awsCommands, "a rejected '{$name}' must not reach AWS");
+        }
+    }
+
+    public function testTheReservedOptionGuardIsCaseInsensitive(): void
+    {
+        $this->installMockS3([new Result([]), new Result([])]);
+
+        // The SDK silently drops a lowercase 'bucket' rather than applying it, so this is the
+        // same caller mistake with a quieter failure mode.
+        $this->assertFalse(S3Storage::upload('a/b.txt', $this->tempFile(), true, ['bucket' => 'other-bucket']));
+        $this->assertStringContainsString("may not contain 'Bucket'", (string)S3Storage::getLastError());
+        $this->assertSame([], $this->awsCommands);
+    }
+
+    public function testUploadSendsTheValidatedBucketAndStillPassesGenuineExtraOptionsThrough(): void
+    {
+        $this->installMockS3([
+            new Result([]), // headBucket
+            new Result([]), // putObject
+        ]);
+
+        $this->assertNotFalse(S3Storage::upload('a/b.txt', $this->tempFile(), true, [
+            'StorageClass' => 'STANDARD_IA',
+            'Metadata'     => ['owner' => 'unit'],
+            'ContentType'  => 'application/x-custom',
+        ]));
+
+        $put = $this->awsParams['PutObject'][0];
+        $this->assertSame(self::TEST_BUCKET, $put['Bucket'] ?? null, 'the bucket on the wire must be the validated one');
+        $this->assertSame('STANDARD_IA', $put['StorageClass'] ?? null, 'a genuine extra option must still reach S3');
+        $this->assertSame(['owner' => 'unit'], $put['Metadata'] ?? null);
+        $this->assertSame(
+            'application/x-custom',
+            $put['ContentType'] ?? null,
+            'ContentType is documented as an honoured override of the detected type'
+        );
+    }
+
+    public function testCopyRejectsAnOptionsCopySourceThatWouldRedirectTheSource(): void
+    {
+        $this->installMockS3([new Result([]), new Result([]), new Result([])]);
+
+        $this->assertFalse(
+            S3Storage::copy('a/x.pdf', 'a/y.pdf', true, true, [
+                'CopySource' => 'someone-elses-bucket/secrets/private.pdf',
+            ]),
+            "an \$options['CopySource'] re-opened the exact cross-bucket redirect requireBucket() exists to close"
+        );
+        $this->assertStringContainsString("may not contain 'CopySource'", (string)S3Storage::getLastError());
+        $this->assertSame([], $this->awsCommands);
+    }
+
+    public function testCopyRejectsEveryOptionItDerivesFromItsOwnArguments(): void
+    {
+        $owned = [
+            'Bucket'            => 'ATTACKER-BUCKET',
+            'Key'               => 'somewhere/else.pdf',
+            'MetadataDirective' => 'REPLACE', // would contradict $preserveMetadata
+            'IfNoneMatch'       => '*',       // would contradict $overwrite
+        ];
+
+        foreach ($owned as $name => $value) {
+            S3Storage::reset();
+            $this->awsCommands = [];
+            $this->awsParams = [];
+            $this->installMockS3([new Result([]), new Result([]), new Result([])]);
+
+            $this->assertFalse(
+                S3Storage::copy('a/x.pdf', 'a/y.pdf', true, true, [$name => $value]),
+                "\$options['{$name}'] would override a copy() argument that was already validated"
+            );
+            $this->assertStringContainsString("may not contain '{$name}'", (string)S3Storage::getLastError());
+            $this->assertSame([], $this->awsCommands, "a rejected '{$name}' must not reach AWS");
+        }
+    }
+
+    public function testCopySendsTheValidatedBucketsAndStillPassesGenuineExtraOptionsThrough(): void
+    {
+        $this->installMockS3([
+            new Result([]),                                   // headBucket
+            new Result(['ContentType' => 'application/pdf']), // headObject
+            new Result([]),                                   // copyObject
+        ]);
+
+        $this->assertTrue(S3Storage::copy('a/x.pdf', 'b/y.pdf', true, true, ['StorageClass' => 'GLACIER']));
+
+        $copy = $this->awsParams['CopyObject'][0];
+        $this->assertSame(self::TEST_BUCKET, $copy['Bucket'] ?? null, 'the destination on the wire is the validated one');
+        $this->assertSame(
+            self::TEST_BUCKET . '/a/x.pdf',
+            $copy['CopySource'] ?? null,
+            'CopySource must be built from the validated source bucket, not from $options'
+        );
+        $this->assertSame('GLACIER', $copy['StorageClass'] ?? null, 'a genuine extra option must still reach S3');
+    }
+
+    public function testMoveRejectsReservedOptionsBeforeCopyingOrDeletingAnything(): void
+    {
+        $this->installMockS3([new Result([]), new Result([]), new Result([]), new Result([])]);
+
+        $this->assertFalse(S3Storage::move('a/x.pdf', 'a/y.pdf', true, true, ['Bucket' => 'elsewhere']));
+        $this->assertSame(
+            [],
+            $this->awsCommands,
+            'move() forwards $options to copy(), which must reject before anything is copied or deleted'
+        );
+        $this->assertStringContainsString('copy()', (string)S3Storage::getLastError());
+    }
+
+    // ---------------------------------------------------------------------
+    // setEndpoint(): the host shape is a config error the caller can still act on.
+    // ---------------------------------------------------------------------
+
+    public function testSetEndpointRejectsHostsWithSpacesOrControlCharacters(): void
+    {
+        // parse_url() parses every one of these WITHOUT complaint, and the raw string —
+        // control bytes and all — is what gets stored and baked into the client. Accepting
+        // them here deferred a detectable config error to every later call.
+        $junk = [
+            'http://minio internal:9000',
+            "http://minio\ninternal:9000",
+            "http://host\r\nX-Injected: 1",
+            "http://mi\tnio.internal",
+            "http://minio\x00.internal",
+            "http://\x07host.internal",
+        ];
+
+        foreach ($junk as $endpoint) {
+            S3Storage::reset();
+
+            $this->assertFalse(
+                S3Storage::setEndpoint($endpoint),
+                'an endpoint carrying spaces/control characters must be rejected at the setter'
+            );
+            $this->assertStringContainsString(
+                'must not contain spaces or control characters',
+                (string)S3Storage::getLastError()
+            );
+            $this->assertNull(S3Storage::getEndpoint(), 'a rejected endpoint must not be stored');
+        }
+    }
+
+    public function testSetEndpointDoesNotEchoRawControlBytesIntoTheErrorMessage(): void
+    {
+        $this->assertFalse(S3Storage::setEndpoint("http://host\r\nX-Injected: 1"));
+
+        $error = (string)S3Storage::getLastError();
+        $this->assertStringNotContainsString(
+            "\r",
+            $error,
+            'a raw CR in getLastError() is a log injection in whatever writes the message out'
+        );
+        $this->assertStringNotContainsString("\n", $error);
+        $this->assertStringContainsString('\r\n', $error, 'the offending value is still reported, escaped');
+    }
+
+    public function testSetEndpointRejectsAStructurallyInvalidHost(): void
+    {
+        foreach ([
+            'http://-bad.example.com',
+            'http://bad-.example.com',
+            'http://a..b',
+            'http://[:::1]:9000',
+            'http://[::1',
+        ] as $endpoint) {
+            S3Storage::reset();
+
+            $this->assertFalse(S3Storage::setEndpoint($endpoint), "'{$endpoint}' is not a usable host");
+            $this->assertNull(S3Storage::getEndpoint());
+        }
+    }
+
+    public function testSetEndpointAcceptsTheHostsRealDeploymentsActuallyUse(): void
+    {
+        // Guards the shape check against over-strictness: each of these is legitimate, and
+        // rejecting any would break a supported deployment to enforce a rule nothing needs.
+        foreach ([
+            'http://127.0.0.1:9000',
+            'http://localhost:9000',
+            'http://minio_1:9000',                // Docker service name: underscores are not
+                                                  // legal DNS but this host really answers
+            'http://[::1]:9000',                  // IPv6 literal
+            'https://gw.example.com/s3',          // gateway exposing S3 under a prefix
+            'https://nyc3.digitaloceanspaces.com',
+            'https://xn--mnchen-3ya.de',          // IDN, punycoded as the SDK requires
+            'http://minio.internal.',             // FQDN root
+        ] as $endpoint) {
+            S3Storage::reset();
+
+            $this->assertTrue(
+                S3Storage::setEndpoint($endpoint),
+                "'{$endpoint}' is a legitimate endpoint and must be accepted"
+            );
+        }
+    }
+
+    public function testARejectedControlCharacterEndpointLeavesTheWorkingOneAndTheClientIntact(): void
+    {
+        $this->assertTrue(S3Storage::setEndpoint('https://minio.example.com:9000'));
+        self::buildClientOffline();
+        $this->assertNotNull(self::peekClient(), 'precondition: a client is cached');
+
+        $this->assertFalse(S3Storage::setEndpoint('http://minio internal:9000'));
+
+        $this->assertSame(
+            'https://minio.example.com:9000',
+            S3Storage::getEndpoint(),
+            'a rejected endpoint must not clobber the working one'
+        );
+        $this->assertNotNull(self::peekClient(), 'nothing changed, so there is nothing to rebuild');
+    }
 }

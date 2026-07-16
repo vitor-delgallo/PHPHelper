@@ -1173,34 +1173,288 @@ final class SecurityTest extends TestCase
     // ---------------------------------------------------------------------------------------
 
     /**
-     * Asserts no ACTIVE construct survived: no event handler, no scripting scheme, and none of the
-     * elements that can execute or that switch the parser into raw-text/foreign-content rules.
-     * Escaped text (e.g. "&lt;script&gt;") is inert and deliberately NOT flagged.
+     * The safe subset the sanitizer promises to emit: element => attributes allowed on it, on top of
+     * XSS_ORACLE_GLOBAL_ATTRIBUTES.
+     *
+     * Deliberately a hand-maintained MIRROR of Security::XSS_ALLOWED_ELEMENTS rather than a read of
+     * the private constant. Deriving it from the source would make the oracle agree with whatever
+     * the source happens to allow — including a future "just add svg" — which is precisely the
+     * failure mode these tests exist to catch. Widening the subset must mean editing this list, in a
+     * diff a reviewer sees.
+     *
+     * @var array<string, string[]>
+     */
+    private const XSS_ORACLE_ELEMENTS = [
+        'a' => ['href'], 'abbr' => [], 'b' => [], 'blockquote' => ['cite'], 'br' => [],
+        'caption' => [], 'cite' => [], 'code' => [], 'col' => ['span'], 'colgroup' => ['span'],
+        'dd' => [], 'del' => ['cite', 'datetime'], 'div' => [], 'dl' => [], 'dt' => [], 'em' => [],
+        'figcaption' => [], 'figure' => [], 'h1' => [], 'h2' => [], 'h3' => [], 'h4' => [],
+        'h5' => [], 'h6' => [], 'hr' => [], 'i' => [], 'img' => ['src', 'alt', 'width', 'height'],
+        'ins' => ['cite', 'datetime'], 'kbd' => [], 'li' => ['value'], 'mark' => [],
+        'ol' => ['start', 'reversed'], 'p' => [], 'pre' => [], 'q' => ['cite'], 's' => [],
+        'samp' => [], 'small' => [], 'span' => [], 'strong' => [], 'sub' => [], 'sup' => [],
+        'table' => [], 'tbody' => [], 'td' => ['colspan', 'rowspan'], 'tfoot' => [],
+        'th' => ['colspan', 'rowspan', 'scope'], 'thead' => [], 'tr' => [], 'u' => [], 'ul' => [],
+        'var' => [], 'wbr' => [],
+    ];
+
+    /** @var string[] Attributes the safe subset allows on every element. */
+    private const XSS_ORACLE_GLOBAL_ATTRIBUTES = ['title', 'lang', 'dir', 'class'];
+
+    /**
+     * Attributes a browser DEREFERENCES, so a scheme in them is executable rather than prose. The
+     * scheme check applies to these ONLY: title="javascript: the language" is inert text, and
+     * flagging it would be a false alarm that pressures someone into weakening the oracle.
+     *
+     * Wider than the source's own list on purpose — it includes the URL-bearing attributes of
+     * elements the sanitizer must never emit (action/formaction/data/poster/xlink:href/srcdoc), so
+     * that if one ever starts being emitted, the scheme check is already watching it.
+     *
+     * @var string[]
+     */
+    private const XSS_ORACLE_URL_ATTRIBUTES = [
+        'href', 'src', 'cite', 'action', 'formaction', 'xlink:href', 'data', 'background',
+        'poster', 'srcdoc', 'longdesc', 'usemap', 'dynsrc', 'lowsrc',
+    ];
+
+    /**
+     * Schemes that execute or smuggle a document. Checked as a DENY-list on purpose: the source
+     * checks an ALLOW-list of safe schemes, so an oracle sharing that list would rubber-stamp a bug
+     * in it. These two disagree unless the value really is inert.
+     *
+     * @var string[]
+     */
+    private const XSS_ORACLE_DENIED_SCHEMES = ['javascript', 'vbscript', 'data', 'blob', 'file'];
+
+    /**
+     * Names the sanitizer must never emit at the byte level: every raw-text element (whose content
+     * is not parsed as markup, so escaping does not stay escaped) and every foreign-content element
+     * (which switches the parser into XML rules). This is the source's own mXSS soundness argument,
+     * pinned against the serialization.
+     *
+     * @var string[]
+     */
+    private const XSS_ORACLE_NEVER_EMITTED = [
+        'script', 'style', 'iframe', 'object', 'embed', 'svg', 'math', 'template', 'noscript',
+        'noembed', 'noframes', 'xmp', 'base', 'link', 'form', 'input', 'textarea', 'button',
+        'frame', 'frameset', 'applet', 'meta', 'marquee', 'html', 'head', 'body',
+    ];
+
+    /**
+     * Resolves the scheme a BROWSER would see in a URL attribute value, or null if it is relative.
+     *
+     * Entities are decoded (to a fixed point) and every control character and every kind of
+     * whitespace is removed first, because browsers ignore those when resolving a scheme:
+     * "jav&#x09;ascript:" is "jav\tascript:" is javascript:.
+     */
+    private static function xssOracleScheme(string $value): ?string
+    {
+        $probe = $value;
+        for ($i = 0; $i < 3; $i++) {
+            $decoded = html_entity_decode($probe, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            if ($decoded === $probe) {
+                break;
+            }
+            $probe = $decoded;
+        }
+
+        $probe = preg_replace('/[\p{C}\p{Z}\s]+/u', '', $probe);
+        if ($probe === null || $probe === '') {
+            return null;
+        }
+        if (preg_match('/^([a-z][a-z0-9+.\-]*):/i', $probe, $matches)) {
+            return strtolower($matches[1]);
+        }
+
+        return str_starts_with($probe, ':') ? '(empty)' : null;
+    }
+
+    /**
+     * Every reason the given HTML still carries ACTIVE content. Empty array = provably inert.
+     *
+     * TWO INDEPENDENT LAYERS, because either alone is unsound:
+     *
+     *  1. BYTE-LEVEL scan of each tag-like region. Necessary because layer 2's parser is libxml's
+     *     HTML4 parser, which is NOT the HTML5 algorithm a browser runs: libxml silently discards
+     *     "/onerror=alert(1)" from <img/onerror=alert(1) src=x> and drops <body onload=alert(1)>
+     *     whole, while a browser builds the handler in both cases. An oracle that only re-parsed
+     *     would be blind to the exact two bypasses this sanitizer was written to kill. It cannot
+     *     false-positive on escaped text: inert text has no raw "<", so it forms no tag region.
+     *  2. STRUCTURAL re-parse of the output, asserting the resulting tree against the safe subset:
+     *     no element outside the allow-list, no attribute outside it, no on* handler under any
+     *     casing, no denied scheme in a URL attribute — and no attribute smuggled onto <html>/
+     *     <head>/<body>. Necessary because layer 1 only sees shapes it can spell.
+     *
+     * Escaped text ("&lt;script&gt;") is inert by construction and deliberately NOT flagged.
+     *
+     * @return string[]
+     */
+    private static function xssActiveContentFindings(string $html): array
+    {
+        $findings = [];
+
+        // ---- Layer 1: the serialization itself.
+        foreach (self::XSS_ORACLE_NEVER_EMITTED as $tag) {
+            if (stripos($html, '<' . $tag) !== false) {
+                $findings[] = "serialization contains <{$tag}";
+            }
+        }
+
+        preg_match_all('/<[a-zA-Z][^>]*>?/', $html, $tagRegions);
+        foreach ($tagRegions[0] as $region) {
+            if (preg_match('/[\s\/"\'\x00-\x20]on[a-z-]+\s*=/i', $region)) {
+                $findings[] = "tag region carries an event handler: {$region}";
+            }
+
+            $urlAttributes = '/[\s\/"\'](?:href|src|action|formaction|xlink:href|data|cite'
+                . '|poster|background|srcdoc)\s*=\s*("[^"]*"|\'[^\']*\'|[^\s>]+)/i';
+            if (preg_match_all($urlAttributes, $region, $matches)) {
+                foreach ($matches[1] as $rawValue) {
+                    $scheme = self::xssOracleScheme(trim($rawValue, "\"'"));
+                    if ($scheme !== null && in_array($scheme, self::XSS_ORACLE_DENIED_SCHEMES, true)) {
+                        $findings[] = "tag region carries the {$scheme}: scheme: {$region}";
+                    }
+                }
+            }
+        }
+
+        // ---- Layer 2: the tree a parser actually builds from that serialization.
+        $document = new \DOMDocument();
+        $previousErrorMode = libxml_use_internal_errors(true);
+        $loaded = $document->loadHTML(
+            '<html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8" '
+            . 'data-oracle-wrapper="1"></head><body>' . $html . '</body></html>',
+            LIBXML_NONET | LIBXML_NOERROR | LIBXML_NOWARNING
+        );
+        libxml_clear_errors();
+        libxml_use_internal_errors($previousErrorMode);
+
+        if (!$loaded || $document->documentElement === null) {
+            $findings[] = 'the sanitizer output could not be re-parsed';
+
+            return array_values(array_unique($findings));
+        }
+
+        $walk = static function (\DOMNode $node) use (&$walk, &$findings): void {
+            if ($node instanceof \DOMElement) {
+                // The wrapper's own <meta>, not something the sanitizer emitted.
+                if ($node->hasAttribute('data-oracle-wrapper')) {
+                    return;
+                }
+
+                $tag = strtolower($node->nodeName);
+                $isWrapper = in_array($tag, ['html', 'head', 'body'], true);
+
+                if (!$isWrapper && !array_key_exists($tag, self::XSS_ORACLE_ELEMENTS)) {
+                    $findings[] = "element <{$tag}> is outside the allow-list";
+                }
+
+                foreach ($node->attributes as $attribute) {
+                    $name = strtolower($attribute->nodeName);
+
+                    if (str_starts_with($name, 'on')) {
+                        $findings[] = "event-handler attribute {$tag}[{$name}]";
+                        continue;
+                    }
+                    // The wrappers are ours and carry no attributes: anything here was smuggled in.
+                    if ($isWrapper) {
+                        $findings[] = "attribute {$name} was smuggled onto <{$tag}>";
+                        continue;
+                    }
+
+                    $allowed = array_merge(
+                        self::XSS_ORACLE_GLOBAL_ATTRIBUTES,
+                        self::XSS_ORACLE_ELEMENTS[$tag] ?? []
+                    );
+                    if (!in_array($name, $allowed, true)) {
+                        $findings[] = "attribute {$tag}[{$name}] is outside the allow-list";
+                    }
+
+                    if (in_array($name, self::XSS_ORACLE_URL_ATTRIBUTES, true)) {
+                        $scheme = self::xssOracleScheme($attribute->nodeValue ?? '');
+                        if ($scheme !== null && in_array($scheme, self::XSS_ORACLE_DENIED_SCHEMES, true)) {
+                            $findings[] = "attribute {$tag}[{$name}] resolves to the {$scheme}: scheme";
+                        }
+                    }
+                }
+            }
+
+            foreach ($node->childNodes as $child) {
+                $walk($child);
+            }
+        };
+        $walk($document->documentElement);
+
+        return array_values(array_unique($findings));
+    }
+
+    /**
+     * Asserts the sanitizer's output is provably inert — see xssActiveContentFindings().
+     *
+     * This REPLACES an oracle that searched the output for a handful of literal substrings
+     * ("<script", "javascript:", a \son[a-z]+= regex). That oracle was unsound in both directions:
+     * a live payload could avoid every substring it looked for, and 6 of the 39 battery cases
+     * passed against a sanitizer whose body had been DELETED — they asserted nothing.
      */
     private function assertNoActiveContent(string $cleaned, string $payload): void
     {
-        $this->assertDoesNotMatchRegularExpression(
-            '/\son[a-z]+\s*=/i',
-            $cleaned,
-            "Event handler survived for payload: {$payload}"
+        $findings = self::xssActiveContentFindings($cleaned);
+
+        $this->assertSame(
+            [],
+            $findings,
+            "Active content survived for payload: {$payload}\n"
+            . "  sanitized output: {$cleaned}\n"
+            . '  findings: ' . implode("\n            ", $findings)
         );
+    }
 
-        foreach (['javascript:', 'vbscript:', 'data:', '-moz-binding'] as $scheme) {
-            $this->assertStringNotContainsStringIgnoringCase(
-                $scheme,
-                $cleaned,
-                "Scheme {$scheme} survived for payload: {$payload}"
-            );
-        }
+    /**
+     * The oracle above is the foundation every other XSS test rests on, so it gets its own test: an
+     * oracle that cannot fail proves nothing. Each payload is fed to it RAW — exactly what a
+     * sanitizer whose body was deleted would return — and the oracle must reject every one.
+     *
+     * Without this, a weakened assertNoActiveContent() (the defect this replaced) is invisible:
+     * the battery goes green either way.
+     */
+    #[DataProvider('xssBypassPayloadProvider')]
+    public function testTheOracleItselfRejectsEveryUnsanitizedPayload(string $payload): void
+    {
+        $this->assertNotSame(
+            [],
+            self::xssActiveContentFindings($payload),
+            "The XSS oracle found nothing wrong with a RAW, unsanitized payload, so it would not "
+            . "notice if the sanitizer stopped working: {$payload}"
+        );
+    }
 
-        foreach (['<script', '<svg', '<math', '<iframe', '<object', '<embed', '<style',
-                  '<form', '<input', '<template', '<noscript', '<xmp', '<base', '<link'] as $tag) {
-            $this->assertStringNotContainsStringIgnoringCase(
-                $tag,
-                $cleaned,
-                "Element {$tag} survived for payload: {$payload}"
-            );
-        }
+    /** The flip side: an oracle that flags everything is equally useless. Benign output must pass. */
+    #[DataProvider('inertHtmlProvider')]
+    public function testTheOracleAcceptsInertOutput(string $inert): void
+    {
+        $this->assertSame([], self::xssActiveContentFindings($inert), "False positive on: {$inert}");
+    }
+
+    public static function inertHtmlProvider(): array
+    {
+        return array_map(static fn ($h) => [$h], [
+            '<a href="http://ok.example/path?q=1">good</a>',
+            '<a href="mailto:a@b.example">mail</a>',
+            '<a href="/relative/page#frag">rel</a>',
+            '<a href="tel:+5511999">call</a>',
+            '<b>bold</b> and <i>italic</i>',
+            '<p title="hi">t</p>',
+            '<ul><li>a</li><li>b</li></ul>',
+            'café ☕ <b>x</b>',
+            'Sodium hydroxide 4%',
+            // Inert TEXT that merely mentions the dangerous shapes: escaped, so not a tag region.
+            'a &lt; b &amp;&amp; c &gt; d',
+            'talk about onerror=x and javascript: in plain text',
+            '&lt;script&gt;alert(1)&lt;/script&gt;',
+            '<del cite="http://x.example" datetime="2020-01-01">d</del>',
+            '<img src="http://x.example/a.png" alt="data: is fine in prose" width="2" />',
+            '<table><tbody><tr><td colspan="2">c</td></tr></tbody></table>',
+        ]);
     }
 
     /**
@@ -1234,10 +1488,15 @@ final class SecurityTest extends TestCase
     public static function xssBypassPayloadProvider(): array
     {
         return array_map(static fn ($p) => [$p], [
-            // Separator tricks that defeated the on*-attribute regex.
+            // Separator tricks that defeated the on*-attribute regex. The CR, LF, TAB and FF cases
+            // are DOUBLE-QUOTED: in single quotes "\r" is a backslash and an "r", which is a
+            // different (and harmless) payload — the separator class would go untested.
             '<svg/onload=alert(1)>',
             '<img/onerror=alert(1) src=x>',
-            '<img\ronerror=alert(1) src=x>',
+            "<img\ronerror=alert(1) src=x>",
+            "<img\nonerror=alert(1) src=x>",
+            "<img\tonerror=alert(1) src=x>",
+            "<img\x0conerror=alert(1) src=x>",
             '<svg onload=alert(1)>',
             '<img src=x onerror=alert(1)>',
             '<img src=x OnErRoR=alert(1)>',
@@ -1522,4 +1781,467 @@ final class SecurityTest extends TestCase
 
         $this->assertSame('x', $filtered);
     }
+
+    // ---------------------------------------------------------------------------------------
+    // The object walk: Traversable containers, enums, readonly properties
+    //
+    // `foreach ($object as $k => $v)` dispatches to the ITERATOR on any Traversable, so writing
+    // back with `$object->$k = ...` created a PHANTOM DYNAMIC property while the real storage kept
+    // the live payload. Every test below reads the container the way the container is actually
+    // read — offsetGet — because that is where the payload survived.
+    // ---------------------------------------------------------------------------------------
+
+    /** The live payload used across the container tests. */
+    private const XSS_LIVE_PAYLOAD = '<img src=x onerror=alert(1)>';
+
+    public function testXssCleanSanitizesArrayObjectStorageNotAPhantomProperty(): void
+    {
+        $subject = new \ArrayObject(['bio' => self::XSS_LIVE_PAYLOAD]);
+
+        $cleaned = Security::xssCleanRecursive($subject);
+
+        $this->assertSame($subject, $cleaned, 'The same instance must come back.');
+        // offsetGet is the ONLY way an ArrayObject is read. Before the fix this still held the
+        // live payload while a sanitized copy hid in an unreachable dynamic property.
+        $this->assertNoActiveContent($cleaned['bio'], self::XSS_LIVE_PAYLOAD);
+        $this->assertSame(
+            [],
+            get_object_vars($subject),
+            'Sanitizing must not invent a dynamic property that shadows the real storage.'
+        );
+    }
+
+    public function testXssCleanSanitizesArrayIteratorStorage(): void
+    {
+        $subject = new \ArrayIterator(['bio' => self::XSS_LIVE_PAYLOAD]);
+
+        $cleaned = Security::xssCleanRecursive($subject);
+
+        $this->assertNoActiveContent($cleaned['bio'], self::XSS_LIVE_PAYLOAD);
+    }
+
+    public function testXssCleanSanitizesNestedArrayObjectStorage(): void
+    {
+        $subject = new \ArrayObject(['profile' => new \ArrayObject(['bio' => self::XSS_LIVE_PAYLOAD])]);
+
+        $cleaned = Security::xssCleanRecursive($subject);
+
+        $this->assertNoActiveContent($cleaned['profile']['bio'], self::XSS_LIVE_PAYLOAD);
+    }
+
+    public function testXssCleanSanitizesAnArrayAccessCollectionsStorageAndPublicProperties(): void
+    {
+        $subject = new SecurityTestCollection(['bio' => self::XSS_LIVE_PAYLOAD]);
+        $subject->label = self::XSS_LIVE_PAYLOAD;
+
+        $cleaned = Security::xssCleanRecursive($subject);
+
+        $this->assertNoActiveContent($cleaned['bio'], self::XSS_LIVE_PAYLOAD);
+        $this->assertNoActiveContent($cleaned->label, self::XSS_LIVE_PAYLOAD);
+    }
+
+    public function testXssCleanWalksTheDeclaredPublicPropertiesOfAnIteratorAggregate(): void
+    {
+        // A custom iterator must NOT be able to steer the walk: this one yields keys that do not
+        // exist as properties, which is exactly how the phantom-property bug was born.
+        $subject = new SecurityTestLyingIteratorAggregate();
+        $subject->bio = self::XSS_LIVE_PAYLOAD;
+
+        $cleaned = Security::xssCleanRecursive($subject);
+
+        $this->assertNoActiveContent($cleaned->bio, self::XSS_LIVE_PAYLOAD);
+        $this->assertObjectNotHasProperty(
+            'ghost',
+            $cleaned,
+            'The walk must follow public properties, not whatever the iterator invents.'
+        );
+    }
+
+    public function testXssCleanReturnsAnEnumUntouchedInsteadOfRaisingAnError(): void
+    {
+        // Writing to an enum's readonly $name/$value is an \Error, and an \Error is not caught by
+        // the `catch (\Exception)` a caller is told to write. It used to blow up here.
+        $this->assertSame(SecurityTestSuit::Hearts, Security::xssCleanRecursive(SecurityTestSuit::Hearts));
+        $this->assertSame(SecurityTestSuit::Hearts->value, 'H');
+
+        $wrapper = new \stdClass();
+        $wrapper->suit = SecurityTestSuit::Hearts;
+        $wrapper->bio = self::XSS_LIVE_PAYLOAD;
+
+        $cleaned = Security::xssCleanRecursive($wrapper);
+
+        $this->assertSame(SecurityTestSuit::Hearts, $cleaned->suit, 'An enum leaf must survive the walk.');
+        $this->assertNoActiveContent($cleaned->bio, self::XSS_LIVE_PAYLOAD);
+    }
+
+    public function testXssCleanSkipsReadonlyPropertiesInsteadOfRaisingAnError(): void
+    {
+        $subject = new SecurityTestReadonly('<b>frozen</b>', self::XSS_LIVE_PAYLOAD);
+
+        $cleaned = Security::xssCleanRecursive($subject);
+
+        // Documented limit: a readonly property cannot be rewritten in place, so it is skipped —
+        // but its presence must never abort the walk of the writable ones.
+        $this->assertSame('<b>frozen</b>', $cleaned->frozen);
+        $this->assertNoActiveContent($cleaned->mutable, self::XSS_LIVE_PAYLOAD);
+    }
+
+    public function testXssCleanLeavesSplObjectStorageAloneInsteadOfRaisingATypeError(): void
+    {
+        // SplObjectStorage is ArrayAccess, but its offsets are OBJECTS while iteration yields
+        // integer positions: writing back by iteration key is a TypeError. Documented as not walked.
+        $storage = new \SplObjectStorage();
+        $storage->attach(new \stdClass(), self::XSS_LIVE_PAYLOAD);
+
+        $this->assertSame($storage, Security::xssCleanRecursive($storage));
+    }
+
+    public function testFilterValueSanitizesArrayObjectStorage(): void
+    {
+        // REGRESSION GUARD: dbec4a5 wrote `$value[$k] = ...` and got this right; pass 1 changed it
+        // to `$value->$k = ...` to fix stdClass and broke every ArrayAccess+Traversable object.
+        $subject = new \ArrayObject(['bio' => self::XSS_LIVE_PAYLOAD]);
+
+        $filtered = Security::filterValue($subject, null, null, false, true);
+
+        $this->assertNoActiveContent($filtered['bio'], self::XSS_LIVE_PAYLOAD);
+        $this->assertSame([], get_object_vars($subject));
+    }
+
+    public function testFilterValueStillRewritesPlainObjectPropertiesInPlace(): void
+    {
+        // The stdClass case pass 1 was trying to fix must keep working.
+        $subject = new \stdClass();
+        $subject->a = '  x  ';
+
+        $filtered = Security::filterValue($subject, null, null, false, false, false, false, false, false, true);
+
+        $this->assertSame($subject, $filtered);
+        $this->assertSame('x', $subject->a);
+    }
+
+    public function testFilterValueDoesNotRaiseOnAnEnumOrReadonlyProperty(): void
+    {
+        $subject = new \stdClass();
+        $subject->suit = SecurityTestSuit::Hearts;
+        $subject->frozen = new SecurityTestReadonly('  keep  ', '  x  ');
+
+        Security::filterValue($subject, null, null, false, false, false, false, false, false, true);
+
+        $this->assertSame(SecurityTestSuit::Hearts, $subject->suit);
+        $this->assertSame('  keep  ', $subject->frozen->frozen, 'readonly is skipped, not rewritten.');
+        $this->assertSame('x', $subject->frozen->mutable);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Array keys are documented as NOT walked
+    // ---------------------------------------------------------------------------------------
+
+    public function testXssCleanLeavesArrayKeysByteForByteIntact(): void
+    {
+        // Pinning the DOCUMENTED limit, not endorsing it: sanitizing keys could collide two
+        // entries into one and silently drop data, so keys are left alone and the docblock says
+        // so. This test exists so the limit cannot change without a reviewer seeing it.
+        $cleaned = Security::xssCleanRecursive([self::XSS_LIVE_PAYLOAD => 'value']);
+
+        $this->assertSame([self::XSS_LIVE_PAYLOAD], array_keys($cleaned));
+        $this->assertSame('value', $cleaned[self::XSS_LIVE_PAYLOAD]);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Depth: libxml truncates silently, the sanitizer must not
+    // ---------------------------------------------------------------------------------------
+
+    public function testXssCleanKeepsContentNestedAtTheLibxmlDepthLimit(): void
+    {
+        $html = str_repeat('<div>', 255) . 'DEEP' . str_repeat('</div>', 255);
+
+        $this->assertStringContainsString('DEEP', Security::xssCleanRecursive($html));
+    }
+
+    public function testXssCleanFailsClosedInsteadOfSilentlyTruncatingTooDeepHtml(): void
+    {
+        // libxml records a level-3 fatal ("Excessive depth in document: 256") but loadHTML() STILL
+        // returns true, so the !$loaded guard never fired and everything past depth 255 was
+        // silently DISCARDED. Now it falls back to escaping: markup dies, content survives, and
+        // nothing executes.
+        foreach ([256, 300] as $depth) {
+            $html = str_repeat('<div>', $depth) . 'DEEP' . str_repeat('</div>', $depth);
+
+            $cleaned = Security::xssCleanRecursive($html);
+
+            $this->assertStringContainsString('DEEP', $cleaned, "Content at depth {$depth} must not vanish.");
+            $this->assertStringNotContainsString('<div>', $cleaned, 'The fallback escapes rather than emits markup.');
+        }
+    }
+
+    public function testXssCleanStillSanitizesInputThatOnlyRaisesNonFatalLibxmlErrors(): void
+    {
+        // Guard against over-reacting: hostile-but-parseable markup raises level-2 libxml ERRORS
+        // (`<svg/onload=1>`, mismatched tags, a raw `&`). Failing closed on those would escape
+        // almost every real input and destroy the allow-list.
+        $this->assertNoActiveContent(Security::xssCleanRecursive('<svg/onload=alert(1)>'), '<svg/onload=alert(1)>');
+        // Mismatched nesting: libxml repairs the tree and the allow-list rebuilds it, still markup.
+        $this->assertSame('<b><i>x</i></b>', Security::xssCleanRecursive('<b><i>x</b></i>'));
+        $this->assertSame('a &amp; b', Security::xssCleanRecursive('a & b'));
+    }
+
+    public function testXssCleanIgnoresLibxmlErrorsQueuedByTheCallerBeforeTheCall(): void
+    {
+        // libxml's error queue is PROCESS-WIDE. A caller who left a fatal queued from their own
+        // unrelated parse must not make this sanitizer attribute it to our input and escape every
+        // valid value from then on. Only errors raised by our own loadHTML() may be judged.
+        $previousMode = libxml_use_internal_errors(true);
+
+        try {
+            $foreign = new \DOMDocument();
+            $foreign->loadHTML(
+                str_repeat('<div>', 300) . 'x' . str_repeat('</div>', 300),
+                LIBXML_NOERROR | LIBXML_NOWARNING
+            );
+            $this->assertNotEmpty(libxml_get_errors(), 'Precondition: the caller has a fatal queued.');
+
+            $this->assertSame('<b>bold</b>', Security::xssCleanRecursive('<b>bold</b>'));
+        } finally {
+            libxml_clear_errors();
+            libxml_use_internal_errors($previousMode);
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // decryptFileV2: a crafted zero-length block must not escape the documented contract
+    // ---------------------------------------------------------------------------------------
+
+    /** Splits a V2 file into its raw "{len}-{payload}" block spans. */
+    private static function v2BlockSpans(string $raw): array
+    {
+        $spans = [];
+        $i = 0;
+        while ($i < strlen($raw)) {
+            $dash = strpos($raw, '-', $i);
+            if ($dash === false) {
+                break;
+            }
+            $len = (int) substr($raw, $i, $dash - $i);
+            $spans[] = [$i, $dash + 1 + $len];
+            $i = $dash + 1 + $len;
+        }
+
+        return $spans;
+    }
+
+    public function testDecryptFileV2ThrowsAndRollsBackOnACraftedZeroLengthBlock(): void
+    {
+        $source = $this->tempPath('plain');
+        file_put_contents($source, 'HELLO WORLD SECRET');
+
+        $encrypted = Security::encryptFileV2($source, self::masterKey(), $this->tempPath('enc'));
+        $raw = file_get_contents($encrypted);
+
+        // Header is 4 blocks; the first data triple is blocks 4..6. Keep them, then splice in a
+        // zero-length block: fread($fp, 0) raises a ValueError — an \Error, NOT an \Exception — so
+        // it escaped the catch AND skipped the rollback, stranding the first block's decrypted
+        // plaintext on disk.
+        $spans = self::v2BlockSpans($raw);
+        $crafted = $this->tempPath('crafted');
+        file_put_contents($crafted, substr($raw, 0, $spans[6][1]) . '0-');
+
+        $destination = $this->tempPath('out');
+
+        try {
+            Security::decryptFileV2($crafted, self::masterKey(), $destination);
+            $this->fail('A crafted zero-length block must not decrypt.');
+        } catch (\Exception $e) {
+            $this->assertStringContainsString('Error on reading IV ciphertext', $e->getMessage());
+        }
+
+        clearstatcache(true, $destination);
+        $this->assertFileDoesNotExist(
+            $destination,
+            'The rollback must run: unauthenticated plaintext may never survive a failure.'
+        );
+    }
+
+    public function testDecryptFileV2RejectsAZeroLengthHeaderBlock(): void
+    {
+        $crafted = $this->tempPath('crafted');
+        file_put_contents($crafted, '0-');
+
+        $this->expectException(\Exception::class);
+        Security::decryptFileV2($crafted, self::masterKey(), $this->tempPath('out'));
+    }
+
+    public function testDecryptFileV2RollsBackToTheEntryLengthOnACraftedBlockInAppendMode(): void
+    {
+        $source = $this->tempPath('plain');
+        file_put_contents($source, 'PART TWO PAYLOAD');
+
+        $encrypted = Security::encryptFileV2($source, self::masterKey(), $this->tempPath('enc'));
+        $raw = file_get_contents($encrypted);
+        $spans = self::v2BlockSpans($raw);
+
+        $crafted = $this->tempPath('crafted');
+        file_put_contents($crafted, substr($raw, 0, $spans[6][1]) . '0-');
+
+        // A part an earlier successful call already appended: it belongs to the caller and must
+        // survive a bad part untouched.
+        $destination = $this->tempPath('out');
+        file_put_contents($destination, 'PART ONE;');
+
+        try {
+            Security::decryptFileV2($crafted, self::masterKey(), $destination, null, 'a');
+            $this->fail('A crafted zero-length block must not decrypt.');
+        } catch (\Exception $e) {
+            // expected
+        }
+
+        $this->assertSame('PART ONE;', file_get_contents($destination));
+    }
+
+    public function testDecryptFileV2LeavesAnExistingDestinationAloneWhenItFailsBeforeOpeningIt(): void
+    {
+        // The rollback may only undo what this call did. A failure raised before the destination
+        // is ever opened has written nothing, so deleting the caller's file would be pure data
+        // destruction — and routing the key rejection through the rollback made that a live bug.
+        $source = $this->tempPath('plain');
+        file_put_contents($source, 'DATA');
+        $encrypted = Security::encryptFileV2($source, self::masterKey(), $this->tempPath('enc'));
+
+        $destination = $this->tempPath('precious');
+
+        // (a) a key deriveKey rejects, before the destination is opened
+        file_put_contents($destination, 'PRECIOUS');
+        try {
+            Security::decryptFileV2($encrypted, str_repeat('k', 31), $destination);
+            $this->fail('A short key must be rejected.');
+        } catch (\Exception $e) {
+            // expected
+        }
+        $this->assertSame('PRECIOUS', @file_get_contents($destination), 'Short key must not delete the destination.');
+
+        // (b) a source whose header does not match, also before the destination is opened
+        $junk = $this->tempPath('junk');
+        file_put_contents($junk, '12-QUJDREVGRw==');
+        file_put_contents($destination, 'PRECIOUS');
+        try {
+            Security::decryptFileV2($junk, self::masterKey(), $destination);
+            $this->fail('A bad header must be rejected.');
+        } catch (\Exception $e) {
+            // expected
+        }
+        $this->assertSame('PRECIOUS', @file_get_contents($destination), 'Bad header must not delete the destination.');
+    }
+
+    public function testDecryptFileV2StillDeletesADestinationItTruncatedItself(): void
+    {
+        // The counterpart: once we HAVE opened (and so truncated) the destination, its old content
+        // is already gone and unauthenticated plaintext must not survive — it gets deleted.
+        $source = $this->tempPath('plain');
+        file_put_contents($source, 'HELLO WORLD SECRET');
+        $encrypted = Security::encryptFileV2($source, self::masterKey(), $this->tempPath('enc'));
+
+        // Truncate away the authenticated end marker: this fails AFTER data blocks are written.
+        $raw = file_get_contents($encrypted);
+        $spans = self::v2BlockSpans($raw);
+        $truncated = $this->tempPath('trunc');
+        file_put_contents($truncated, substr($raw, 0, $spans[6][1]));
+
+        $destination = $this->tempPath('out');
+        file_put_contents($destination, 'OLD');
+
+        try {
+            Security::decryptFileV2($truncated, self::masterKey(), $destination);
+            $this->fail('A truncated file must not decrypt.');
+        } catch (\Exception $e) {
+            $this->assertStringContainsString('truncated', $e->getMessage());
+        }
+
+        clearstatcache(true, $destination);
+        $this->assertFileDoesNotExist($destination);
+    }
+
+    public function testDecryptFileV2StillRoundTripsAfterTheZeroLengthGuard(): void
+    {
+        // The guard rejects "0-", which writeLengthEncodedBlock never emits. Prove the legitimate
+        // path is untouched, including a file whose size is an exact multiple of the block size.
+        Security::setFileEncryptBlocksBytes(16);
+        try {
+            $payload = str_repeat('A', 32);
+            $source = $this->tempPath('plain');
+            file_put_contents($source, $payload);
+
+            $encrypted = Security::encryptFileV2($source, self::masterKey(), $this->tempPath('enc'));
+            $decrypted = Security::decryptFileV2($encrypted, self::masterKey(), $this->tempPath('out'));
+
+            $this->assertSame($payload, file_get_contents($decrypted));
+        } finally {
+            Security::setFileEncryptBlocksBytes(null);
+        }
+    }
+}
+
+/** An ArrayAccess+Traversable collection with its own storage AND a public property. */
+final class SecurityTestCollection implements \ArrayAccess, \IteratorAggregate
+{
+    public string $label = '';
+
+    public function __construct(private array $items = [])
+    {
+    }
+
+    public function getIterator(): \Traversable
+    {
+        return new \ArrayIterator($this->items);
+    }
+
+    public function offsetExists(mixed $offset): bool
+    {
+        return isset($this->items[$offset]);
+    }
+
+    #[\ReturnTypeWillChange]
+    public function offsetGet(mixed $offset): mixed
+    {
+        return $this->items[$offset] ?? null;
+    }
+
+    public function offsetSet(mixed $offset, mixed $value): void
+    {
+        if ($offset === null) {
+            $this->items[] = $value;
+
+            return;
+        }
+        $this->items[$offset] = $value;
+    }
+
+    public function offsetUnset(mixed $offset): void
+    {
+        unset($this->items[$offset]);
+    }
+}
+
+/** Traversable but NOT ArrayAccess, and its iterator yields a key that is not a property. */
+final class SecurityTestLyingIteratorAggregate implements \IteratorAggregate
+{
+    public string $bio = '';
+
+    public function getIterator(): \Traversable
+    {
+        return new \ArrayIterator(['ghost' => 'not-a-property']);
+    }
+}
+
+/** A public readonly property alongside a writable one. */
+final class SecurityTestReadonly
+{
+    public function __construct(public readonly string $frozen, public string $mutable)
+    {
+    }
+}
+
+enum SecurityTestSuit: string
+{
+    case Hearts = 'H';
+    case Spades = 'S';
 }

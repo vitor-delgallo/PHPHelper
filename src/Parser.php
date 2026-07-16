@@ -436,11 +436,25 @@ class Parser {
      *  - numeric zero in any form: 0, 0.0, -0, '0', '0.0', '00', '0e0' (leading/trailing spaces ok);
      *  - null, '' and "\0";
      *  - the empty array [] and an object with no properties;
-     *  - these words, case-insensitively and ignoring surrounding spaces: 'false', 'null',
-     *    'undefined', 'no', 'n', 'tno', '{}', '[]'.
+     *  - these words, case-insensitively and with EVERY whitespace character removed first — not
+     *    merely trimmed: 'false', 'null', 'undefined', 'no', 'n', 'tno', '{}', '[]'.
      *
      * TRUE is returned for everything else, including 'true', 'yes', any non-zero number, any
      * non-empty array/object, and any other non-empty string.
+     *
+     * READ THAT WHITESPACE RULE LITERALLY, because it is surprising and it is not a typo: the
+     * sentinel comparison strips INTERNAL whitespace too, so 'fa lse', 'n o', 'F A L S E' and
+     * '{ }' are all FALSE, and only a string that collapses to something OTHER than a sentinel
+     * stays TRUE. A user who fat-fingers a space into the middle of a word gets the word's
+     * meaning, not the garbage-is-truthy fallback you would expect. Do not rely on this to
+     * sanitise anything.
+     *
+     * This is deliberate rather than merely tolerated. The normalisation lives in
+     * Validator::isCompletelyEmpty(), which also backs Security's `asBoolean` sanitize option, so
+     * a submitted string MUST mean the same thing through both doors. Loosening it here — and only
+     * here — would fork the two: 'n o' would be a flag that reads false when parsed and true when
+     * sanitised, which is a far nastier defect than a boolean parser being generous about spaces.
+     * Change it in isCompletelyEmpty() for both callers, or not at all.
      *
      * An object implementing __toString() is judged by its string value (so a wrapper around 'no' is
      * FALSE); any other object is judged only on whether it has properties.

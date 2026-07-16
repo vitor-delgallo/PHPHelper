@@ -329,6 +329,15 @@ class Str {
      * bits): it is a last resort for exotic hosts, not a source of secrets. When you need an
      * unguessable value, verify openssl is present or use random_bytes() directly.
      *
+     * NO PATH HAS A GLOBAL SIDE EFFECT. The fallback draws one rand() — which PHP 7.1+ aliases to
+     * mt_rand() — so it advances the process-global Mt19937, but it does NOT reseed it. (It used
+     * to: `mt_srand((int)(microtime(true) * 10000))`. That handed the global generator a seed with
+     * roughly 14 bits of real entropy, derived from the clock, which made every subsequent
+     * rand()/shuffle()/str_shuffle() ANYWHERE in the process reconstructible by anyone who knew
+     * roughly when the call happened — a library silently sabotaging its host's randomness. It
+     * bought nothing: PHP seeds Mt19937 from a secure source on first use, so seeding it by hand
+     * could only ever make it worse.)
+     *
      * $trim is honored identically on all three paths.
      *
      * @param bool $trim If true (default), returns the GUID bare: "xxxxxxxx-xxxx-...-xxxxxxxxxxxx".
@@ -355,7 +364,23 @@ class Str {
         }
 
         // Fallback (PHP 4.2+)
-        mt_srand((int)(microtime(true) * 10000));
+        return self::generateGuidFallback($trim);
+    }
+
+    /**
+     * Builds a GUID-shaped string without com_create_guid or openssl — the last-resort path of
+     * generateGuid(), extracted so it is reachable and testable on hosts where openssl exists.
+     *
+     * NOT cryptographically secure and NOT an RFC 4122 version-4 UUID (no version/variant bits):
+     * it is md5(uniqid(rand(), true)), which is clock-dominated and guessable. Never use it for a
+     * secret. It is well-formed and collision-resistant enough to identify a row, nothing more.
+     *
+     * Deliberately free of global side effects: it does NOT call mt_srand(). See generateGuid().
+     *
+     * @param bool $trim True for a bare GUID, false to wrap it in curly braces.
+     * @return string 36 characters bare, 38 with braces.
+     */
+    private static function generateGuidFallback(bool $trim): string {
         $charId = Str::strToLower(md5(uniqid((string)rand(), true)));
         $hyphen = '-';
         $leftBrace = $trim ? '' : '{';

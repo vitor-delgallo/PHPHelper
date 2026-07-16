@@ -71,15 +71,10 @@ class Mailer {
      *                    unreadable or non-existent path, or a path that resolves OUTSIDE the base
      *                    directory — is left in the body EXACTLY as the caller wrote it: nothing is
      *                    read, nothing is attached, and the send does not fail.
+     *                    Tag detection understands quoted attributes, so a '>' inside src="…"/alt="…"
+     *                    does not truncate the tag. If the scan itself fails (a PCRE limit), NOTHING
+     *                    is embedded and the body is sent exactly as resolved — never emptied.
      *                    Requires $embeddedImagesBaseDir; see there.
-     * @param string|null $embeddedImagesBaseDir The ONLY directory an embedded <img> src is allowed
-     *                    to resolve to. REQUIRED when $useEmbeddedImages is TRUE: if it is null,
-     *                    blank, or not an existing directory, the send returns FALSE without
-     *                    sending, because "attach whatever the body points at" is not an offer this
-     *                    function makes. Containment is enforced AFTER realpath(), so neither ../
-     *                    nor a symlink can escape the allow-list — a src is only ever read when the
-     *                    file it truly resolves to lies under this directory. Ignored entirely when
-     *                    $useEmbeddedImages is FALSE.
      * @param string $charset Charset (default: UTF-8)
      * @param bool $useAuth Whether to authenticate with $configs['user'] / $configs['pass'].
      *                      Governs the CREDENTIALS ONLY — 'host', 'port' and 'secure' are applied
@@ -91,6 +86,19 @@ class Mailer {
      * @param bool $debugMode Enable debug output. Also passed to the $template view. NOTE: the
      *                        SMTP conversation is printed to STDOUT (PHPMailer's default), so this
      *                        must stay FALSE outside a console.
+     * @param string|null $embeddedImagesBaseDir The ONLY directory an embedded <img> src is allowed
+     *                    to resolve to. REQUIRED when $useEmbeddedImages is TRUE: if it is null,
+     *                    blank, or not an existing directory, the send returns FALSE without
+     *                    sending, because "attach whatever the body points at" is not an offer this
+     *                    function makes. Containment is enforced AFTER realpath(), so neither ../
+     *                    nor a symlink can escape the allow-list — a src is only ever read when the
+     *                    file it truly resolves to lies under this directory. Ignored entirely when
+     *                    $useEmbeddedImages is FALSE.
+     *                    It sits LAST, away from the $useEmbeddedImages it belongs to, on purpose: a
+     *                    new parameter gets APPENDED. Slotting it next to its partner would have
+     *                    shifted $charset/$useAuth/$isSMTP/$debugMode one place right for every
+     *                    positional caller — a silent miscompile of working code, which is too high
+     *                    a price for reading nicely in the signature.
      *
      * @return bool TRUE on success. FALSE on a missing/invalid $configs key (including a 'secure'
      *              outside {'tls','ssl','none'}), on $useEmbeddedImages without a usable
@@ -121,11 +129,11 @@ class Mailer {
         ?string $template = null,
         bool $confirm = false,
         bool $useEmbeddedImages = false,
-        ?string $embeddedImagesBaseDir = null,
         string $charset = 'UTF-8',
         bool $useAuth = true,
         bool $isSMTP = true,
-        bool $debugMode = false
+        bool $debugMode = false,
+        ?string $embeddedImagesBaseDir = null
     ): bool {
         if (!class_exists(\PHPMailer\PHPMailer\PHPMailer::class)) {
             return false;
@@ -335,55 +343,75 @@ class Mailer {
 
             $mail->Body = $params['template'];
             if($params['useEmbeddedImages']){
-                // The quantifier is LAZY: a greedy `[\w\W]{0,}` swallowed everything from the first
-                // `<img` to the last `>`, so a two-image body collapsed into a single match and the
-                // text between the images was silently deleted from the message.
-                $imgRegex = '/<img([\w\W]*?)\/{0,1}>/i';
+                // Each alternative is mutually exclusive on its first character, so at any position
+                // exactly one can match: the loop is deterministic and the possessive `*+` forbids
+                // it from ever giving anything back. That is what makes this LINEAR.
+                //
+                // Both of its predecessors shipped a broken body, in opposite directions: greedy
+                // `[\w\W]{0,}` ran from the first `<img` to the LAST `>`, eating the text between
+                // two images; the lazy `[\w\W]*?` that replaced it expanded one character at a time,
+                // and each step costs a backtrack — so a single ~500KB inline base64 logo exhausted
+                // pcre.backtrack_limit (1M), both preg_ calls below returned FALSE, and the message
+                // went out EMPTY.
+                //
+                // Recognising `"…"`/`'…'` as units is also what keeps a '>' inside an attribute
+                // (alt="a > b") from truncating the tag and leaking the remainder into the body.
+                $imgRegex = '/<img(?:[^>"\']|"[^"]*"|\'[^\']*\')*+>/i';
 
-                $mail->Body = "";
-                preg_match_all($imgRegex, $params['template'], $imgsBody);
                 // Split into a LOCAL var: $params['template'] must stay a string for AltBody below.
-                $bodyParts = preg_split($imgRegex, $params['template']);
+                $imgsBody  = [];
+                $matched   = preg_match_all($imgRegex, $params['template'], $imgsBody);
+                $bodyParts = $matched === false ? false : preg_split($imgRegex, $params['template']);
 
-                foreach ($bodyParts AS $keyPart => $partString){
-                    $mail->Body .= $partString;
+                // A preg_ function reports failure by RETURNING FALSE, quietly. Unchecked, that
+                // false reached `foreach (false)` while Body had already been blanked — the empty
+                // email above. Body is therefore blanked only once the scan is known to have
+                // worked, and a failed scan simply embeds nothing: the resolved body still ships
+                // intact, with its <img> tags exactly as the caller wrote them. That is the same
+                // outcome this function already documents for every image it cannot embed.
+                if($matched !== false && $bodyParts !== false){
+                    $mail->Body = "";
+                    foreach ($bodyParts AS $keyPart => $partString){
+                        $mail->Body .= $partString;
 
-                    // $imgsBody[0] is the list of whole <img> matches; $imgsBody[1] is capture
-                    // group 1. Indexing the OUTER array by the part number handed an ARRAY to
-                    // getImageSrc(string) — an uncatchable-here TypeError on any body with an
-                    // image. preg_split also yields one more part than there are tags, so the last
-                    // part legitimately has no image after it.
-                    if(!isset($imgsBody[0][$keyPart])) {
-                        continue;
-                    }
-
-                    $imgTag = $imgsBody[0][$keyPart];
-                    $cid    = "attach-" . $keyPart;
-
-                    // The src decides only WHETHER a file we already vetted gets attached — it is
-                    // never itself handed to the mailer. Passing the raw src to addEmbeddedImage()
-                    // made every <img> an arbitrary-file-read primitive that mails the file OUT:
-                    // <img src="/etc/passwd"> in an attacker-influenced body attached /etc/passwd
-                    // to the outgoing message. Only a path that truly resolves inside the caller's
-                    // allow-listed base directory survives resolveEmbeddableImage().
-                    $path = self::resolveEmbeddableImage(self::getImageSrc($imgTag), $params['imagesBaseDir']);
-
-                    $embedded = false;
-                    if($path !== null) {
-                        try {
-                            $mail->addEmbeddedImage($path, $cid, $cid);
-                            $embedded = true;
-                        } catch (\PHPMailer\PHPMailer\Exception $e) {
-                            $embedded = false;
+                        // $imgsBody[0] is the list of whole <img> matches, and the regex captures
+                        // nothing else. Indexing the OUTER array by the part number handed an ARRAY
+                        // to getImageSrc(string) — an uncatchable-here TypeError on any body with an
+                        // image. preg_split also yields one more part than there are tags, so the
+                        // last part legitimately has no image after it.
+                        if(!isset($imgsBody[0][$keyPart])) {
+                            continue;
                         }
-                    }
 
-                    // Point the tag at the attachment we just made, or — when it could not be
-                    // embedded — put the caller's own tag back untouched, leaving it a plain
-                    // reference the mail client may or may not fetch. Dropping it would silently
-                    // strip the image out of the body; rethrowing would fail an otherwise valid
-                    // send.
-                    $mail->Body .= $embedded ? ('<img src="cid:' . $cid . '">') : $imgTag;
+                        $imgTag = $imgsBody[0][$keyPart];
+                        $cid    = "attach-" . $keyPart;
+
+                        // The src decides only WHETHER a file we already vetted gets attached — it
+                        // is never itself handed to the mailer. Passing the raw src to
+                        // addEmbeddedImage() made every <img> an arbitrary-file-read primitive that
+                        // mails the file OUT: <img src="/etc/passwd"> in an attacker-influenced body
+                        // attached /etc/passwd to the outgoing message. Only a path that truly
+                        // resolves inside the caller's allow-listed base directory survives
+                        // resolveEmbeddableImage().
+                        $path = self::resolveEmbeddableImage(self::getImageSrc($imgTag), $params['imagesBaseDir']);
+
+                        $embedded = false;
+                        if($path !== null) {
+                            try {
+                                $mail->addEmbeddedImage($path, $cid, $cid);
+                                $embedded = true;
+                            } catch (\PHPMailer\PHPMailer\Exception $e) {
+                                $embedded = false;
+                            }
+                        }
+
+                        // Point the tag at the attachment we just made, or — when it could not be
+                        // embedded — put the caller's own tag back untouched, leaving it a plain
+                        // reference the mail client may or may not fetch. Dropping it would silently
+                        // strip the image out of the body; rethrowing would fail an otherwise valid
+                        // send.
+                        $mail->Body .= $embedded ? ('<img src="cid:' . $cid . '">') : $imgTag;
+                    }
                 }
             }
 
@@ -521,12 +549,16 @@ class Mailer {
      * Never throws: malformed HTML, markup with no <img>, and an empty/blank string all return ''.
      * If $imgTag holds more than one <img>, the FIRST one's src is returned.
      *
+     * $imgTag is parsed as UTF-8, which is this library's charset everywhere else and the only
+     * encoding sendMail() ever hands it. HTML entities ARE decoded (&amp; comes back as &), because
+     * that is what the markup MEANT; nothing else is transformed.
+     *
      * The src is returned RAW — it is not validated, resolved, or sanitised, and it is not checked
      * against any scheme or path allow-list. Whatever the HTML said is what you get, so treat the
      * result as hostile: sendMail()'s $useEmbeddedImages does its own allow-list check before a src
      * is ever allowed to name a file, and does not trust this value.
      *
-     * @param string $imgTag HTML <img> tag to extract the src from
+     * @param string $imgTag HTML <img> tag to extract the src from, encoded as UTF-8
      * @return string The value of the src attribute, or an empty string if not found
      */
     public static function getImageSrc(string $imgTag): string {
@@ -538,7 +570,16 @@ class Mailer {
         }
 
         $document = new \DOMDocument();
-        @$document->loadHTML($imgTag); // suppress warnings for malformed HTML
+        // libxml's HTML parser assumes ISO-8859-1 when the markup declares nothing, so every
+        // non-ASCII src came back mojibake'd ("ação.png" -> "aÃ§Ã£o.png") and could never match the
+        // file on disk. The meta charset is the in-band way to tell it otherwise; it is stripped
+        // from consideration by the //img XPath below, so it cannot affect the result.
+        // LIBXML_NONET is belt-and-braces: this parses hostile markup, and it must never be able to
+        // reach the network to resolve anything.
+        @$document->loadHTML(
+            '<meta http-equiv="Content-Type" content="text/html; charset=utf-8">' . $imgTag,
+            LIBXML_NONET | LIBXML_NOERROR | LIBXML_NOWARNING
+        );
 
         $xpath = new \DOMXPath($document);
         return $xpath->evaluate("string(//img/@src)");
