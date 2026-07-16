@@ -1783,84 +1783,159 @@ final class SecurityTest extends TestCase
     }
 
     // ---------------------------------------------------------------------------------------
-    // The object walk: Traversable containers, enums, readonly properties
+    // The object walk: a NARROW contract that REFUSES what it cannot do correctly
     //
-    // `foreach ($object as $k => $v)` dispatches to the ITERATOR on any Traversable, so writing
-    // back with `$object->$k = ...` created a PHANTOM DYNAMIC property while the real storage kept
-    // the live payload. Every test below reads the container the way the container is actually
-    // read — offsetGet — because that is where the payload survived.
+    // Three passes tried to walk arbitrary container objects in place and each shipped a
+    // different fail-open:
+    //   - `$object->$k = ...` wrote a PHANTOM DYNAMIC property (foreach dispatches to the
+    //     ITERATOR on any Traversable) while the real storage kept the live payload;
+    //   - `offsetSet($iterationKey, ...)` works only while getIterator() yields storage offsets.
+    //     On a container that re-keys, it writes to INVENTED offsets: the payload survives at the
+    //     real key AND the container silently grows an entry, on the success path.
+    //
+    // The contract is now: strings, arrays (recursively), and a PLAIN object's PUBLIC properties.
+    // Everything else THROWS. The tests below pin the refusal, because a container returned
+    // unwalked-but-looking-sanitized is the fail-open itself.
     // ---------------------------------------------------------------------------------------
 
     /** The live payload used across the container tests. */
     private const XSS_LIVE_PAYLOAD = '<img src=x onerror=alert(1)>';
 
-    public function testXssCleanSanitizesArrayObjectStorageNotAPhantomProperty(): void
+    /**
+     * CONTRACT CHANGE (was: "sanitizes ArrayObject storage via offsetSet"). Writing back by
+     * ITERATION KEY is only accidentally correct — see testXssCleanRefusesAContainerWhoseIterator
+     * ReKeys, which is the container that proves it. Rather than be right for ArrayObject and
+     * silently wrong (and corrupting) for everything else, the walk refuses every container.
+     */
+    public function testXssCleanRefusesAnArrayObjectInsteadOfGuessingAtItsStorage(): void
     {
         $subject = new \ArrayObject(['bio' => self::XSS_LIVE_PAYLOAD]);
 
-        $cleaned = Security::xssCleanRecursive($subject);
+        try {
+            Security::xssCleanRecursive($subject);
+            $this->fail('An ArrayObject must be refused, not silently returned unsanitized.');
+        } catch (\InvalidArgumentException $e) {
+            $this->assertStringContainsString('ArrayObject', $e->getMessage());
+            $this->assertStringContainsString(
+                'getArrayCopy',
+                $e->getMessage(),
+                'The refusal must tell the caller what to do instead.'
+            );
+        }
 
-        $this->assertSame($subject, $cleaned, 'The same instance must come back.');
-        // offsetGet is the ONLY way an ArrayObject is read. Before the fix this still held the
-        // live payload while a sanitized copy hid in an unreachable dynamic property.
-        $this->assertNoActiveContent($cleaned['bio'], self::XSS_LIVE_PAYLOAD);
-        $this->assertSame(
-            [],
-            get_object_vars($subject),
-            'Sanitizing must not invent a dynamic property that shadows the real storage.'
-        );
+        // The refusal must not leave debris behind: no phantom dynamic property, storage intact.
+        $this->assertSame([], get_object_vars($subject));
+        $this->assertSame(['bio' => self::XSS_LIVE_PAYLOAD], $subject->getArrayCopy());
     }
 
-    public function testXssCleanSanitizesArrayIteratorStorage(): void
+    /**
+     * THE CONTAINER THAT PROVES THE POINT. Its getIterator() re-keys (array_values()), exactly
+     * like a sorted/paginated/array_values()'d view. Pass 3's offsetSet-by-iteration-key walk
+     * wrote to INVENTED offset 0 here: the live payload survived at 'bio' and count went 1 -> 2,
+     * on the SUCCESS path, with no error. Refusing is the only honest answer.
+     */
+    public function testXssCleanRefusesAContainerWhoseIteratorReKeysRatherThanCorruptIt(): void
     {
-        $subject = new \ArrayIterator(['bio' => self::XSS_LIVE_PAYLOAD]);
+        $subject = new SecurityTestReKeyingCollection(['bio' => self::XSS_LIVE_PAYLOAD]);
 
-        $cleaned = Security::xssCleanRecursive($subject);
+        $this->expectException(\InvalidArgumentException::class);
 
-        $this->assertNoActiveContent($cleaned['bio'], self::XSS_LIVE_PAYLOAD);
+        try {
+            Security::xssCleanRecursive($subject);
+        } finally {
+            // The bug this replaces: an entry nobody inserted, beside the surviving payload.
+            $this->assertCount(1, $subject->items(), 'The walk must never grow the caller container.');
+            $this->assertSame(['bio' => self::XSS_LIVE_PAYLOAD], $subject->items());
+        }
     }
 
-    public function testXssCleanSanitizesNestedArrayObjectStorage(): void
+    public function testXssCleanRefusesAnArrayIterator(): void
     {
-        $subject = new \ArrayObject(['profile' => new \ArrayObject(['bio' => self::XSS_LIVE_PAYLOAD])]);
+        $this->expectException(\InvalidArgumentException::class);
 
-        $cleaned = Security::xssCleanRecursive($subject);
-
-        $this->assertNoActiveContent($cleaned['profile']['bio'], self::XSS_LIVE_PAYLOAD);
+        Security::xssCleanRecursive(new \ArrayIterator(['bio' => self::XSS_LIVE_PAYLOAD]));
     }
 
-    public function testXssCleanSanitizesAnArrayAccessCollectionsStorageAndPublicProperties(): void
+    /** A refused container must be refused from anywhere in the graph, not just the top. */
+    public function testXssCleanRefusesAContainerNestedInsideAPlainObject(): void
+    {
+        $subject = new \stdClass();
+        $subject->profile = new \ArrayObject(['bio' => self::XSS_LIVE_PAYLOAD]);
+
+        $this->expectException(\InvalidArgumentException::class);
+
+        Security::xssCleanRecursive($subject);
+    }
+
+    /** ...including from inside an array, which is the shape that reaches this from $_POST. */
+    public function testXssCleanRefusesAContainerNestedInsideAnArray(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+
+        Security::xssCleanRecursive(['profile' => new \ArrayObject(['bio' => self::XSS_LIVE_PAYLOAD])]);
+    }
+
+    /**
+     * Traversable WITHOUT ArrayAccess is refused too. Its public properties could be walked, but
+     * the data it exists to expose — what iteration yields — could not be, so "sanitized" would be
+     * a lie about the part that matters.
+     */
+    public function testXssCleanRefusesAnIteratorAggregateWhoseIteratedDataItCannotAddress(): void
+    {
+        $subject = new SecurityTestLyingIteratorAggregate();
+        $subject->bio = self::XSS_LIVE_PAYLOAD;
+
+        $this->expectException(\InvalidArgumentException::class);
+
+        Security::xssCleanRecursive($subject);
+    }
+
+    public function testXssCleanRefusesAnArrayAccessCollection(): void
     {
         $subject = new SecurityTestCollection(['bio' => self::XSS_LIVE_PAYLOAD]);
         $subject->label = self::XSS_LIVE_PAYLOAD;
 
-        $cleaned = Security::xssCleanRecursive($subject);
+        $this->expectException(\InvalidArgumentException::class);
 
-        $this->assertNoActiveContent($cleaned['bio'], self::XSS_LIVE_PAYLOAD);
-        $this->assertNoActiveContent($cleaned->label, self::XSS_LIVE_PAYLOAD);
+        Security::xssCleanRecursive($subject);
     }
 
-    public function testXssCleanWalksTheDeclaredPublicPropertiesOfAnIteratorAggregate(): void
+    public function testXssCleanRefusesSplObjectStorage(): void
     {
-        // A custom iterator must NOT be able to steer the walk: this one yields keys that do not
-        // exist as properties, which is exactly how the phantom-property bug was born.
-        $subject = new SecurityTestLyingIteratorAggregate();
-        $subject->bio = self::XSS_LIVE_PAYLOAD;
+        // ArrayAccess whose OFFSETS are objects while iteration yields integer positions. Pass 3
+        // hard-coded a one-class exclusion and returned it unsanitized; it is refused now.
+        $storage = new \SplObjectStorage();
+        $storage->attach(new \stdClass(), self::XSS_LIVE_PAYLOAD);
 
-        $cleaned = Security::xssCleanRecursive($subject);
+        $this->expectException(\InvalidArgumentException::class);
 
-        $this->assertNoActiveContent($cleaned->bio, self::XSS_LIVE_PAYLOAD);
-        $this->assertObjectNotHasProperty(
-            'ghost',
-            $cleaned,
-            'The walk must follow public properties, not whatever the iterator invents.'
-        );
+        Security::xssCleanRecursive($storage);
     }
 
+    /**
+     * WeakMap raised an UNCAUGHT TypeError from iterator_to_array() (its keys are objects): the
+     * shape pass 3 guarded for SplObjectStorage but missed. Now it is refused like every other
+     * container, with an exception the documented `catch` actually catches.
+     */
+    public function testXssCleanRefusesAWeakMapInsteadOfRaisingATypeError(): void
+    {
+        $map = new \WeakMap();
+        $map[new \stdClass()] = self::XSS_LIVE_PAYLOAD;
+
+        $this->expectException(\InvalidArgumentException::class);
+
+        Security::xssCleanRecursive($map);
+    }
+
+    /**
+     * An enum is NOT refused, and that is deliberate: its cases are compile-time constants written
+     * in source, never caller data, so there is nothing in one to sanitize. Returning it untouched
+     * is the complete, correct result — not a slot skipped — which is exactly what separates it
+     * from a readonly property (that one CAN hold attacker data, so it throws). Refusing enums
+     * would break every DTO with a status/role property for no security gain.
+     */
     public function testXssCleanReturnsAnEnumUntouchedInsteadOfRaisingAnError(): void
     {
-        // Writing to an enum's readonly $name/$value is an \Error, and an \Error is not caught by
-        // the `catch (\Exception)` a caller is told to write. It used to blow up here.
         $this->assertSame(SecurityTestSuit::Hearts, Security::xssCleanRecursive(SecurityTestSuit::Hearts));
         $this->assertSame(SecurityTestSuit::Hearts->value, 'H');
 
@@ -1874,38 +1949,166 @@ final class SecurityTest extends TestCase
         $this->assertNoActiveContent($cleaned->bio, self::XSS_LIVE_PAYLOAD);
     }
 
-    public function testXssCleanSkipsReadonlyPropertiesInsteadOfRaisingAnError(): void
+    /**
+     * CONTRACT CHANGE (was: "skips readonly properties"). A public readonly property is on the
+     * object's public data surface and CAN hold attacker data — `new Dto(bio: $_POST['bio'])` —
+     * so skipping it handed back an object that looked sanitized with the payload still live.
+     * What the walk can SEE it must handle; it cannot write this, so it refuses.
+     */
+    public function testXssCleanRefusesAPublicReadonlyPropertyInsteadOfSkippingItSilently(): void
+    {
+        $subject = new SecurityTestReadonly(self::XSS_LIVE_PAYLOAD, 'mutable');
+
+        try {
+            Security::xssCleanRecursive($subject);
+            $this->fail('A readonly property holding live markup must not be silently skipped.');
+        } catch (\InvalidArgumentException $e) {
+            $this->assertStringContainsString('frozen', $e->getMessage(), 'Name the offending property.');
+        }
+    }
+
+    /** The refusal is decided BEFORE any write, so a refused object is not left half-rewritten. */
+    public function testXssCleanRefusesAReadonlyHolderWithoutRewritingItsOtherProperties(): void
     {
         $subject = new SecurityTestReadonly('<b>frozen</b>', self::XSS_LIVE_PAYLOAD);
 
+        try {
+            Security::xssCleanRecursive($subject);
+        } catch (\InvalidArgumentException) {
+            // expected
+        }
+
+        $this->assertSame('<b>frozen</b>', $subject->frozen);
+        $this->assertSame(
+            self::XSS_LIVE_PAYLOAD,
+            $subject->mutable,
+            'A refused object must come back untouched, not partly rewritten.'
+        );
+    }
+
+    /**
+     * THE SHARPEST EDGE OF THE CONTRACT CHANGE, pinned so nobody softens it by accident: a DTO
+     * whose readonly property is a plain int id is refused too, even though skipping that id would
+     * have been harmless. The old code called this case out by name ("rather than crash on an
+     * object that merely has a readonly id"). It is refused anyway: a rule the caller can predict
+     * from the class shape beats one they must re-evaluate per value. The remedy is in the message.
+     */
+    public function testXssCleanRefusesAReadonlyHolderEvenWhenTheReadonlyValueNeededNoChange(): void
+    {
+        $subject = new SecurityTestReadonlyId(7, self::XSS_LIVE_PAYLOAD);
+
+        try {
+            Security::xssCleanRecursive($subject);
+            $this->fail('A public readonly property must be refused predictably, by shape.');
+        } catch (\InvalidArgumentException $e) {
+            $this->assertStringContainsString('$id', $e->getMessage());
+            $this->assertStringContainsString(
+                'BEFORE constructing',
+                $e->getMessage(),
+                'A readonly holder must get readonly advice, not "write it back through the container API".'
+            );
+            $this->assertStringNotContainsString('getArrayCopy', $e->getMessage());
+        }
+    }
+
+    /** A private/protected-only object is NOT refused: it is outside the contract, not skipped inside it. */
+    public function testXssCleanWalksAPlainObjectsPublicPropertiesAndLeavesPrivateStateAlone(): void
+    {
+        $subject = new SecurityTestPrivateState(self::XSS_LIVE_PAYLOAD);
+        $subject->bio = self::XSS_LIVE_PAYLOAD;
+
         $cleaned = Security::xssCleanRecursive($subject);
 
-        // Documented limit: a readonly property cannot be rewritten in place, so it is skipped —
-        // but its presence must never abort the walk of the writable ones.
-        $this->assertSame('<b>frozen</b>', $cleaned->frozen);
-        $this->assertNoActiveContent($cleaned->mutable, self::XSS_LIVE_PAYLOAD);
+        $this->assertSame($subject, $cleaned);
+        $this->assertNoActiveContent($cleaned->bio, self::XSS_LIVE_PAYLOAD);
+        $this->assertSame(
+            self::XSS_LIVE_PAYLOAD,
+            $subject->secret(),
+            'Private state is documented as NOT walked — pinning the limit, not endorsing it.'
+        );
     }
 
-    public function testXssCleanLeavesSplObjectStorageAloneInsteadOfRaisingATypeError(): void
-    {
-        // SplObjectStorage is ArrayAccess, but its offsets are OBJECTS while iteration yields
-        // integer positions: writing back by iteration key is a TypeError. Documented as not walked.
-        $storage = new \SplObjectStorage();
-        $storage->attach(new \stdClass(), self::XSS_LIVE_PAYLOAD);
+    // ---------------------------------------------------------------------------------------
+    // Cycle guard: a back-reference used to die with an UNCATCHABLE fatal (memory exhausted)
+    // ---------------------------------------------------------------------------------------
 
-        $this->assertSame($storage, Security::xssCleanRecursive($storage));
+    public function testXssCleanTerminatesOnASelfReferencingObject(): void
+    {
+        $subject = new \stdClass();
+        $subject->bio = self::XSS_LIVE_PAYLOAD;
+        $subject->self = $subject;
+
+        $cleaned = Security::xssCleanRecursive($subject);
+
+        $this->assertNoActiveContent($cleaned->bio, self::XSS_LIVE_PAYLOAD);
+        $this->assertSame($subject, $cleaned->self, 'The back-reference must survive as the same instance.');
     }
 
-    public function testFilterValueSanitizesArrayObjectStorage(): void
+    public function testXssCleanTerminatesOnAMutuallyReferencingObjectGraph(): void
     {
-        // REGRESSION GUARD: dbec4a5 wrote `$value[$k] = ...` and got this right; pass 1 changed it
-        // to `$value->$k = ...` to fix stdClass and broke every ArrayAccess+Traversable object.
+        $parent = new \stdClass();
+        $child = new \stdClass();
+        $parent->child = $child;
+        $child->parent = $parent;
+        $child->bio = self::XSS_LIVE_PAYLOAD;
+
+        $cleaned = Security::xssCleanRecursive($parent);
+
+        $this->assertNoActiveContent($child->bio, self::XSS_LIVE_PAYLOAD);
+        $this->assertSame($child, $cleaned->child);
+        $this->assertSame($parent, $child->parent);
+    }
+
+    public function testFilterValueTerminatesOnASelfReferencingObject(): void
+    {
+        $subject = new \stdClass();
+        $subject->a = '  x  ';
+        $subject->self = $subject;
+
+        Security::filterValue($subject, null, null, false, false, false, false, false, false, true);
+
+        $this->assertSame('x', $subject->a);
+        $this->assertSame($subject, $subject->self);
+    }
+
+    /**
+     * The guard must not outlive the call that set it. If a refusal deep in the graph left an
+     * object marked "in progress" forever, the caller's NEXT call would skip it and return it
+     * UNSANITIZED — a fail-open manufactured by the cycle guard itself.
+     */
+    public function testARefusedWalkDoesNotPoisonTheCycleGuardForLaterCalls(): void
+    {
+        $subject = new \stdClass();
+        $subject->bio = self::XSS_LIVE_PAYLOAD;
+        $subject->container = new \ArrayObject(['x' => 'y']);
+
+        try {
+            Security::xssCleanRecursive($subject);
+        } catch (\InvalidArgumentException) {
+            // expected
+        }
+
+        unset($subject->container);
+        $subject->bio = self::XSS_LIVE_PAYLOAD;
+
+        $cleaned = Security::xssCleanRecursive($subject);
+
+        $this->assertNoActiveContent($cleaned->bio, self::XSS_LIVE_PAYLOAD);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // filterValue shares the walk and therefore the contract
+    // ---------------------------------------------------------------------------------------
+
+    public function testFilterValueRefusesAnArrayObject(): void
+    {
+        // CONTRACT CHANGE (was: "sanitizes ArrayObject storage"). Same walk, same refusal — the
+        // two must never offer different contracts for the same object.
         $subject = new \ArrayObject(['bio' => self::XSS_LIVE_PAYLOAD]);
 
-        $filtered = Security::filterValue($subject, null, null, false, true);
+        $this->expectException(\InvalidArgumentException::class);
 
-        $this->assertNoActiveContent($filtered['bio'], self::XSS_LIVE_PAYLOAD);
-        $this->assertSame([], get_object_vars($subject));
+        Security::filterValue($subject, null, null, false, true);
     }
 
     public function testFilterValueStillRewritesPlainObjectPropertiesInPlace(): void
@@ -1920,17 +2123,27 @@ final class SecurityTest extends TestCase
         $this->assertSame('x', $subject->a);
     }
 
-    public function testFilterValueDoesNotRaiseOnAnEnumOrReadonlyProperty(): void
+    public function testFilterValueDoesNotRaiseOnAnEnum(): void
     {
         $subject = new \stdClass();
         $subject->suit = SecurityTestSuit::Hearts;
-        $subject->frozen = new SecurityTestReadonly('  keep  ', '  x  ');
+        $subject->a = '  x  ';
 
         Security::filterValue($subject, null, null, false, false, false, false, false, false, true);
 
         $this->assertSame(SecurityTestSuit::Hearts, $subject->suit);
-        $this->assertSame('  keep  ', $subject->frozen->frozen, 'readonly is skipped, not rewritten.');
-        $this->assertSame('x', $subject->frozen->mutable);
+        $this->assertSame('x', $subject->a);
+    }
+
+    public function testFilterValueRefusesAReadonlyHolder(): void
+    {
+        // CONTRACT CHANGE (was: "readonly is skipped, not rewritten").
+        $subject = new \stdClass();
+        $subject->frozen = new SecurityTestReadonly('  keep  ', '  x  ');
+
+        $this->expectException(\InvalidArgumentException::class);
+
+        Security::filterValue($subject, null, null, false, false, false, false, false, false, true);
     }
 
     // ---------------------------------------------------------------------------------------
@@ -2178,6 +2391,467 @@ final class SecurityTest extends TestCase
             Security::setFileEncryptBlocksBytes(null);
         }
     }
+
+    // ---------------------------------------------------------------------------------------
+    // encryptFileV2 / decryptFileV2 — in-place (destination === source) is REFUSED
+    //
+    // Both functions open the destination for writing (truncating it) and only then read the
+    // source. Passing one path as both shredded the file and STILL reported success:
+    // encryptFileV2($f, $key, $f) returned $f, left 284 bytes of its own envelope header, and the
+    // original was unrecoverable. decryptFileV2 was worse: for a ciphertext small enough to fit
+    // PHP's 8192-byte stream read buffer it "worked", so it passed in dev; above that it failed
+    // mid-read and the rollback then DELETED the caller's only ciphertext copy.
+    // ---------------------------------------------------------------------------------------
+
+    /** The exact call from the report: encrypt a file onto itself. */
+    public function testEncryptFileV2RefusesToWriteOntoItsOwnSource(): void
+    {
+        $file = $this->tempPath('inplace');
+        file_put_contents($file, 'CONTEUDO IMPORTANTE DO USUARIO');
+
+        try {
+            Security::encryptFileV2($file, self::masterKey(), $file);
+            $this->fail('Expected an Exception: encrypting a file onto itself destroys it.');
+        } catch (\Exception $e) {
+            $this->assertStringContainsString('must not be the same file', $e->getMessage());
+        }
+
+        // The whole point: the caller's file is still there, byte for byte.
+        $this->assertSame('CONTEUDO IMPORTANTE DO USUARIO', file_get_contents($file));
+    }
+
+    /**
+     * decryptFileV2 in place, on BOTH sides of the stream-buffer threshold that made this defect
+     * invisible in development. The 10-byte case used to return SUCCESS; the 100 KB case used to
+     * throw AND unlink the ciphertext.
+     */
+    #[DataProvider('inPlaceDecryptSizeProvider')]
+    public function testDecryptFileV2RefusesToWriteOntoItsOwnSource(int $payloadSize): void
+    {
+        [, $enc] = $this->makeEncryptedFile(str_repeat('A', $payloadSize));
+        $before = file_get_contents($enc);
+
+        try {
+            Security::decryptFileV2($enc, self::masterKey(), $enc);
+            $this->fail('Expected an Exception: decrypting a file onto itself destroys the ciphertext.');
+        } catch (\Exception $e) {
+            $this->assertStringContainsString('must not be the same file', $e->getMessage());
+        }
+
+        // The ciphertext must survive UNTOUCHED — it may be the caller's only copy.
+        $this->assertFileExists($enc);
+        $this->assertSame($before, file_get_contents($enc), 'The ciphertext was modified or destroyed.');
+    }
+
+    /** @return array<string, array{0:int}> */
+    public static function inPlaceDecryptSizeProvider(): array
+    {
+        return [
+            'small: fits the 8192-byte stream buffer, used to silently "work"' => [10],
+            'just under the buffer'                                            => [1000],
+            'larger than the buffer: used to throw AND delete the ciphertext'  => [100000],
+        ];
+    }
+
+    /**
+     * A raw string compare on the caller's paths is trivially defeated. Every spelling below names
+     * the SAME file and must be refused just like the identical path.
+     */
+    #[DataProvider('equivalentPathSpellingProvider')]
+    public function testFileV2RefusesInPlaceForEquivalentPathSpellings(string $mutation): void
+    {
+        $file = $this->tempPath('spell');
+        file_put_contents($file, 'CONTEUDO');
+
+        $dir  = dirname($file);
+        $name = basename($file);
+
+        $destination = match ($mutation) {
+            'dot-slash'      => $dir . DIRECTORY_SEPARATOR . '.' . DIRECTORY_SEPARATOR . $name,
+            'trailing-slash' => $file . DIRECTORY_SEPARATOR,
+            'dot-dot'        => $dir . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . basename($dir) . DIRECTORY_SEPARATOR . $name,
+            'case'           => $dir . DIRECTORY_SEPARATOR . strtoupper($name),
+        };
+
+        if ($mutation === 'case' && DIRECTORY_SEPARATOR !== '\\') {
+            $this->markTestSkipped('Path case only aliases the same file on Windows.');
+        }
+
+        try {
+            Security::encryptFileV2($file, self::masterKey(), $destination);
+            $this->fail("Expected an Exception for the '{$mutation}' spelling of the source path.");
+        } catch (\Exception $e) {
+            $this->assertStringContainsString('must not be the same file', $e->getMessage());
+        }
+
+        $this->assertSame('CONTEUDO', file_get_contents($file));
+    }
+
+    /** @return array<string, array{0:string}> */
+    public static function equivalentPathSpellingProvider(): array
+    {
+        return [
+            './x vs x'      => ['dot-slash'],
+            'trailing sep'  => ['trailing-slash'],
+            '.. segment'    => ['dot-dot'],
+            'different case'=> ['case'],
+        ];
+    }
+
+    /** A symlink is a second name for the same file; realpath() collapses it. */
+    public function testFileV2RefusesInPlaceThroughASymlink(): void
+    {
+        $file = $this->tempPath('symsrc');
+        file_put_contents($file, 'CONTEUDO');
+        $link = $this->tempPath('symlink');
+
+        if (!@symlink($file, $link)) {
+            $this->markTestSkipped('This platform/account cannot create symlinks.');
+        }
+
+        try {
+            Security::encryptFileV2($file, self::masterKey(), $link);
+            $this->fail('Expected an Exception: the destination symlink resolves to the source.');
+        } catch (\Exception $e) {
+            $this->assertStringContainsString('must not be the same file', $e->getMessage());
+        }
+
+        $this->assertSame('CONTEUDO', file_get_contents($file));
+    }
+
+    /**
+     * A HARD link is the case a path comparison CANNOT see: both names are equally real, so
+     * realpath() correctly reports two different paths for one file. Only the device+inode
+     * comparison catches it. Verified on Windows too — its stat() does report a real inode.
+     */
+    public function testFileV2RefusesInPlaceThroughAHardLink(): void
+    {
+        $file = $this->tempPath('hardsrc');
+        file_put_contents($file, 'CONTEUDO');
+        $hard = $this->tempPath('hardlink');
+
+        if (!@link($file, $hard)) {
+            $this->markTestSkipped('This platform/filesystem cannot create hard links.');
+        }
+
+        // Pin the premise: if realpath() ever collapsed these, this test would prove nothing.
+        $this->assertNotSame(realpath($file), realpath($hard), 'Premise: a hard link has its own realpath.');
+
+        try {
+            Security::encryptFileV2($file, self::masterKey(), $hard);
+            $this->fail('Expected an Exception: the destination hard link IS the source file.');
+        } catch (\Exception $e) {
+            $this->assertStringContainsString('must not be the same file', $e->getMessage());
+        }
+
+        $this->assertSame('CONTEUDO', file_get_contents($file));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // REGRESSION GUARD: the ordinary source != destination path must be completely unaffected.
+    // The in-place guard runs on EVERY call; a false positive here would break all file crypto.
+    // ---------------------------------------------------------------------------------------
+
+    public function testFileV2RoundTripIsUnaffectedByTheInPlaceGuard(): void
+    {
+        $payload = random_bytes(200000); // spans several stream buffers
+        $src = $this->tempPath('ok_src');
+        file_put_contents($src, $payload);
+        $enc = $this->tempPath('ok_enc');
+        $dec = $this->tempPath('ok_dec');
+
+        Security::encryptFileV2($src, self::masterKey(), $enc);
+        Security::decryptFileV2($enc, self::masterKey(), $dec);
+
+        $this->assertSame($payload, file_get_contents($dec));
+    }
+
+    /**
+     * Both sides EXISTING is what makes the inode branch run for real. If it compared a
+     * not-reported inode (0 === 0) or a shared device, this would fail — every normal overwrite
+     * would be rejected.
+     */
+    public function testFileV2AllowsOverwritingPreExistingDistinctDestinations(): void
+    {
+        $payload = 'CONTEUDO IMPORTANTE';
+        $src = $this->tempPath('pre_src');
+        file_put_contents($src, $payload);
+        $enc = $this->tempPath('pre_enc');
+        $dec = $this->tempPath('pre_dec');
+
+        // Pre-create both destinations in the SAME directory as the source.
+        file_put_contents($enc, 'stale');
+        file_put_contents($dec, 'stale');
+
+        Security::encryptFileV2($src, self::masterKey(), $enc);
+        Security::decryptFileV2($enc, self::masterKey(), $dec);
+
+        $this->assertSame($payload, file_get_contents($dec));
+    }
+
+    /** Append mode reassembly must still work — the guard must not fire on a shared destination. */
+    public function testFileV2AppendModeIsUnaffectedByTheInPlaceGuard(): void
+    {
+        $a = $this->tempPath('part_a');
+        $b = $this->tempPath('part_b');
+        file_put_contents($a, 'PARTE-A|');
+        file_put_contents($b, 'PARTE-B');
+        $encA = $this->tempPath('part_a_enc');
+        $encB = $this->tempPath('part_b_enc');
+        $out  = $this->tempPath('joined');
+
+        Security::encryptFileV2($a, self::masterKey(), $encA);
+        Security::encryptFileV2($b, self::masterKey(), $encB);
+        Security::decryptFileV2($encA, self::masterKey(), $out, null, 'w');
+        Security::decryptFileV2($encB, self::masterKey(), $out, null, 'a');
+
+        $this->assertSame('PARTE-A|PARTE-B', file_get_contents($out));
+    }
+
+    /**
+     * The in-place guard must NOT fold case to decide identity.
+     *
+     * Windows is usually case-insensitive, which tempts a case-insensitive comparison — but a
+     * directory can opt into case sensitivity (fsutil; WSL-created directories have it by
+     * default), and there 'x.txt' and 'X.TXT' are two genuinely different files with different
+     * inodes. Folding case rejected that legitimate call. Nothing is lost by not folding: on a
+     * case-INsensitive volume the two spellings are one file, so realpath() returns the same
+     * on-disk name for both and they share an inode — proved by the 'different case' data set of
+     * testFileV2RefusesInPlaceForEquivalentPathSpellings, which still passes.
+     *
+     * Self-validating: if the premise (two coexisting case-differing files) does not hold on this
+     * filesystem, the test skips rather than asserting something meaningless.
+     */
+    public function testFileV2AllowsDistinctFilesDifferingOnlyInCase(): void
+    {
+        $dir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'phpht_casesens_' . bin2hex(random_bytes(6));
+        if (!@mkdir($dir)) {
+            $this->markTestSkipped('Could not create the probe directory.');
+        }
+
+        $lower = $dir . DIRECTORY_SEPARATOR . 'segredo.txt';
+        $upper = $dir . DIRECTORY_SEPARATOR . 'SEGREDO.TXT';
+        $this->tempPaths[] = $lower;
+        $this->tempPaths[] = $upper;
+
+        try {
+            if (DIRECTORY_SEPARATOR === '\\') {
+                if (!function_exists('exec')) {
+                    $this->markTestSkipped('exec() is unavailable; cannot opt the directory into case sensitivity.');
+                }
+                // Opt this directory into case sensitivity; needs no elevation, but can fail.
+                $out = [];
+                $rc  = -1;
+                @exec('fsutil file setCaseSensitiveInfo "' . $dir . '" enable 2>&1', $out, $rc);
+                if ($rc !== 0) {
+                    $this->markTestSkipped('This filesystem does not support per-directory case sensitivity.');
+                }
+            }
+
+            file_put_contents($lower, 'SOU O ARQUIVO MINUSCULO');
+            file_put_contents($upper, 'SOU O ARQUIVO MAIUSCULO');
+            clearstatcache();
+
+            // The premise: they must really be two separate files here.
+            if (!is_file($lower) || !is_file($upper) || fileinode($lower) === fileinode($upper)
+                || file_get_contents($lower) === file_get_contents($upper)) {
+                $this->markTestSkipped('This filesystem folds case; the two spellings are one file.');
+            }
+
+            // Encrypting one onto the other is a perfectly legitimate call.
+            Security::encryptFileV2($lower, self::masterKey(), $upper);
+
+            $this->assertSame('SOU O ARQUIVO MINUSCULO', file_get_contents($lower), 'The source must be untouched.');
+            $this->assertNotSame('SOU O ARQUIVO MAIUSCULO', file_get_contents($upper), 'The destination should hold the ciphertext.');
+        } finally {
+            @unlink($lower);
+            @unlink($upper);
+            @rmdir($dir);
+        }
+    }
+
+    /** A destination whose path merely CONTAINS the source path must be allowed. */
+    public function testFileV2AllowsADestinationThatExtendsTheSourcePath(): void
+    {
+        $src = $this->tempPath('prefix');
+        file_put_contents($src, 'CONTEUDO');
+        $enc = $src . '.enc';
+        $this->tempPaths[] = $enc;
+
+        Security::encryptFileV2($src, self::masterKey(), $enc);
+
+        $this->assertFileExists($enc);
+        $this->assertSame('CONTEUDO', file_get_contents($src));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // decryptFileV2 — a pre-open failure must leave the destination's PERMISSIONS alone too
+    // ---------------------------------------------------------------------------------------
+
+    /**
+     * The docblock promises a failure raised before the destination is opened leaves an existing
+     * destination untouched, but the chmod() applying $permissionMode ran BEFORE the header was
+     * even read — so a rejected source left the caller's 0400 secret at 0644. The chmod is now
+     * deferred to immediately before the fopen.
+     *
+     * Runs everywhere: it asserts on the READ-ONLY bit, the one permission Windows does model
+     * (verified: chmod(0444) reports 0444/not-writable, chmod(0644) reports 0666/writable).
+     */
+    public function testDecryptFileV2DoesNotWidenDestinationPermissionsOnAPreOpenFailure(): void
+    {
+        $junk = $this->tempPath('notcipher');
+        file_put_contents($junk, 'this is not a V2 envelope at all');
+
+        $destination = $this->tempPath('secret');
+        file_put_contents($destination, 'SEGREDO PREEXISTENTE');
+
+        try {
+            chmod($destination, 0444);
+            clearstatcache(true, $destination);
+            $modeBefore = fileperms($destination) & 0777;
+            $this->assertFalse(is_writable($destination), 'Premise: the destination starts read-only.');
+
+            try {
+                // Fails on the header, i.e. BEFORE the destination is ever opened.
+                Security::decryptFileV2($junk, self::masterKey(), $destination, '0666');
+                $this->fail('Expected an Exception for a non-envelope source.');
+            } catch (\Exception) {
+                // expected
+            }
+
+            clearstatcache(true, $destination);
+            $this->assertSame($modeBefore, fileperms($destination) & 0777, 'A pre-open failure widened the destination permissions.');
+            $this->assertFalse(is_writable($destination), 'A pre-open failure made the caller\'s read-only file writable.');
+            $this->assertSame('SEGREDO PREEXISTENTE', file_get_contents($destination), 'A pre-open failure altered the destination contents.');
+        } finally {
+            // A read-only file cannot be unlink()ed on Windows; let tearDown clean up.
+            @chmod($destination, 0666);
+        }
+    }
+
+    /**
+     * The other half of the deferral: the chmod must still happen BEFORE the fopen. If it had been
+     * moved to after the destination was opened, a read-only destination could no longer be opened
+     * for writing and this would throw. Portable for the same reason as the test above.
+     */
+    public function testDecryptFileV2StillChmodsTheDestinationBeforeOpeningIt(): void
+    {
+        [, $enc] = $this->makeEncryptedFile('CONTEUDO');
+
+        $dec = $this->tempPath('ro_dec');
+        file_put_contents($dec, 'stale');
+
+        try {
+            chmod($dec, 0444);
+            clearstatcache(true, $dec);
+            $this->assertFalse(is_writable($dec), 'Premise: the destination starts read-only.');
+
+            // $permissionMode makes it writable; that chmod must still precede the fopen.
+            Security::decryptFileV2($enc, self::masterKey(), $dec, '0666');
+
+            $this->assertSame('CONTEUDO', file_get_contents($dec));
+        } finally {
+            @chmod($dec, 0666);
+        }
+    }
+
+    /** The deferral must not stop a REAL decrypt from applying the exact $permissionMode. */
+    public function testDecryptFileV2StillAppliesPermissionModeOnSuccess(): void
+    {
+        if (DIRECTORY_SEPARATOR === '\\') {
+            $this->markTestSkipped('Windows models only the read-only bit; the exact mode is asserted on POSIX.');
+        }
+
+        [, $enc] = $this->makeEncryptedFile('CONTEUDO');
+        $dec = $this->tempPath('perm_dec');
+        file_put_contents($dec, 'stale');
+        chmod($dec, 0666);
+
+        Security::decryptFileV2($enc, self::masterKey(), $dec, '0600');
+
+        clearstatcache(true, $dec);
+        $this->assertSame(0600, fileperms($dec) & 0777);
+        $this->assertSame('CONTEUDO', file_get_contents($dec));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Short fwrite must fail loud (contradicted the FAILS LOUD contract)
+    // ---------------------------------------------------------------------------------------
+
+    /**
+     * fwrite() returns the number of bytes it actually wrote: on a full disk or a quota it returns
+     * a SHORT COUNT, not false. Testing only `=== false` accepted a partial write, so decryptFileV2
+     * returned the destination path as a success while the plaintext on disk was truncated.
+     *
+     * A short write cannot be provoked portably (it needs a genuinely full device; there is no
+     * /dev/full on Windows, and the destination must be a real path a stream wrapper cannot fake),
+     * so — exactly like testDecryptFileV2DerivesItsVersionFromTheConstantNotALiteral above — this
+     * pins the wiring in the source. It fails against the pre-fix body, which only tested for false.
+     */
+    public function testDecryptFileV2DetectsAShortPlaintextWrite(): void
+    {
+        $method = new \ReflectionMethod(Security::class, 'decryptFileV2');
+        $lines  = file($method->getFileName());
+        $body   = implode('', array_slice(
+            $lines,
+            $method->getStartLine() - 1,
+            $method->getEndLine() - $method->getStartLine() + 1
+        ));
+
+        $this->assertDoesNotMatchRegularExpression(
+            '/if\s*\(\s*fwrite\s*\(\s*\$fpOut\s*,\s*\$plaintext\s*\)\s*===\s*false\s*\)/',
+            $body,
+            'decryptFileV2 still accepts a short fwrite() as success, truncating the plaintext silently.'
+        );
+        $this->assertMatchesRegularExpression(
+            '/\$written\s*=\s*fwrite\s*\(\s*\$fpOut\s*,\s*\$plaintext\s*\)\s*;/',
+            $body,
+            'decryptFileV2 must capture the fwrite() return value.'
+        );
+        $this->assertMatchesRegularExpression(
+            '/\$written\s*!==\s*\$plaintextLength/',
+            $body,
+            'decryptFileV2 must compare the bytes written against the plaintext length.'
+        );
+    }
+
+    /** The same defect on encryptFileV2's write path: every block goes through this helper. */
+    public function testWriteLengthEncodedBlockDetectsAShortWrite(): void
+    {
+        $method = new \ReflectionMethod(Security::class, 'writeLengthEncodedBlock');
+        $lines  = file($method->getFileName());
+        $body   = implode('', array_slice(
+            $lines,
+            $method->getStartLine() - 1,
+            $method->getEndLine() - $method->getStartLine() + 1
+        ));
+
+        $this->assertDoesNotMatchRegularExpression(
+            '/if\s*\(\s*fwrite\s*\([^)]*\)\s*===\s*false\s*\)/',
+            $body,
+            'writeLengthEncodedBlock still accepts a short fwrite(): encryptFileV2 would report success for a truncated ciphertext.'
+        );
+        $this->assertMatchesRegularExpression(
+            '/\$written\s*===\s*false\s*\|\|\s*\$written\s*!==\s*mb_strlen\s*\(\s*\$payload\s*,\s*[\'"]8bit[\'"]\s*\)/',
+            $body,
+            'writeLengthEncodedBlock must demand that every byte of the block was written.'
+        );
+    }
+
+    /** Writing a full envelope must still succeed — the stricter check must not reject good writes. */
+    public function testWriteLengthEncodedBlockStillWritesCompleteEnvelopes(): void
+    {
+        $payload = random_bytes(50000);
+        $src = $this->tempPath('short_src');
+        file_put_contents($src, $payload);
+        $enc = $this->tempPath('short_enc');
+        $dec = $this->tempPath('short_dec');
+
+        Security::encryptFileV2($src, self::masterKey(), $enc);
+        Security::decryptFileV2($enc, self::masterKey(), $dec);
+
+        $this->assertSame($payload, file_get_contents($dec));
+    }
 }
 
 /** An ArrayAccess+Traversable collection with its own storage AND a public property. */
@@ -2229,6 +2903,79 @@ final class SecurityTestLyingIteratorAggregate implements \IteratorAggregate
     public function getIterator(): \Traversable
     {
         return new \ArrayIterator(['ghost' => 'not-a-property']);
+    }
+}
+
+/**
+ * A container whose getIterator() RE-KEYS — the ordinary shape of a sorted, paginated or
+ * array_values()'d view. This is the counter-example to "iteration keys are storage offsets":
+ * offsetSet($iterationKey, ...) writes to offset 0, which addresses NOTHING here, so the live
+ * payload survives at 'bio' and the container grows an entry nobody inserted.
+ */
+final class SecurityTestReKeyingCollection implements \ArrayAccess, \IteratorAggregate
+{
+    public function __construct(private array $items = [])
+    {
+    }
+
+    /** @return array The real storage, keys and all. */
+    public function items(): array
+    {
+        return $this->items;
+    }
+
+    public function getIterator(): \Traversable
+    {
+        return new \ArrayIterator(array_values($this->items));
+    }
+
+    public function offsetExists(mixed $offset): bool
+    {
+        return isset($this->items[$offset]);
+    }
+
+    #[\ReturnTypeWillChange]
+    public function offsetGet(mixed $offset): mixed
+    {
+        return $this->items[$offset] ?? null;
+    }
+
+    public function offsetSet(mixed $offset, mixed $value): void
+    {
+        if ($offset === null) {
+            $this->items[] = $value;
+
+            return;
+        }
+        $this->items[$offset] = $value;
+    }
+
+    public function offsetUnset(mixed $offset): void
+    {
+        unset($this->items[$offset]);
+    }
+}
+
+/** A readonly property whose value never needed sanitizing — refused all the same, by shape. */
+final class SecurityTestReadonlyId
+{
+    public function __construct(public readonly int $id, public string $bio)
+    {
+    }
+}
+
+/** A plain object with a public property alongside private state the walk cannot reach. */
+final class SecurityTestPrivateState
+{
+    public string $bio = '';
+
+    public function __construct(private string $secret)
+    {
+    }
+
+    public function secret(): string
+    {
+        return $this->secret;
     }
 }
 

@@ -800,10 +800,17 @@ SINK;
     }
 
     /**
-     * The same defect, in the shape that does not need 600KB: proof the scan is linear rather than
-     * merely under the limit for this input.
+     * Many images in one body: every tag embedded, every separator between them preserved.
+     *
+     * This test used to be titled "proof the scan is linear". It was not, and could not be: every
+     * <img> here is WELL-FORMED, so the quadratic implementation it was written against matched each
+     * one in a few steps and passed this test identically. A test that cannot fail certifies the
+     * property it does not check — the real linearity proof is
+     * testImgScanCostPerByteDoesNotGrowWithBodySize, and the end-to-end guard is
+     * testSendMailDeliversAMalformedBodyWithoutBurningTheCpu. What this one legitimately covers is
+     * the functional split/rejoin over many tags, so it stays, under an honest name.
      */
-    public function testSendMailScansABodyOfManyImagesWithoutExhaustingPcre(): void
+    public function testSendMailEmbedsEveryOneOfManyImagesAndKeepsEverySeparator(): void
     {
         $port = $this->startSink();
         $png  = $this->makePng();
@@ -831,6 +838,139 @@ SINK;
         // Every separator between two images survives the split/rejoin.
         self::assertStringContainsString('TEXT-0', $eml);
         self::assertStringContainsString('TEXT-199', $eml);
+    }
+
+    /**
+     * A body that costs the SCAN quadratic time: many '<img' openings that never reach a '>'.
+     *
+     * The '"' before the only '>' is the load-bearing detail. Without a '>' in the subject at all,
+     * PCRE's required-code-unit check rejects every start position for free and the defect hides. With
+     * one present, each '<img' scans all the way to the unbalanced quote, fails, and PCRE restarts
+     * the whole attempt at the next '<' — O(n^2). Measured against the pass-3 possessive regex: 4.0x
+     * per doubling, 0.69s at 80KB, and no PCRE limit ever fires to stop it (a possessive repeat does
+     * not backtrack, so nothing is counted against pcre.backtrack_limit). It just pegs a core.
+     *
+     * @return string A body of $count '<img ' openings, with markers to prove it still ships
+     */
+    private static function malformedImgBody(int $count): string
+    {
+        return '<p>MARKER-START</p>' . str_repeat('<img ', $count) . '"x>' . '<p>MARKER-END</p>';
+    }
+
+    /**
+     * THE LINEARITY PROOF. Pass 3 asserted "LINEAR" in a comment; this measures it.
+     *
+     * Per-BYTE scan cost across a 8x range of body sizes. Linear work means a flat per-byte cost;
+     * quadratic work means a per-byte cost that grows in step with the input. Measured on this
+     * implementation the ratio is 0.89–1.01 over repeated runs (flat, ~1.35 ns/byte); measured on the
+     * pass-3 possessive regex behind this very seam it is 8.09 (537 -> 4347 ns/byte).
+     *
+     * The 3.0 threshold is the geometric midpoint of those two outcomes (sqrt(8.09) ~= 2.84): it sits
+     * ~3x above the worst linear reading observed and ~2.7x below the quadratic one, so it takes a
+     * 3x timing artefact to false-alarm and a 2.7x one to miss a real regression. Ratios of ratios are
+     * what make this safe to run on a busy box — a host that is uniformly 10x slower cancels out
+     * entirely, which a wall-clock budget could not do.
+     *
+     * Each size is timed $trials times and the FASTEST run is kept. Scheduling noise can only ever ADD
+     * time, never remove it, so the minimum is the closest estimate of the real cost — and it is what
+     * stops one context switch landing in the (sub-millisecond) largest-size window from inflating
+     * that reading 3x and false-alarming. Cost when linear: ~12ms for the whole test.
+     */
+    public function testImgScanCostPerByteDoesNotGrowWithBodySize(): void
+    {
+        $scan    = new \ReflectionMethod(Mailer::class, 'splitOnImgTags');
+        $sizes   = [1000, 2000, 4000, 8000];
+        $repeats = 40;
+        $trials  = 3;
+
+        $bodies = [];
+        foreach ($sizes as $count) {
+            $bodies[$count] = self::malformedImgBody($count);
+        }
+        // Warm the opcode/GC state so the first size is not billed for everyone else's setup.
+        $scan->invoke(null, $bodies[$sizes[0]]);
+
+        $perByte = [];
+        foreach ($sizes as $count) {
+            $body    = $bodies[$count];
+            $fastest = PHP_INT_MAX;
+            for ($trial = 0; $trial < $trials; $trial++) {
+                $started = hrtime(true);
+                for ($i = 0; $i < $repeats; $i++) {
+                    $scan->invoke(null, $body);
+                }
+                $fastest = min($fastest, hrtime(true) - $started);
+            }
+
+            if ($fastest < 20000) {
+                self::markTestSkipped(sprintf(
+                    'this host scanned %d bytes x %d in %d ns — below what the clock can resolve, '
+                        . 'so a per-byte ratio here would be noise, not a linearity measurement',
+                    strlen($body),
+                    $repeats,
+                    $fastest
+                ));
+            }
+
+            $perByte[] = ($fastest / $repeats) / strlen($body);
+        }
+
+        $growth = $perByte[count($perByte) - 1] / $perByte[0];
+
+        self::assertLessThan(3.0, $growth, sprintf(
+            'the <img> scan is not linear: per-byte cost grew %.2fx across an %dx body size range '
+                . '(%s ns/byte). A flat cost is linear; a cost that grows with n is quadratic, which '
+                . 'is a CPU-burn DoS on a malformed body.',
+            $growth,
+            end($sizes) / $sizes[0],
+            implode(' -> ', array_map(static fn (float $n): string => sprintf('%.2f', $n), $perByte))
+        ));
+    }
+
+    /**
+     * The same defect end to end, through the real delivery path, with no reflection: a malformed
+     * body must neither peg the CPU nor cost the caller their message.
+     *
+     * The budget is wall-clock and therefore generous. The pass-3 regex needs ~17s of pure CPU for
+     * this 400KB body (682ms at 80KB, x25 for the 5x size); this implementation needs ~0.6ms, and the
+     * measured cost is dominated by spawning the sink and the SMTP round trip (~0.4s). 5s sits ~12x
+     * above the real cost and ~3.4x below the regression it must catch — the widest gap available,
+     * and the reason the RIGOROUS linearity check above is a ratio rather than a stopwatch.
+     */
+    public function testSendMailDeliversAMalformedBodyWithoutBurningTheCpu(): void
+    {
+        $port = $this->startSink();
+        // 400KB of '<img ' openings: 80,000 restart points for an <img>-anchored regex.
+        $body = self::malformedImgBody(80000);
+
+        $started = hrtime(true);
+        $ok      = Mailer::sendMail(
+            $this->configs($port),
+            [['email' => 'to@example.com', 'name' => 'To']],
+            'Subject',
+            $body,
+            useEmbeddedImages: true,
+            embeddedImagesBaseDir: $this->tmpDir
+        );
+        $elapsed = (hrtime(true) - $started) / 1e9;
+
+        // The CPU budget is asserted FIRST, and deliberately: it is this test's primary claim, and a
+        // scan that blows it also blows the sink's 5s accept timeout, so $ok goes false as a knock-on.
+        // Asserting delivery first reported "Failed asserting that false is true" — a true failure
+        // with a useless message, pointing at the network instead of at the scan that caused it.
+        self::assertLessThan(5.0, $elapsed, sprintf(
+            'sending a %d-byte malformed body took %.2fs — the <img> scan is burning CPU on markup '
+                . 'it cannot match',
+            strlen($body),
+            $elapsed
+        ));
+        self::assertTrue($ok);
+
+        // ...and the whole point of not blanking the body: it must still be on the wire.
+        $eml = $this->sinkCapture()['eml'];
+        self::assertNotSame('', trim($eml), 'the message was delivered EMPTY');
+        self::assertStringContainsString('MARKER-START', $eml);
+        self::assertStringContainsString('MARKER-END', $eml);
     }
 
     /**

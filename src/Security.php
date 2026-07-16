@@ -164,14 +164,22 @@ class Security {
      * The given content is base64-encoded and written in the format:
      * "{length}-{base64_encoded_data}".
      *
+     * A PARTIAL write is a failure. fwrite() reports the number of bytes it actually wrote and
+     * returns a short count (or 0) rather than false when the disk is full or a quota is hit;
+     * accepting that would emit a truncated block and let encryptFileV2 report success for a
+     * ciphertext that can never be decrypted. $fp here is always a blocking local file opened by
+     * encryptFileV2, so a short count is never a benign "try again later" — it is data loss.
+     *
      * @param resource $fp File pointer opened for writing
      * @param string $text Raw content to be encoded and written
      *
-     * @return bool Returns true on success or false on failure
+     * @return bool Returns true only when the whole block reached the stream, false otherwise
      */
     private static function writeLengthEncodedBlock($fp, $text): bool {
         $textEncoded = base64_encode($text);
-        if (fwrite($fp, (mb_strlen($textEncoded, '8bit') . "-" . $textEncoded)) === false) {
+        $payload = mb_strlen($textEncoded, '8bit') . "-" . $textEncoded;
+        $written = fwrite($fp, $payload);
+        if ($written === false || $written !== mb_strlen($payload, '8bit')) {
             return false;
         }
 
@@ -239,6 +247,110 @@ class Security {
         $destPath = null;
 
         return $ret;
+    }
+
+    /**
+     * Rejects a file operation whose destination IS the source file.
+     *
+     * encryptFileV2/decryptFileV2 stream source -> destination: they open the destination for
+     * writing (which TRUNCATES it) and only then read the source. When both are the same file the
+     * source is destroyed before it is ever read, and the call still reports success — the read
+     * loop simply re-reads whatever the writer has already emitted. Callers lose the file with no
+     * error. In-place operation is therefore REFUSED here, loudly, before anything is opened.
+     *
+     * Identity is decided on RESOLVED paths and on file identity, never on the raw strings:
+     * './x' vs 'x', a trailing separator, '..' segments, a symlink to the source and — on Windows
+     * — an 8.3 short name or a different case all name the SAME file while comparing unequal as
+     * strings.
+     *
+     * Two checks, because neither alone is sufficient:
+     *  1. Device+inode equality. This is the PRIMARY check and the only one that catches a HARD
+     *     LINK or a junction: those are second, equally real names for one file, so realpath()
+     *     correctly reports two different paths and no path comparison can see through them.
+     *     Skipped when the platform reports no inode (ino 0) rather than guessing — an
+     *     unavailable inode must not make every ordinary call fail.
+     *  2. Canonical path equality (realpath), as the FALLBACK for a platform with no inodes.
+     *     Note realpath() output is canonical but not guaranteed fully expanded: it resolves a
+     *     junction while leaving an 8.3 short name in the prefix intact, so two of its results can
+     *     still differ for one file. Hence check 1 leads.
+     *
+     * Case is deliberately NOT folded, on any platform. Windows paths are usually
+     * case-insensitive, but a directory can opt into case sensitivity (fsutil, and WSL does it by
+     * default), where 'x.txt' and 'X.TXT' are two different files — folding case there REFUSES a
+     * legitimate call. Nothing is lost: on a case-insensitive volume the two spellings are one
+     * file, so realpath() returns the same on-disk name for both AND they share an inode.
+     *
+     * A destination that does not exist yet cannot be the source, so it needs no stat — that is
+     * the ordinary case and it must stay cheap and side-effect free.
+     *
+     * @param string $source Resolved source path, as returned by getRealSource()
+     * @param string $destination Resolved destination path, as returned by getRealDestination()
+     *
+     * @throws \Exception If the destination resolves to the same file as the source
+     * @return void
+     */
+    private static function assertDestinationIsNotSource(string $source, string $destination): void {
+        $message = "The destination must not be the same file as the source. Encrypting or "
+            . "decrypting a file in place would truncate it before it is read and destroy its "
+            . "contents; write to a different path.";
+
+        clearstatcache(true, $source);
+        clearstatcache(true, $destination);
+
+        // realpath() returns false for a path that does not exist — the normal case for a
+        // destination. Fall back to the given path then: getRealSource()/getRealDestination() have
+        // already resolved everything that CAN be resolved (the destination's directory is always
+        // realpath()-resolved), so the remaining string compare is between canonical forms.
+        $sourceReal = realpath($source);
+        $destinationReal = realpath($destination);
+
+        $paths = [];
+        foreach ([($sourceReal === false ? $source : $sourceReal), ($destinationReal === false ? $destination : $destinationReal)] as $path) {
+            // Unify the separators ONLY on Windows, where '/' and '\' are interchangeable. On
+            // POSIX a backslash is an ordinary, legal character in a file name, so rewriting it
+            // would make the distinct files "a\b.txt" and "a/b.txt" compare equal and refuse a
+            // legitimate call.
+            if (DIRECTORY_SEPARATOR === "\\") {
+                $path = str_replace("/", DIRECTORY_SEPARATOR, $path);
+            }
+
+            // Drop trailing separators ("x/" is the same file as "x") without eating a root.
+            // Belt-and-braces: getRealDestination() already folds a trailing separator away.
+            while (mb_strlen($path, '8bit') > 1 && str_ends_with($path, DIRECTORY_SEPARATOR)) {
+                $path = mb_substr($path, 0, -1, '8bit');
+            }
+
+            // Case is NOT folded here — see the note above. Folding it would reject a legitimate
+            // 'x.txt' -> 'X.TXT' on a case-sensitive directory (fsutil/WSL), and it catches
+            // nothing the inode check below does not already catch.
+            $paths[] = $path;
+        }
+
+        if ($paths[0] === $paths[1]) {
+            throw new \Exception($message);
+        }
+
+        // Distinct canonical paths can still be one file (hard link, junction). That needs both
+        // sides to exist: an unresolvable destination does not exist, hence is not the source.
+        if ($sourceReal === false || $destinationReal === false) {
+            return;
+        }
+
+        $sourceStat = @stat($sourceReal);
+        $destinationStat = @stat($destinationReal);
+        if ($sourceStat === false || $destinationStat === false) {
+            return;
+        }
+
+        // An inode of 0 means "not reported by this platform/filesystem", NOT "inode zero". Two
+        // unrelated files would both report 0 and every ordinary call would be rejected.
+        if (empty($sourceStat['ino']) || empty($destinationStat['ino'])) {
+            return;
+        }
+
+        if ($sourceStat['ino'] === $destinationStat['ino'] && $sourceStat['dev'] === $destinationStat['dev']) {
+            throw new \Exception($message);
+        }
     }
 
     /**
@@ -333,14 +445,23 @@ class Security {
     /**
      * Encrypts the given file and saves the result to a new destination file V2
      *
+     * IN-PLACE IS REFUSED. $destination must not resolve to the same file as $source: the
+     * destination is opened for writing (truncating it) before the source is read, so an in-place
+     * call would shred the plaintext and then encrypt its own output — and report success. The
+     * check compares device+inode plus RESOLVED paths, so './x' vs 'x', a trailing separator, a
+     * symlink, a hard link and (on Windows) an 8.3 short name or a case-insensitive spelling are
+     * all caught. Encrypt to a different path; if you need the result to land on the source path,
+     * rename it there yourself once this call has returned successfully.
+     *
      * @param string $source Path to the file to be encrypted (use tmp_name if from $_FILES)
      * @param string $key Encryption key to be used
-     * @param string $destination Path where the encrypted file should be saved
+     * @param string $destination Path where the encrypted file should be saved. MUST NOT be $source.
      * @param string|null $salt Optional salt for key derivation
      * @param string|null $permissionMode Optional file permission mode to apply to the destination file
      *
      * @return string Returns the path to the encrypted file
-     * @throws \Exception If encryption fails or file handling encounters an error
+     * @throws \Exception If $destination is the same file as $source, or if encryption fails or
+     *                    file handling encounters an error
      *
      * @ref https://riptutorial.com/php/example/25499/symmetric-encryption-and-decryption-of-large-files-with-openssl
      */
@@ -357,6 +478,10 @@ class Security {
 
         // Sets the destination file path
         $destination = self::getRealDestination($destination, $permissionMode);
+
+        // Refuse to write onto the source. This MUST precede the chmod and the fopen below: both
+        // touch the destination, and the fopen(..., 'wb') would truncate the source irrecoverably.
+        self::assertDestinationIsNotSource($source, $destination);
 
         // Sets the default permission mode if it's empty
         $mode = File::getPermissionMode($permissionMode);
@@ -526,13 +651,24 @@ class Security {
      * \Error rather than a detected tamper: nothing leaves this function without the rollback.
      *
      * A failure raised BEFORE the destination is opened (missing OpenSSL, unresolvable source or
-     * destination, an invalid $outReadMode, a header that does not match, a key deriveKey rejects)
-     * leaves an existing destination file untouched — this call never wrote to it, so it has
-     * nothing to undo and does not delete the caller's file.
+     * destination, a destination that is the source, an invalid $outReadMode, a header that does
+     * not match, a key deriveKey rejects) leaves an existing destination file untouched — not its
+     * contents, and not its permissions either: the chmod() that applies $permissionMode is
+     * deliberately deferred until this call is committed to opening the destination, so a rejected
+     * call cannot widen the mode of a file it never writes to.
+     *
+     * IN-PLACE IS REFUSED. $destination must not resolve to the same file as $source. Opening the
+     * destination truncates it, so decrypting in place destroys the ciphertext — and does it
+     * SILENTLY for a small file (the whole envelope happens to fit in the stream read buffer, so
+     * it still "works"), while a larger file fails mid-read and the rollback then deletes the
+     * caller's only copy. The check compares device+inode plus RESOLVED paths, so './x' vs 'x', a
+     * trailing separator, a symlink, a hard link and (on Windows) an 8.3 short name or a
+     * case-insensitive spelling are all caught. Decrypt to a different path and rename afterwards
+     * if needed.
      *
      * @param string $source Path to the file to be decrypted (use tmp_name when from $_FILES)
      * @param string $key Master key (>= 32 bytes), the same one passed to encryptFileV2
-     * @param string $destination Path where the decrypted file should be saved
+     * @param string $destination Path where the decrypted file should be saved. MUST NOT be $source.
      * @param string|null $permissionMode Optional file permission mode to apply to the destination file
      * @param string $outReadMode How the destination is opened. Accepts exactly "w"/"wb" (truncate,
      *                            the default) or "a"/"ab" (append — for reassembling a multi-part
@@ -541,8 +677,9 @@ class Security {
      *                            appending one destroys the caller's data.
      *
      * @return string Returns the path of the decrypted file
-     * @throws \Exception On an unknown $outReadMode, or on any source/destination resolution,
-     *                    authentication, truncation or tamper failure.
+     * @throws \Exception If $destination is the same file as $source, on an unknown $outReadMode,
+     *                    or on any source/destination resolution, authentication, truncation or
+     *                    tamper failure.
      */
     public static function decryptFileV2(string $source, string $key, string $destination, ?string $permissionMode = null, string $outReadMode = "w"): string {
         if (!extension_loaded('openssl')) {
@@ -554,6 +691,11 @@ class Security {
 
         // Sets the destination file path
         $destination = self::getRealDestination($destination, $permissionMode);
+
+        // Refuse to write onto the source. This MUST precede the chmod and both fopen()s below:
+        // opening the destination truncates the ciphertext we are about to read, and the rollback
+        // would then delete what is left of the caller's only copy.
+        self::assertDestinationIsNotSource($source, $destination);
 
         // Sets the default permission mode if it's empty
         $mode = File::getPermissionMode($permissionMode);
@@ -581,10 +723,10 @@ class Security {
         $destExistedBefore = is_file($destination);
         $appendStartOffset = ($appendMode && $destExistedBefore ? (int) filesize($destination) : 0);
 
-        // Sets the permission of the destination file
-        $oldMask = umask(0);
-        @chmod($destination, $mode);
-        umask($oldMask);
+        // NOTE: applying $permissionMode to the destination is DEFERRED to just before it is
+        // opened (see below). Doing it here would chmod the caller's file on the way to a failure
+        // that never writes a byte — a mismatched header or a rejected key would leave the
+        // destination's mode WIDENED, contradicting the "untouched" guarantee documented above.
 
         // Attempts to open the source file for reading
         if (!($fpIn = fopen($source, 'rb'))) {
@@ -642,6 +784,14 @@ class Security {
 
             // Attempts to open the destination file for writing
             if (!$error) {
+                // Sets the permission of the destination file. Deferred to here from before the
+                // header reads: every pre-open rejection above must leave the caller's destination
+                // exactly as it found it, permissions included. The chmod still happens immediately
+                // BEFORE the fopen, so the mode a written destination ends up with is unchanged.
+                $oldMask = umask(0);
+                @chmod($destination, $mode);
+                umask($oldMask);
+
                 if (!($fpOut = fopen($destination, $outReadMode))) {
                     $error = "Error while writing to the destination file.";
                 } else {
@@ -687,7 +837,14 @@ class Security {
                 $dataAad = $fileId . "|" . $version . "|D|" . $index;
                 $plaintext = openssl_decrypt($ciphertext, $cipher, $key, OPENSSL_RAW_DATA, $iv, $tag, $dataAad);
                 if ($plaintext !== false) {
-                    if (fwrite($fpOut, $plaintext) === false) {
+                    // fwrite() returns the number of bytes actually written: on a full disk or a
+                    // quota limit it returns a SHORT count (or 0), not false. Testing only for
+                    // false accepted a partial write and let this function return the destination
+                    // path as a success — silently truncated plaintext, which is exactly what the
+                    // FAILS LOUD contract above forbids. Demand every byte.
+                    $plaintextLength = mb_strlen($plaintext, '8bit');
+                    $written = fwrite($fpOut, $plaintext);
+                    if ($written === false || $written !== $plaintextLength) {
                         $error = "Error on writing plaintext";
                         break;
                     }
@@ -1470,54 +1627,162 @@ class Security {
     }
 
     /**
-     * Walks a container object and rewrites its sanitizable slots IN PLACE via $sanitize.
+     * The objects currently being walked, higher up the recursion stack. Purely the cycle guard's
+     * bookkeeping: every walk detaches its own object on the way out (finally), so between
+     * top-level calls this is empty.
+     *
+     * @var \SplObjectStorage<object, null>|null
+     */
+    private static ?\SplObjectStorage $objectWalkInProgress = null;
+
+    /**
+     * Walks a PLAIN object and rewrites its PUBLIC PROPERTIES in place via $sanitize.
      *
      * Shared by xssCleanRecursive() and filterValue() so the two walks cannot drift apart — they
-     * did drift, and the drift was the bug: `foreach ($object as $k => $v)` dispatches to the
-     * ITERATOR on any Traversable, so `$object->$k = ...` wrote a PHANTOM DYNAMIC property while
-     * the real storage (an ArrayObject's) kept the live payload, and the caller got a sanitized
-     * copy reachable only through a property nothing reads.
+     * did drift, and the drift was the bug.
      *
-     * Two disjoint slot kinds are visited:
-     *  - STORAGE, for an ArrayAccess container: the only way an ArrayObject/ArrayIterator is
-     *    actually read is offsetGet, so the write-back must go through offsetSet.
-     *  - PUBLIC PROPERTIES, via get_object_vars(), which sees exactly the public properties the
-     *    contract promises and is NOT hijacked by a custom iterator.
+     * THE CONTRACT IS DELIBERATELY NARROW, AND THE NARROWING IS THE FIX. Three earlier attempts
+     * tried to walk arbitrary container objects in place, and each one shipped a different
+     * fail-open:
+     *  - `$object->$k = ...` — `foreach ($object as $k => $v)` dispatches to the ITERATOR on any
+     *    Traversable, so this wrote a PHANTOM DYNAMIC property while the real storage (an
+     *    ArrayObject's) kept the live payload; the caller got a "sanitized" copy reachable only
+     *    through a property nothing reads.
+     *  - `$object->offsetSet($key, ...)` with ITERATION keys — correct only while getIterator()
+     *    happens to yield storage offsets. On a container that re-keys (array_values(), a sorted
+     *    or paginated view) it writes to INVENTED offsets: the live payload SURVIVES at the real
+     *    key and the container silently GROWS an entry, on the success path, with no error.
      *
-     * @param object $object   Container to walk, mutated in place
-     * @param callable $sanitize fn(mixed $value): mixed applied to every visited slot
+     * There is no general, correct way to address a foreign container's storage from out here.
+     * So this no longer tries. It walks exactly what it can address correctly — public properties,
+     * via get_object_vars(), which no custom iterator can steer — and THROWS on everything else.
+     * Refusing loudly is the whole point: silently returning an unwalked container IS the
+     * fail-open, only quieter.
+     *
+     * @param object $object   Plain object to walk, mutated in place
+     * @param callable $sanitize fn(mixed $value): mixed applied to every public property
      * @return void
+     * @throws \InvalidArgumentException When $object is not a plain object whose public properties
+     *                                   are its data — see assertWalkablePlainObject() for the
+     *                                   refused shapes and what to do instead.
      */
     private static function walkObjectInPlace(object $object, callable $sanitize): void {
-        // An enum case is a process-wide singleton whose name/value are readonly constants, not
-        // caller data: there is nothing to sanitize, and writing to it is an \Error.
+        // An enum case is a process-wide singleton whose name/value are compile-time constants
+        // written in SOURCE — they are never caller data, so there is genuinely nothing to
+        // sanitize and returning it untouched is the CORRECT result, not a slot skipped. (It is
+        // also the only thing possible: writing to them is an \Error.) This is the one shape this
+        // walk handles completely by doing nothing, which is why it returns instead of throwing.
         if ($object instanceof \UnitEnum) {
             return;
         }
 
-        // Array-like storage. SplObjectStorage is excluded on purpose: it is ArrayAccess, but its
-        // OFFSETS are objects while iteration yields integer positions, so writing back by
-        // iteration key is a TypeError — its attached data is not addressable by the keys foreach
-        // hands us, and pretending otherwise would trade one broken walk for another.
-        if ($object instanceof \ArrayAccess && $object instanceof \Traversable && !($object instanceof \SplObjectStorage)) {
-            // Snapshot first: writing through offsetSet while the iterator is live is undefined.
-            foreach (iterator_to_array($object) as $key => $value) {
-                $object->offsetSet($key, $sanitize($value));
-            }
+        self::assertWalkablePlainObject($object);
+
+        // Cycle guard. A back-reference ($a->self = $a, or $a->b->a) used to recurse until memory
+        // was exhausted and die with an UNCATCHABLE fatal. An object already being walked higher
+        // up the stack is skipped: it is the same instance, it is already being sanitized by that
+        // frame, and re-entering it could never terminate.
+        self::$objectWalkInProgress ??= new \SplObjectStorage();
+        if (self::$objectWalkInProgress->contains($object)) {
+            return;
         }
 
-        // Public properties. get_object_vars() is called from this scope, so private/protected
-        // properties are invisible here — which IS the documented contract.
-        foreach (get_object_vars($object) as $key => $value) {
-            // A readonly property cannot be rewritten in place from outside its declaring scope:
-            // the assignment is an \Error, even when the value needs no change at all. Skip it
-            // rather than crash on an object that merely has a readonly id.
+        self::$objectWalkInProgress->attach($object);
+
+        try {
+            // get_object_vars() is called from this scope, so private/protected properties are
+            // invisible here — which IS the documented contract — and, unlike foreach, it cannot
+            // be steered by a custom iterator.
+            foreach (get_object_vars($object) as $key => $value) {
+                $object->$key = $sanitize($value);
+            }
+        } finally {
+            // Detach on every exit, throw included: otherwise a refusal deep in the graph would
+            // leave this instance marked forever and the caller's NEXT call would skip it
+            // silently unsanitized — a fail-open manufactured by the cycle guard itself.
+            self::$objectWalkInProgress->detach($object);
+        }
+    }
+
+    /**
+     * Enforces walkObjectInPlace's narrow contract: an object is walked only when its public
+     * properties ARE its data. Anything else is REFUSED, loudly, rather than handed back looking
+     * sanitized.
+     *
+     * REFUSED, and why each one cannot be done correctly from out here:
+     *  - Traversable and/or ArrayAccess — ArrayObject, ArrayIterator, SplObjectStorage, WeakMap,
+     *    SplFixedArray, any custom collection. Their payload lives in storage reached through
+     *    offsets (or through nothing but a getter), and an iteration key is NOT a storage address:
+     *    SplObjectStorage iterates integer positions while its offsets are objects, WeakMap
+     *    iterates object keys, and any re-keying view (sorted, paginated, array_values()) hands out
+     *    keys that address nothing. Writing by iteration key is a TypeError at best and an invented
+     *    entry beside the surviving payload at worst.
+     *  - a public readonly property. It cannot be rewritten in place from outside its declaring
+     *    scope — the assignment is an \Error — and it is on the object's PUBLIC data surface, so
+     *    skipping it would return the object with attacker-controlled data still live in it. What
+     *    this walk can SEE it must handle; private/protected state is a different case, outside
+     *    the contract by construction and documented as not walked.
+     *
+     * @param object $object
+     * @return void
+     * @throws \InvalidArgumentException For the shapes above. Returns silently for a plain object,
+     *                                   including one that carries private/protected state or an
+     *                                   uninitialized (and therefore invisible) readonly property.
+     */
+    private static function assertWalkablePlainObject(object $object): void {
+        if ($object instanceof \Traversable || $object instanceof \ArrayAccess) {
+            throw new \InvalidArgumentException(self::unwalkableObjectMessage(
+                $object,
+                'its payload lives in container storage, and this walk cannot address that storage '
+                . '— iteration keys are not storage offsets, so writing back through them either '
+                . 'raises a TypeError or invents an entry while the real value survives',
+                'Extract the data where the storage IS addressable — $value->getArrayCopy(), or '
+                . 'your container\'s own getter — sanitize that ARRAY, and write it back through '
+                . 'the container\'s own API.'
+            ));
+        }
+
+        foreach (get_object_vars($object) as $key => $_) {
             if (self::isReadOnlyProperty($object, $key)) {
-                continue;
+                throw new \InvalidArgumentException(self::unwalkableObjectMessage(
+                    $object,
+                    sprintf(
+                        'its public readonly property $%s cannot be rewritten in place from outside '
+                        . 'its declaring scope, and skipping it would hand the object back with '
+                        . 'that property still unsanitized',
+                        $key
+                    ),
+                    sprintf(
+                        'Sanitize the value BEFORE constructing %s — a readonly property is a '
+                        . 'promise that its value was settled at construction, so that is the only '
+                        . 'place it can be settled correctly. If the data genuinely arrives '
+                        . 'untrusted and must be cleaned afterwards, $%s should not be readonly.',
+                        $object::class,
+                        $key
+                    )
+                ));
             }
-
-            $object->$key = $sanitize($value);
         }
+    }
+
+    /**
+     * The refusal message. It must leave the caller with a working alternative, not just a "no" —
+     * a refusal the caller cannot act on just moves the problem.
+     *
+     * @param object $object The object being refused
+     * @param string $reason Why this walk cannot handle it correctly
+     * @param string $remedy What the caller should do instead
+     * @return string
+     */
+    private static function unwalkableObjectMessage(object $object, string $reason, string $remedy): string {
+        return sprintf(
+            'Security cannot sanitize %s in place: %s. This walk handles strings, arrays '
+            . '(recursively), and the public properties of plain objects only — it refuses what it '
+            . 'cannot address rather than hand back an object that merely looks sanitized. %s',
+            $object::class,
+            $reason,
+            $remedy
+        );
     }
 
     /**
@@ -1584,18 +1849,41 @@ class Security {
      *    rewriting it could collide two entries into one and silently drop data, so keys are left
      *    byte-for-byte intact and MAY STILL CONTAIN LIVE MARKUP (the keys of $_POST are
      *    attacker-controlled). If you render keys, escape them at output.
-     *  - Of an object, only ArrayAccess STORAGE and PUBLIC PROPERTIES are walked. Private/protected
-     *    state, READONLY properties (they cannot be rewritten in place — the assignment is an
-     *    \Error, so they are skipped), data reachable only through a custom Iterator/IteratorAggregate,
-     *    and SplObjectStorage's attached data are ALL left unsanitized. Sanitize those before
-     *    construction, or sanitize on output.
+     *  - OBJECTS: ONLY a PLAIN object's PUBLIC PROPERTIES are walked. This does NOT walk container
+     *    storage of any kind, and does not pretend to. Two shapes are REFUSED with an
+     *    \InvalidArgumentException, rather than returned unwalked — a container that comes back
+     *    looking sanitized while still holding the live payload is the bug, not the safe default:
+     *      * Traversable or ArrayAccess (ArrayObject, ArrayIterator, SplObjectStorage, WeakMap,
+     *        SplFixedArray, any custom collection). Extract the data yourself
+     *        (e.g. $ao->getArrayCopy()), sanitize the ARRAY, write it back via the container's API.
+     *      * a public READONLY property. It cannot be rewritten from outside its declaring scope,
+     *        and it CAN hold attacker data (`new Dto(bio: $_POST['bio'])`), so skipping it would be
+     *        a silent fail-open on the object's own public surface. Sanitize before construction —
+     *        readonly means the value was settled there — or do not make that property readonly.
+     *        NOTE: this refuses the object even when the readonly value needed no change (a
+     *        readonly int id). That is deliberate: a predictable refusal beats a rule the caller
+     *        has to evaluate per value.
+     *  - PRIVATE/PROTECTED state is never walked and is left UNSANITIZED — it is not reachable from
+     *    here, and unlike a public readonly property it is not part of the object's public data
+     *    surface, so it is outside this contract rather than a slot silently skipped inside it.
+     *    Sanitize it before construction, or sanitize on output.
+     *  - An object graph is walked only ONCE per instance per cycle: a back-reference ($a->b->a) is
+     *    detected and not re-entered, so a cyclic graph terminates instead of exhausting memory.
+     *  - If it THROWS partway through an object graph, the objects already visited KEEP their
+     *    sanitized values — the walk is in-place and has no rollback. Discard the object on throw;
+     *    do not use it half-walked.
      *
-     * @param mixed $input The value to sanitize. Arrays are copied (copy-on-write); objects are
-     *                     walked recursively and rewritten IN PLACE, and the same instance is
-     *                     returned — see HONEST LIMITS for exactly which slots are visited. An enum
-     *                     case is returned untouched (its cases are constants, not caller data).
+     * @param mixed $input The value to sanitize. Strings are sanitized; arrays are copied
+     *                     (copy-on-write) and walked recursively; a PLAIN object is walked
+     *                     recursively and rewritten IN PLACE, and the same instance is returned.
+     *                     An enum case is returned untouched — its cases are compile-time
+     *                     constants, not caller data, so there is nothing in one to sanitize.
      *                     Non-string scalars are returned unchanged.
      * @return mixed The sanitized value
+     * @throws \InvalidArgumentException When $input contains an object this walk cannot sanitize
+     *                                   correctly (Traversable, ArrayAccess, or a public readonly
+     *                                   property) — see HONEST LIMITS. The message names the
+     *                                   alternative.
      */
     public static function xssCleanRecursive(mixed $input): mixed {
         if ($input === null || $input === "" || is_bool($input) || filter_var($input, FILTER_VALIDATE_INT) || filter_var($input, FILTER_VALIDATE_FLOAT)) {
@@ -1621,21 +1909,24 @@ class Security {
     /**
      * Retrieves a value from an array/object/scalar, applying the selected transformations.
      *
-     * Arrays and objects are walked recursively and the filters are applied to every scalar leaf;
-     * the container type is preserved (an object stays an object, its public properties rewritten
-     * in place). A scalar is filtered directly.
+     * Arrays and PLAIN objects are walked recursively and the filters are applied to every scalar
+     * leaf; the container type is preserved (an object stays an object, its public properties
+     * rewritten in place). A scalar is filtered directly.
      *
      * MUTATION ASYMMETRY: an array $source is copied (PHP copy-on-write), so the caller's array is
      * untouched and only the return value is filtered. An OBJECT $source is a shared handle, so it
      * is rewritten IN PLACE — the caller's object is modified and the same instance is returned.
      * Clone before calling if you need the original intact.
      *
-     * WHAT THE OBJECT WALK VISITS: ArrayAccess storage (via offsetSet, so an ArrayObject is really
-     * filtered rather than shadowed by a phantom dynamic property) and PUBLIC properties. NOT
-     * visited, and therefore surviving UNFILTERED: private/protected state, readonly properties
-     * (they cannot be rewritten in place), data reachable only through a custom Iterator, and
-     * SplObjectStorage's attached data. An enum case is returned untouched. Array KEYS are never
-     * filtered — only values are.
+     * WHAT THE OBJECT WALK VISITS: the PUBLIC PROPERTIES of a plain object, and nothing else. It
+     * does NOT walk container storage. An object that is Traversable or ArrayAccess (ArrayObject,
+     * ArrayIterator, SplObjectStorage, WeakMap, any custom collection), or that has a public
+     * readonly property, is REFUSED with an \InvalidArgumentException naming what to do instead —
+     * it is not returned unfiltered, because a container that comes back looking filtered while
+     * still holding the raw value is exactly the bug this narrow contract exists to kill. Filter
+     * such a container yourself: extract its data, filter the ARRAY, write it back. An enum case is
+     * returned untouched (nothing in one is caller data). PRIVATE/PROTECTED state is never walked
+     * and survives UNFILTERED. Array KEYS are never filtered — only values are.
      *
      * @param mixed $source The input array, object, or scalar
      * @param string|null $key If set, extracts a value from $source by key. ARRAYS ONLY: if $source
@@ -1667,6 +1958,12 @@ class Security {
      * @param bool $jsonDecode Whether to JSON-decode the result
      *
      * @return mixed The filtered value
+     * @throws \InvalidArgumentException When the walked value contains an object this walk cannot
+     *                                   filter correctly (Traversable, ArrayAccess, or a public
+     *                                   readonly property) — see WHAT THE OBJECT WALK VISITS. The
+     *                                   walk is in-place with no rollback, so an object graph that
+     *                                   throws partway keeps the filters already applied: discard
+     *                                   it rather than using it half-filtered.
      */
     public static function filterValue(
         mixed $source,
@@ -1788,10 +2085,9 @@ class Security {
                 $value[$k] = $recurse($v);
             }
         } elseif (is_object($value)) {
-            // Route every write through the SAME walk xssCleanRecursive uses. Branching on
-            // is_object() and assigning `$value->$k` was the wrong discriminator: on an
-            // ArrayAccess+Traversable container (ArrayObject) it wrote a phantom dynamic property
-            // and left the real storage holding the unfiltered value.
+            // Route every write through the SAME walk xssCleanRecursive uses, so the two cannot
+            // drift apart and offer different contracts for the same object. That walk is narrow
+            // on purpose and REFUSES what it cannot address correctly — see walkObjectInPlace().
             self::walkObjectInPlace($value, $recurse);
         } else {
             $value = $applyFilters($value);

@@ -71,9 +71,13 @@ class Mailer {
      *                    unreadable or non-existent path, or a path that resolves OUTSIDE the base
      *                    directory — is left in the body EXACTLY as the caller wrote it: nothing is
      *                    read, nothing is attached, and the send does not fail.
-     *                    Tag detection understands quoted attributes, so a '>' inside src="…"/alt="…"
-     *                    does not truncate the tag. If the scan itself fails (a PCRE limit), NOTHING
-     *                    is embedded and the body is sent exactly as resolved — never emptied.
+     *                    Tag detection is a single linear forward pass (splitOnImgTags) that follows
+     *                    HTML5 tag boundaries: a '>' inside src="…"/alt="…" does not truncate the
+     *                    tag, and `<imgfoo>` is not an <img>. It cannot fail and cannot be made to
+     *                    backtrack, so the body it hands on is the resolved body with, at worst, no
+     *                    image embedded — never a truncated or empty one. An unterminated tag ends
+     *                    the scan (HTML5 drops such a tag too): the rest of the body still ships
+     *                    verbatim, simply with nothing embedded from that point on.
      *                    Requires $embeddedImagesBaseDir; see there.
      * @param string $charset Charset (default: UTF-8)
      * @param bool $useAuth Whether to authenticate with $configs['user'] / $configs['pass'].
@@ -343,76 +347,71 @@ class Mailer {
 
             $mail->Body = $params['template'];
             if($params['useEmbeddedImages']){
-                // Each alternative is mutually exclusive on its first character, so at any position
-                // exactly one can match: the loop is deterministic and the possessive `*+` forbids
-                // it from ever giving anything back. That is what makes this LINEAR.
-                //
-                // Both of its predecessors shipped a broken body, in opposite directions: greedy
-                // `[\w\W]{0,}` ran from the first `<img` to the LAST `>`, eating the text between
-                // two images; the lazy `[\w\W]*?` that replaced it expanded one character at a time,
-                // and each step costs a backtrack — so a single ~500KB inline base64 logo exhausted
-                // pcre.backtrack_limit (1M), both preg_ calls below returned FALSE, and the message
-                // went out EMPTY.
-                //
-                // Recognising `"…"`/`'…'` as units is also what keeps a '>' inside an attribute
-                // (alt="a > b") from truncating the tag and leaking the remainder into the body.
-                $imgRegex = '/<img(?:[^>"\']|"[^"]*"|\'[^\']*\')*+>/i';
+                // Tag detection is a single forward pass — see splitOnImgTags(). It replaces an
+                // `<img`-anchored regex whose every incarnation shipped a broken body. Naming the
+                // three quantifiers rather than quoting the patterns whole is deliberate: the lazy
+                // one spelled in full ends in the two characters that CLOSE PHP MODE, even inside a
+                // `//` comment, which silently turns the rest of this file into inline HTML.
+                //   * greedy `[\w\W]{0,}` ran from the first `<img` to the LAST `>`, eating the
+                //     text between two images;
+                //   * lazy `[\w\W]*` + `?` expanded one character at a time and each step cost a
+                //     backtrack, so one ~500KB inline base64 logo exhausted pcre.backtrack_limit
+                //     (1M), both preg_ calls returned FALSE, and the message went out EMPTY;
+                //   * possessive `(?:[^>"']|"[^"]*"|'[^']*')*+` could not blow the backtrack limit
+                //     — but it could not stop, either. Every `<img` that does NOT reach a `>` scans
+                //     to end-of-subject and fails, and PCRE then restarts the whole attempt at the
+                //     next `<`, so a body of many unterminated `<img` openings cost O(n^2):
+                //     measured 4.0x per doubling, 0.69s at 80KB, ~110s at 1MB. No PCRE limit fires
+                //     (a possessive repeat does not backtrack, so nothing is counted), so there was
+                //     no guard rail — it simply pegged a core. Its comment claimed "LINEAR".
+                // The restart is the whole defect, and no regex anchored on a literal `<img` can
+                // avoid it. A cursor that only ever moves forward can.
+                $scan = self::splitOnImgTags($params['template']);
 
-                // Split into a LOCAL var: $params['template'] must stay a string for AltBody below.
-                $imgsBody  = [];
-                $matched   = preg_match_all($imgRegex, $params['template'], $imgsBody);
-                $bodyParts = $matched === false ? false : preg_split($imgRegex, $params['template']);
+                // Built in a LOCAL and assigned ONCE. $mail->Body used to be blanked and refilled in
+                // place, which is what let a mid-scan failure deliver an empty email; and
+                // $params['template'] must stay a string for the AltBody below.
+                $rebuilt = '';
+                foreach ($scan['parts'] AS $keyPart => $partString){
+                    $rebuilt .= $partString;
 
-                // A preg_ function reports failure by RETURNING FALSE, quietly. Unchecked, that
-                // false reached `foreach (false)` while Body had already been blanked — the empty
-                // email above. Body is therefore blanked only once the scan is known to have
-                // worked, and a failed scan simply embeds nothing: the resolved body still ships
-                // intact, with its <img> tags exactly as the caller wrote them. That is the same
-                // outcome this function already documents for every image it cannot embed.
-                if($matched !== false && $bodyParts !== false){
-                    $mail->Body = "";
-                    foreach ($bodyParts AS $keyPart => $partString){
-                        $mail->Body .= $partString;
-
-                        // $imgsBody[0] is the list of whole <img> matches, and the regex captures
-                        // nothing else. Indexing the OUTER array by the part number handed an ARRAY
-                        // to getImageSrc(string) — an uncatchable-here TypeError on any body with an
-                        // image. preg_split also yields one more part than there are tags, so the
-                        // last part legitimately has no image after it.
-                        if(!isset($imgsBody[0][$keyPart])) {
-                            continue;
-                        }
-
-                        $imgTag = $imgsBody[0][$keyPart];
-                        $cid    = "attach-" . $keyPart;
-
-                        // The src decides only WHETHER a file we already vetted gets attached — it
-                        // is never itself handed to the mailer. Passing the raw src to
-                        // addEmbeddedImage() made every <img> an arbitrary-file-read primitive that
-                        // mails the file OUT: <img src="/etc/passwd"> in an attacker-influenced body
-                        // attached /etc/passwd to the outgoing message. Only a path that truly
-                        // resolves inside the caller's allow-listed base directory survives
-                        // resolveEmbeddableImage().
-                        $path = self::resolveEmbeddableImage(self::getImageSrc($imgTag), $params['imagesBaseDir']);
-
-                        $embedded = false;
-                        if($path !== null) {
-                            try {
-                                $mail->addEmbeddedImage($path, $cid, $cid);
-                                $embedded = true;
-                            } catch (\PHPMailer\PHPMailer\Exception $e) {
-                                $embedded = false;
-                            }
-                        }
-
-                        // Point the tag at the attachment we just made, or — when it could not be
-                        // embedded — put the caller's own tag back untouched, leaving it a plain
-                        // reference the mail client may or may not fetch. Dropping it would silently
-                        // strip the image out of the body; rethrowing would fail an otherwise valid
-                        // send.
-                        $mail->Body .= $embedded ? ('<img src="cid:' . $cid . '">') : $imgTag;
+                    // parts always holds exactly one more entry than tags, so the last part
+                    // legitimately has no image after it.
+                    if(!isset($scan['tags'][$keyPart])) {
+                        continue;
                     }
+
+                    $imgTag = $scan['tags'][$keyPart];
+                    $cid    = "attach-" . $keyPart;
+
+                    // The src decides only WHETHER a file we already vetted gets attached — it
+                    // is never itself handed to the mailer. Passing the raw src to
+                    // addEmbeddedImage() made every <img> an arbitrary-file-read primitive that
+                    // mails the file OUT: <img src="/etc/passwd"> in an attacker-influenced body
+                    // attached /etc/passwd to the outgoing message. Only a path that truly
+                    // resolves inside the caller's allow-listed base directory survives
+                    // resolveEmbeddableImage().
+                    $path = self::resolveEmbeddableImage(self::getImageSrc($imgTag), $params['imagesBaseDir']);
+
+                    $embedded = false;
+                    if($path !== null) {
+                        try {
+                            $mail->addEmbeddedImage($path, $cid, $cid);
+                            $embedded = true;
+                        } catch (\PHPMailer\PHPMailer\Exception $e) {
+                            $embedded = false;
+                        }
+                    }
+
+                    // Point the tag at the attachment we just made, or — when it could not be
+                    // embedded — put the caller's own tag back untouched, leaving it a plain
+                    // reference the mail client may or may not fetch. Dropping it would silently
+                    // strip the image out of the body; rethrowing would fail an otherwise valid
+                    // send.
+                    $rebuilt .= $embedded ? ('<img src="cid:' . $cid . '">') : $imgTag;
                 }
+
+                $mail->Body = $rebuilt;
             }
 
             $mail->AltBody = strip_tags($mail->Body);
@@ -452,6 +451,136 @@ class Mailer {
             'none'                                              => '',
             default                                             => null,
         };
+    }
+
+    /**
+     * Splits $html into the literal text around its <img> tags and the tags themselves.
+     *
+     * LINEAR, and this comment is checked by a test rather than asserted by a comment: every byte is
+     * read by at most one strpos()/strcspn() skip plus at most one findImgTagEnd() pass, because the
+     * cursor NEVER moves backwards. That is the entire point. The regexes that came before all
+     * restarted the match at the next `<` after a failed attempt, and a body of unterminated `<img`
+     * openings therefore cost O(n^2) — see the note at the call site.
+     *
+     * Tag boundaries follow HTML5: the name ends at whitespace, '/' or '>', and a quoted attribute
+     * value is a unit, so a '>' inside src="…"/alt="…" does NOT end the tag. `<imgfoo>` is NOT an
+     * <img> (the old regex thought it was; getImageSrc() correctly disagreed and returned '', so
+     * such a tag was never embedded either way — only the attach-N numbering of LATER images moves).
+     *
+     * An unterminated tag — '<img' with no closing '>', or a quoted value with no closing quote —
+     * runs to end-of-input by definition, so scanning simply stops there and the remainder is
+     * returned as ordinary literal text. HTML5 drops such a tag too. Nothing is embedded from that
+     * point on; nothing is lost.
+     *
+     * The return is a LOSSLESS partition: parts[0] . tags[0] . parts[1] . tags[1] . … . parts[n]
+     * reassembles $html byte for byte, and parts always holds exactly count(tags)+1 entries. That
+     * invariant — not a return-value check — is what now makes it impossible for this scan to
+     * deliver an empty body; unlike preg_split(), it has no failure mode to guard against.
+     *
+     * @param string $html The resolved message body, assumed hostile and possibly malformed
+     * @return array{parts: list<string>, tags: list<string>} The literal text between the tags, and
+     *                                                        each whole <img …> tag in order
+     */
+    private static function splitOnImgTags(string $html): array {
+        $parts  = [];
+        $tags   = [];
+        $length = strlen($html);
+        $cursor = 0; // start of the literal part being accumulated
+        $scan   = 0; // the read head — only ever ADVANCES, which is what bounds this at O(n)
+
+        while ($scan < $length) {
+            $lt = strpos($html, '<', $scan);
+            if ($lt === false) {
+                break;
+            }
+
+            if (!self::isImgTagStart($html, $lt, $length)) {
+                $scan = $lt + 1;
+                continue;
+            }
+
+            // +4 skips the '<img' we just identified; the terminator itself is re-read as the first
+            // character of the attribute list, where '>' ends the tag immediately (`<img>`).
+            $end = self::findImgTagEnd($html, $lt + 4, $length);
+            if ($end === null) {
+                break; // end of input inside the tag: no closing '>' exists anywhere after it
+            }
+
+            $parts[] = substr($html, $cursor, $lt - $cursor);
+            $tags[]  = substr($html, $lt, $end - $lt + 1);
+            $cursor  = $end + 1;
+            $scan    = $cursor;
+        }
+
+        $parts[] = substr($html, $cursor);
+
+        return ['parts' => $parts, 'tags' => $tags];
+    }
+
+    /**
+     * Tells whether the '<' at $lt opens an <img> tag.
+     *
+     * Case-insensitive, and the name must be followed by a character HTML5 accepts as the end of a
+     * tag name — whitespace, '/' or '>' — so `<image>` and `<imgfoo>` are not <img> tags. A '<img'
+     * sitting at the very end of the input has no terminator and is therefore not one either.
+     *
+     * @param string $html The body being scanned
+     * @param int $lt Offset of the '<'
+     * @param int $length strlen($html), passed in so this stays O(1)
+     * @return bool TRUE when an <img> tag starts at $lt
+     */
+    private static function isImgTagStart(string $html, int $lt, int $length): bool {
+        if ($lt + 4 >= $length) {
+            return false;
+        }
+        if (substr_compare($html, 'img', $lt + 1, 3, true) !== 0) {
+            return false;
+        }
+
+        return match ($html[$lt + 4]) {
+            '>', '/', ' ', "\t", "\n", "\r", "\f" => true,
+            default                               => false,
+        };
+    }
+
+    /**
+     * Finds the '>' that closes the tag whose attribute list starts at $from.
+     *
+     * ONE forward pass: the C-level strcspn()/strpos() skips below only ever move the cursor
+     * RIGHT, so this costs O($length - $from) no matter how hostile the markup is. It is also what
+     * keeps the 600KB base64 src of an inline logo cheap — that whole run is skipped by a single
+     * strpos() to the closing quote, not one PHP loop iteration per byte.
+     *
+     * A quoted value is a unit: a '>' inside it does not close the tag.
+     *
+     * @param string $html The body being scanned
+     * @param int $from Offset of the first character after '<img'
+     * @param int $length strlen($html)
+     * @return int|null Offset of the closing '>', or NULL when the input ends inside the tag
+     */
+    private static function findImgTagEnd(string $html, int $from, int $length): ?int {
+        $scan = $from;
+
+        while ($scan < $length) {
+            // Skip everything that can neither open a quoted value nor close the tag.
+            $scan += strcspn($html, "\"'>", $scan);
+            if ($scan >= $length) {
+                return null;
+            }
+
+            $char = $html[$scan];
+            if ($char === '>') {
+                return $scan;
+            }
+
+            $close = strpos($html, $char, $scan + 1);
+            if ($close === false) {
+                return null; // an attribute value that is never closed runs to end of input
+            }
+            $scan = $close + 1;
+        }
+
+        return null;
     }
 
     /**
