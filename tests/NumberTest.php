@@ -101,7 +101,7 @@ final class NumberTest extends TestCase
 
     // ------------------------------------------------------ roundDecimal(): documented edge cases
 
-    public function testRoundDecimalShortCircuitsZeroToPositiveZero(): void
+    public function testRoundDecimalReturnsFloatZeroForZero(): void
     {
         $this->assertSame(0.0, Number::roundDecimal(0.0));
         $this->assertSame(0.0, Number::roundDecimal(-0.0, 2, 'floor'));
@@ -109,17 +109,67 @@ final class NumberTest extends TestCase
     }
 
     /**
-     * The docblock promises this silent fallback explicitly, so it is a contract, not an accident:
-     * an unknown $method — including a wrong-case 'FLOOR' — is replaced with 'round'.
+     * BEHAVIOR CHANGE (pass 2). Zero used to be short-circuited by `if (empty($value)) return 0;`
+     * — an INT literal that only became 0.0 because the return type coerced it, so adding
+     * declare(strict_types=1) to Number.php would have turned every zero into a TypeError. The
+     * short-circuit is gone and zero now takes the ordinary path.
+     *
+     * The observable consequence, pinned here: IEEE-754 signed zero survives. -0.0 in gives -0.0
+     * out (it stringifies as "-0"), which is what the method ALREADY did for -0.004 — the
+     * short-circuit only normalised the literal -0.0 and left the inconsistency everywhere else.
+     * Zero is now consistent with every other value instead of being consistent with nothing.
      */
-    public function testRoundDecimalSilentlyFallsBackToRoundForAnUnknownMethod(): void
+    public function testRoundDecimalPreservesSignedZeroConsistentlyForZeroAndForSmallNegatives(): void
     {
-        // 'floor' would give 8.19; the fallback rounds instead.
-        $this->assertSame(8.2, Number::roundDecimal(8.199, 2, 'FLOOR'));
-        $this->assertSame(8.19, Number::roundDecimal(8.199, 2, 'floor'));
+        // Before the fix this was "0": the short-circuit normalised the sign for a literal -0.0...
+        $this->assertSame('-0', (string)Number::roundDecimal(-0.0, 2, 'floor'));
+        // ...but never for a small negative, which returned "-0" then and now.
+        $this->assertSame('-0', (string)Number::roundDecimal(-0.004, 2));
 
-        $this->assertSame(8.2, Number::roundDecimal(8.199, 2, 'trunc'));
-        $this->assertSame(8.2, Number::roundDecimal(8.199, 2, ''));
+        // Signed zero still compares equal to positive zero, so arithmetic callers see no change.
+        $this->assertSame(0.0, Number::roundDecimal(-0.0, 2, 'floor'));
+        $this->assertTrue(Number::roundDecimal(-0.004, 2) == 0.0);
+    }
+
+    /**
+     * BEHAVIOR CHANGE (pass 2). An unrecognised $method used to be SILENTLY replaced with 'round',
+     * so roundDecimal($x, 2, 'FLOOR') quietly returned a rounded number that looked plausible and
+     * was wrong. It now throws. This test previously pinned the silent fallback; it pins the throw.
+     */
+    public function testRoundDecimalRejectsAWrongCaseMethod(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage("\$method must be exactly 'round', 'floor' or 'ceil'");
+        Number::roundDecimal(8.199, 2, 'FLOOR');
+    }
+
+    /**
+     * 'trunc' is the case case-insensitivity would NOT have caught: it is a real rounding mode in
+     * other languages, it is not one here, and silently rounding it is a wrong answer. It is the
+     * reason $method is validated by exact match rather than case-folded.
+     */
+    public function testRoundDecimalRejectsAPlausibleButUnsupportedMethod(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage("\$method must be exactly 'round', 'floor' or 'ceil'");
+        Number::roundDecimal(8.199, 2, 'trunc');
+    }
+
+    public function testRoundDecimalRejectsAnEmptyMethod(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage("\$method must be exactly 'round', 'floor' or 'ceil'");
+        Number::roundDecimal(8.199, 2, '');
+    }
+
+    /**
+     * The three supported modes must still be accepted verbatim — the guard rejects typos, not work.
+     */
+    public function testRoundDecimalAcceptsTheThreeSupportedMethods(): void
+    {
+        $this->assertSame(8.2, Number::roundDecimal(8.199, 2, 'round'));
+        $this->assertSame(8.19, Number::roundDecimal(8.199, 2, 'floor'));
+        $this->assertSame(8.2, Number::roundDecimal(8.191, 2, 'ceil'));
     }
 
     public function testRoundDecimalAcceptsNegativePrecisionToRoundToTensAndHundreds(): void
@@ -282,6 +332,66 @@ final class NumberTest extends TestCase
             $this->assertGreaterThanOrEqual(1.0E-20, $value);
             $this->assertLessThanOrEqual(1.0E-19, $value);
         }
+    }
+
+    // ------------------------------- randomDecimal(): SECURITY — the draw must come from the CSPRNG
+
+    /**
+     * BEHAVIOR CHANGE (pass 2). randomDecimal() drew with rand(), which PHP 7.1+ aliases to
+     * mt_rand() — seedable Mt19937, predictable from observed output. It now draws with
+     * random_int().
+     *
+     * This is the decisive difference, not a statistical hunch: mt_srand() makes rand() replay an
+     * identical sequence, and has no effect whatever on random_int(). So under the old
+     * implementation both loops below produced the SAME 20 values and this test failed; under the
+     * new one they agree only if 20 independent draws from a 1,000,001-value range all coincide
+     * (~1e-120).
+     */
+    public function testRandomDecimalDrawsFromTheCsprngAndIgnoresTheMtRandSeed(): void
+    {
+        try {
+            mt_srand(12345);
+            $first = [];
+            for ($i = 0; $i < 20; $i++) {
+                $first[] = Number::randomDecimal(0.0, 1.0, 6);
+            }
+
+            mt_srand(12345);
+            $second = [];
+            for ($i = 0; $i < 20; $i++) {
+                $second[] = Number::randomDecimal(0.0, 1.0, 6);
+            }
+
+            $this->assertNotSame(
+                $first,
+                $second,
+                'randomDecimal() replayed a seeded sequence: it is drawing from Mt19937, not the CSPRNG'
+            );
+        } finally {
+            // Do not leave the global Mt19937 seeded for whatever test runs next.
+            mt_srand();
+        }
+    }
+
+    /**
+     * Uniformity over the WHOLE scaled range, not just "in range": a draw derived from a uniform
+     * integer over [$min * 10^d, $max * 10^d] must be able to reach every grid point. A shape that
+     * drew the integer part and the fraction separately, or that scaled a [0,1) float, would leave
+     * gaps or skew the ends. 6 grid points, 400 draws: missing one is ~(5/6)^400 ~ 1e-32.
+     */
+    public function testRandomDecimalReachesEveryGridPointAcrossTheRange(): void
+    {
+        // Collected as VALUES, not array keys: PHP would silently cast the key "1" to int 1 and
+        // the comparison below would be against a mixed int/string list.
+        $seen = [];
+        for ($i = 0; $i < 400; $i++) {
+            $seen[] = (string)Number::randomDecimal(1.0, 1.5, 1);
+        }
+
+        $seen = array_unique($seen);
+        sort($seen, SORT_STRING);
+
+        $this->assertSame(['1', '1.1', '1.2', '1.3', '1.4', '1.5'], array_values($seen));
     }
 
     // ------------------------------------------------------- randomDecimal(): denied/error paths

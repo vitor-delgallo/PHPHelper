@@ -2,6 +2,7 @@
 
 namespace VD\PHPHelper\Tests;
 
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use VD\PHPHelper\SQL;
 use VD\PHPHelper\System;
@@ -374,8 +375,8 @@ final class SQLTest extends TestCase {
         $sql = SQL::prepareInsertOrUpdateMySQL($data, 'journal');
 
         self::assertSame(
-            "INSERT INTO journal (level,msg) VALUES ('warn','disk'),('warn','disk') "
-                . 'ON DUPLICATE KEY UPDATE level=VALUES(level),msg=VALUES(msg)',
+            "INSERT INTO journal (`level`,`msg`) VALUES ('warn','disk'),('warn','disk') "
+                . 'ON DUPLICATE KEY UPDATE `level`=VALUES(`level`),`msg`=VALUES(`msg`)',
             $sql
         );
         self::assertSame(2, substr_count((string) $sql, "('warn','disk')"));
@@ -475,6 +476,73 @@ final class SQLTest extends TestCase {
         self::assertSame([], $data);
     }
 
+    // ---------------------------------------------------------------- prepareInsertOrUpdateMySQL: batching cost
+
+    /**
+     * FINDING (fixed): the batch loop called System::getMemoryUsage() ONCE PER ROW just to read
+     * usageBytes. That method first probes the OPERATING SYSTEM for physical memory — two `wmic`
+     * subprocesses on Windows, a /proc/meminfo read elsewhere — while usageBytes is only
+     * memory_get_usage(true), which needs no probe at all. Every row therefore paid for an OS probe
+     * whose result it discarded. On Windows 11 24H2+ wmic is REMOVED, yet cmd.exe is still spawned
+     * twice per call to discover that: measured at ~37 ms per row on the box this was written on,
+     * i.e. roughly 37 SECONDS of pure subprocess spawning on a 1000-row batch. The probe is now
+     * hoisted out of the loop: O(1) per call instead of O(rows).
+     *
+     * The test calibrates against the real probe cost on this host, so it is not a fixed-time
+     * assertion, and it skips where the probe is too cheap to tell the two implementations apart
+     * (a /proc/meminfo read is microseconds — real, but not measurable against loop noise).
+     */
+    public function testPrepareDoesNotPayTheOsMemoryProbeOncePerRow(): void {
+        $probeRuns = 5;
+        $started = hrtime(true);
+        for ($i = 0; $i < $probeRuns; $i++) {
+            System::getServerMemoryUsage();
+        }
+        $probeMs = ((hrtime(true) - $started) / 1e6) / $probeRuns;
+
+        if ($probeMs < 1.0) {
+            self::markTestSkipped(sprintf(
+                'the OS memory probe costs %.4f ms here — too cheap for timing to distinguish a '
+                    . 'per-row probe from a hoisted one',
+                $probeMs
+            ));
+        }
+
+        // A real budget, so the whole batch is emitted in one call and the loop runs every row.
+        $this->originalMemoryLimit = (string) ini_get('memory_limit');
+        ini_set('memory_limit', '512M');
+
+        $rows = 100;
+        $data = [];
+        for ($i = 1; $i <= $rows; $i++) {
+            $data[] = ['id' => $i];
+        }
+
+        $started = hrtime(true);
+        $sql = SQL::prepareInsertOrUpdateMySQL($data, 't', 'id', 'id=VALUES(id)');
+        $elapsedMs = (hrtime(true) - $started) / 1e6;
+
+        self::assertIsString($sql);
+        self::assertStringContainsString('(' . $rows . ')', $sql, 'the whole batch must be emitted');
+        self::assertSame([], $data, 'the whole batch fits the budget, so every row is consumed');
+
+        // One probe per row bills about $rows * $probeMs; one hoisted probe bills about $probeMs.
+        // A quarter of the per-row bill sits far above the hoisted cost and far below the old one.
+        $budgetMs = $rows * $probeMs / 4;
+
+        self::assertLessThan(
+            $budgetMs,
+            $elapsedMs,
+            sprintf(
+                'a %d-row batch took %.1f ms while a single OS memory probe costs %.1f ms — the '
+                    . 'probe is being paid per row again',
+                $rows,
+                $elapsedMs,
+                $probeMs
+            )
+        );
+    }
+
     // ---------------------------------------------------------------- prepareInsertOrUpdateMySQL: formatter contract
 
     public function testPrepareAutoDerivesColumnsAndUpdateClauseFromFirstRow(): void {
@@ -483,8 +551,8 @@ final class SQLTest extends TestCase {
         $sql = SQL::prepareInsertOrUpdateMySQL($data, 't');
 
         self::assertSame(
-            'INSERT INTO t (id,note,ok,ratio) VALUES (7,NULL,1,1.5) ON DUPLICATE KEY UPDATE '
-                . 'id=VALUES(id),note=VALUES(note),ok=VALUES(ok),ratio=VALUES(ratio)',
+            'INSERT INTO t (`id`,`note`,`ok`,`ratio`) VALUES (7,NULL,1,1.5) ON DUPLICATE KEY UPDATE '
+                . '`id`=VALUES(`id`),`note`=VALUES(`note`),`ok`=VALUES(`ok`),`ratio`=VALUES(`ratio`)',
             $sql
         );
     }
@@ -495,7 +563,126 @@ final class SQLTest extends TestCase {
         $sql = SQL::prepareInsertOrUpdateMySQL($data, 't');
 
         self::assertSame(
-            "INSERT INTO t (id,name) VALUES (1,'Ada') ON DUPLICATE KEY UPDATE id=VALUES(id),name=VALUES(name)",
+            "INSERT INTO t (`id`,`name`) VALUES (1,'Ada') "
+                . 'ON DUPLICATE KEY UPDATE `id`=VALUES(`id`),`name`=VALUES(`name`)',
+            $sql
+        );
+    }
+
+    /**
+     * Auto-derived identifiers are written by the library, so the library quotes them. Besides being
+     * defence in depth behind the identifier check, this is what makes the convenience path usable
+     * at all against an ordinary schema: "order" and "key" are reserved words, and unquoted they are
+     * a syntax error, so before the fix auto-derivation simply could not insert into such a table.
+     */
+    public function testPrepareQuotesAutoDerivedIdentifiersSoReservedWordColumnsSurvive(): void {
+        $data = [['id' => 1, 'order' => 7, 'key' => 'k']];
+
+        $sql = SQL::prepareInsertOrUpdateMySQL($data, 't');
+
+        self::assertSame(
+            "INSERT INTO t (`id`,`order`,`key`) VALUES (1,7,'k') ON DUPLICATE KEY UPDATE "
+                . '`id`=VALUES(`id`),`order`=VALUES(`order`),`key`=VALUES(`key`)',
+            $sql
+        );
+    }
+
+    // ------------------------------------------- prepareInsertOrUpdateMySQL: identifier injection
+
+    /**
+     * FINDING (fixed): with $insertFields omitted, the column list is derived from the KEYS of the
+     * first row and interpolated raw as identifiers. Identifiers cannot be escaped, so a $data array
+     * built from user input — `foreach ($_POST['rows'] as $r) { $data[] = $r; }`, an imported CSV
+     * whose header row becomes the keys, a decoded JSON body — turned an attacker-chosen array key
+     * straight into SQL. This payload used to produce:
+     *
+     *     INSERT INTO clients (id,x) VALUES (1); DROP TABLE clients; -- ) VALUES (...)
+     *
+     * The row VALUES were escaped all along; the COLUMN NAMES were not, which is the whole point.
+     * Now an auto-derived name that is not a plain identifier is refused outright.
+     */
+    public function testPrepareRejectsCraftedColumnNameFromDataInsteadOfInterpolatingItRaw(): void {
+        $data = [['id' => 1, 'x) VALUES (1); DROP TABLE clients; -- ' => 'pwned']];
+
+        $this->expectException(\InvalidArgumentException::class);
+        SQL::prepareInsertOrUpdateMySQL($data, 'clients');
+    }
+
+    /** The dataset must survive the refusal: nothing was written, so nothing may be consumed. */
+    public function testPrepareLeavesDatasetUntouchedWhenAnAutoDerivedColumnIsRejected(): void {
+        $data = [['id' => 1, 'evil`col' => 'x'], ['id' => 2, 'evil`col' => 'y']];
+        $original = $data;
+
+        try {
+            SQL::prepareInsertOrUpdateMySQL($data, 't');
+            self::fail('a crafted auto-derived column name must be refused');
+        } catch (\InvalidArgumentException) {
+            // expected
+        }
+
+        self::assertSame($original, $data);
+    }
+
+    /**
+     * The backtick is the one character that could break out of the quoting the auto-derived path
+     * now applies, so it gets its own case.
+     */
+    public function testPrepareRejectsAutoDerivedColumnNameContainingABacktick(): void {
+        $data = [['id' => 1, '`,`x`) VALUES (1,2); -- ' => 'pwned']];
+
+        $this->expectException(\InvalidArgumentException::class);
+        SQL::prepareInsertOrUpdateMySQL($data, 't');
+    }
+
+    public static function invalidAutoDerivedColumnProvider(): array {
+        return [
+            'space'             => ['bad col'],
+            'backtick'          => ['col`'],
+            'quote'             => ["col'"],
+            'semicolon'         => ['col;drop'],
+            'parenthesis'       => ['col()'],
+            'comment'           => ['col-- '],
+            'dot qualified'     => ['db.col'],
+            'newline'           => ["col\nname"],
+            'null byte'         => ["col\0"],
+            'star'              => ['*'],
+            'empty string key'  => [''],
+        ];
+    }
+
+    #[DataProvider('invalidAutoDerivedColumnProvider')]
+    public function testPrepareRejectsEveryAutoDerivedColumnNameOutsideThePattern(string $column): void {
+        $data = [[$column => 'v']];
+
+        $this->expectException(\InvalidArgumentException::class);
+        SQL::prepareInsertOrUpdateMySQL($data, 't');
+    }
+
+    /**
+     * The flip side: the pattern must not reject the ordinary names real schemas use, or callers
+     * would be pushed back onto raw $insertFields and lose the check entirely.
+     */
+    public function testPrepareAcceptsOrdinaryAutoDerivedColumnNames(): void {
+        $data = [['id' => 1, 'first_name' => 'a', 'addr2' => 'b', '$rate' => 3, 'CamelCase' => 'd']];
+
+        $sql = SQL::prepareInsertOrUpdateMySQL($data, 't');
+
+        self::assertIsString($sql);
+        self::assertStringContainsString('(`id`,`first_name`,`addr2`,`$rate`,`CamelCase`)', $sql);
+    }
+
+    /**
+     * An explicit $insertFields stays a TRUSTED, raw-interpolated caller input — documented as such,
+     * and the escape hatch for a column the auto-derive pattern refuses. This pins that the check
+     * added above did not silently start policing (or quoting) the caller's own SQL text.
+     */
+    public function testPrepareLeavesExplicitInsertFieldsRawAndUnchecked(): void {
+        $data = [['db.col' => 'v']];
+
+        $sql = SQL::prepareInsertOrUpdateMySQL($data, 't', 'db.col', 'db.col=VALUES(db.col)');
+
+        self::assertSame(
+            "INSERT INTO t (db.col) VALUES ('v') ON DUPLICATE KEY UPDATE db.col=VALUES(db.col)",
             $sql
         );
     }

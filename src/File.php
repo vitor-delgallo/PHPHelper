@@ -72,21 +72,6 @@ class File {
     }
 
     /**
-     * Returns whether $mode is a usable octal permission string (e.g. "755", "0700").
-     *
-     * Equivalent to Validator::isOctal() for permission modes, but implemented without octdec():
-     * Validator::isOctal() feeds the raw value to octdec(), which raises the E_DEPRECATED
-     * "Invalid characters passed for attempted conversion" for precisely the malformed input it
-     * is being asked to reject — so every rejection sprayed a deprecation into the caller's logs.
-     *
-     * @param string|null $mode Candidate mode; NULL and "" are not octal
-     * @return bool TRUE only for a non-empty run of octal digits with an optional leading zero
-     */
-    private static function isOctalMode(?string $mode): bool {
-        return $mode !== null && preg_match('/^0?[0-7]+$/', $mode) === 1;
-    }
-
-    /**
      * Returns the default permission mode, as an octal integer, used when a caller passes no
      * explicit mode.
      *
@@ -113,7 +98,7 @@ class File {
      * @return void
      */
     public static function setDefaultMode(string $defaultMode): void {
-        if(!self::isOctalMode($defaultMode)) {
+        if(!Validator::isOctal($defaultMode)) {
             return;
         }
         self::$defaultMode = octdec($defaultMode);
@@ -132,7 +117,7 @@ class File {
      * @return int|float The resolved permission mode as an octal integer
      */
     public static function getPermissionMode(?string $permissionMode): int|float {
-        if(!self::isOctalMode($permissionMode)) {
+        if(!Validator::isOctal($permissionMode)) {
             return self::getDefaultMode();
         }
         return octdec($permissionMode);
@@ -361,7 +346,7 @@ class File {
             return $ret;
         }
 
-        if($createPath === null || (!is_bool($createPath) && !self::isOctalMode($createPath))) {
+        if($createPath === null || (!is_bool($createPath) && !Validator::isOctal($createPath))) {
             $createPath = false;
         }
 
@@ -439,7 +424,7 @@ class File {
             throw new \Exception("File path not provided for writing!");
         };
 
-        if($permissionMode !== null && !self::isOctalMode($permissionMode)) {
+        if($permissionMode !== null && !Validator::isOctal($permissionMode)) {
             throw new \InvalidArgumentException("Invalid permission mode provided for writing: '{$permissionMode}'!");
         }
 
@@ -1098,22 +1083,40 @@ class File {
     }
 
     /**
-     * Generates a .zip filename by removing the current extension from the given file path.
+     * Generates a .zip filename by replacing the LEAF name's last extension with ".zip".
      *
-     * This function splits the input by dots (.) and reconstructs the filename without the last extension,
-     * appending ".zip" instead. Useful for converting filenames like "backup.tar.gz" into "backup.tar.zip".
+     * Only the last extension of the file name itself is replaced, so "backup.tar.gz" becomes
+     * "backup.tar.zip". The directory part is preserved byte-for-byte and is never parsed for
+     * extensions.
+     *
+     * This used to explode() the FULL PATH on '.' and drop everything after the last dot, which
+     * mangled any path whose DIRECTORY contained a dot but whose file name did not:
+     * "/tmp/a.b/out" became "/tmp/a.zip" — a different directory. A path with no dot at all fared
+     * worse: "/tmp/out" became a bare ".zip", a hidden file in the process's working directory.
+     * Either way zipDirectory()/zipMultipleFiles() silently wrote the archive somewhere the caller
+     * never asked for.
      *
      * @param string $outputFile The original file path or name (e.g., with any extension)
-     * @return string The filename ending with ".zip"
+     * @return string The same path with the leaf's last extension replaced by ".zip". A leaf with
+     *                no extension simply gains one ("/tmp/out" -> "/tmp/out.zip"), and a dotfile
+     *                leaf is kept whole (".gitignore" -> ".gitignore.zip") rather than collapsing
+     *                to a bare ".zip".
      */
     private static function getZipName(string $outputFile): string {
-        $parts = explode(".", $outputFile);
-        $basePath = "";
-        for ($i = 0; $i < count($parts) - 1; $i++) {
-            if ($i !== 0) $basePath .= ".";
-            $basePath .= $parts[$i];
+        $basename = basename($outputFile);
+        // Everything ahead of the leaf name, kept exactly as given ("" for a bare file name).
+        // pathinfo()'s 'dirname' is not usable here: it reports "." for a bare name, which would
+        // invent a "./" prefix the caller never wrote.
+        $prefix = substr($outputFile, 0, strlen($outputFile) - strlen($basename));
+
+        $stem = pathinfo($basename, PATHINFO_FILENAME);
+        if ($stem === "") {
+            // A dotfile such as ".gitignore" has an empty stem; keep the leaf whole so the archive
+            // does not collapse into a bare ".zip".
+            $stem = $basename;
         }
-        return $basePath . ".zip";
+
+        return $prefix . $stem . ".zip";
     }
 
     /**
@@ -1167,12 +1170,12 @@ class File {
      *                                  which PHP cleans up itself.
      * @param bool $terminateAfterDownload Whether to call exit() after sending the file. Default is true.
      *
-     * @throws \Exception If the file resolved but could not be opened for reading. NOTE: a
-     *                    $filePath that does not resolve to a readable file (or to a genuine
-     *                    upload) does NOT throw — it exits(0) when $terminateAfterDownload is
-     *                    true, silently ending the request with an empty 200, or returns quietly
-     *                    when it is false. Check the file yourself first; a try/catch here will
-     *                    not see a missing file.
+     * @throws \Exception If $filePath does not resolve to a readable file (or to a genuine
+     *                    upload), or if it resolved but could not be opened for reading. A missing
+     *                    file fails LOUDLY and $terminateAfterDownload is not honoured for it: the
+     *                    caller gets the exception instead of an empty HTTP 200. This method used
+     *                    to exit(0) on a missing file, so the client received a successful,
+     *                    zero-byte response and the caller's try/catch never fired.
      */
     public static function downloadFile(
         string $filePath,
@@ -1196,11 +1199,10 @@ class File {
 
         $resolvedPath = null;
 
+        // A missing file is an error, not a download. This used to exit(0) (or return quietly),
+        // handing the client an empty 200 that is indistinguishable from a successful transfer.
         if (empty($filePath)) {
-            if ($terminateAfterDownload) {
-                exit(0);
-            }
-            return;
+            throw new \Exception("The file requested for download does not exist or is not readable.");
         }
 
         header("Pragma: public");
@@ -1239,12 +1241,15 @@ class File {
      * Renames a file name before uploading it to the server, ensuring a clean format
      * and appending a timestamp suffix for uniqueness.
      *
-     * The WHOLE returned name is sanitised — base name AND extension — down to [A-Za-z0-9-]:
-     * accents are folded to ASCII and every other character, INCLUDING spaces and dots inside the
-     * base name, is REMOVED rather than replaced ("relatório final.csv" -> "relatoriofinal…csv").
-     * The only '_' in the result is the one introducing the suffix. The result is therefore safe
-     * to use as a path segment, but it can still be a reserved Windows device name ("con",
-     * "nul"), so callers on Windows should not rely on this alone.
+     * The WHOLE returned name is sanitised — base name AND extension — down to [A-Za-z0-9_-]:
+     * accents are folded to ASCII, each SPACE becomes '_', and every other character, INCLUDING
+     * dots inside the base name, is REMOVED rather than replaced ("relatório final.csv" ->
+     * "relatorio_final…csv"). '_' is in the allowlist precisely so that the space -> '_' step
+     * survives the filter; it is not a path or shell metacharacter, so it costs nothing in safety
+     * and keeps word boundaries readable. It follows that a '_' in the result is NOT necessarily
+     * the suffix separator — an underscore (or a space) in the original name yields one too. The
+     * result is safe to use as a path segment, but it can still be a reserved Windows device name
+     * ("con", "nul"), so callers on Windows should not rely on this alone.
      *
      * Uniqueness is best-effort: the suffix is a per-second timestamp plus rand(0, 999), so two
      * uploads within the same second collide at roughly 1/1000. Callers that must not overwrite
@@ -1275,10 +1280,13 @@ class File {
             $maxLength = 125;
         }
 
-        // Internal helper function to clean file name
+        // Internal helper function to clean file name.
+        // '_' is part of the allowlist so the space -> '_' replacement above it actually survives:
+        // the filter used to be [^A-Za-z0-9\-], which stripped the very underscore just inserted,
+        // making the str_replace() dead code and silently welding words together.
         $formatFileName = function (string $name): string {
             return preg_replace(
-                '/[^A-Za-z0-9\-]/',
+                '/[^A-Za-z0-9_\-]/',
                 '',
                 str_replace(
                     ' ',

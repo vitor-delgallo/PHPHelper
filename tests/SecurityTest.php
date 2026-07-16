@@ -2,6 +2,7 @@
 
 namespace VD\PHPHelper\Tests;
 
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use VD\PHPHelper\Security;
 
@@ -266,6 +267,38 @@ final class SecurityTest extends TestCase
         Security::encryptFileV2($src, str_repeat('k', 31), $this->tempPath('enc'));
     }
 
+    /**
+     * decryptFileV2 must read its version from self::FILE_V2_VERSION, the same constant
+     * encryptFileV2 writes and binds into every block's AAD — NOT from a hardcoded "v2" literal.
+     *
+     * The defect is LATENT, so no round-trip can catch it: today the literal and the constant are
+     * both "v2", and bumping the constant is what would silently break decryption of every newly
+     * written file. A PHP class constant cannot be rebound at runtime to simulate that, so this
+     * asserts the source itself is wired to the constant. It fails against the pre-fix body, which
+     * contained `$version = "v2";`.
+     */
+    public function testDecryptFileV2DerivesItsVersionFromTheConstantNotALiteral(): void
+    {
+        $method = new \ReflectionMethod(Security::class, 'decryptFileV2');
+        $lines  = file($method->getFileName());
+        $body   = implode('', array_slice(
+            $lines,
+            $method->getStartLine() - 1,
+            $method->getEndLine() - $method->getStartLine() + 1
+        ));
+
+        $this->assertMatchesRegularExpression(
+            '/\$version\s*=\s*self::FILE_V2_VERSION\s*;/',
+            $body,
+            'decryptFileV2 must take its version from self::FILE_V2_VERSION.'
+        );
+        $this->assertDoesNotMatchRegularExpression(
+            '/\$version\s*=\s*[\'"]v2[\'"]\s*;/',
+            $body,
+            'decryptFileV2 still hardcodes its version literal; bumping FILE_V2_VERSION would silently break decryption.'
+        );
+    }
+
     // ---------------------------------------------------------------------------------------
     // generateSearchHash — the blind index
     // ---------------------------------------------------------------------------------------
@@ -358,23 +391,49 @@ final class SecurityTest extends TestCase
         Security::decryptLocal(base64_encode('short'), self::masterKey());
     }
 
-    public function testEncryptLocalRejectsKeyShorterThan16Bytes(): void
+    /**
+     * The message must state the floor that is ACTUALLY enforced. This previously reported
+     * "at least 16 bytes" from a dead local guard, while the real (correct) 32-byte floor lived in
+     * deriveKey — so a 16..31-byte key was told 16 and then refused for being under 32.
+     */
+    public function testEncryptLocalRejectsKeyShorterThan32BytesWithA32ByteMessage(): void
     {
         $this->expectException(\Exception::class);
-        $this->expectExceptionMessage('at least 16 bytes');
+        $this->expectExceptionMessage('at least 32 bytes');
         Security::encryptLocal('x', str_repeat('k', 15));
     }
 
     /**
-     * encryptLocal advertises a 16-byte minimum but delegates to deriveKey, which enforces 32.
-     * A 16..31-byte key is therefore still refused — pinned so the stricter floor cannot silently
-     * regress into the weaker advertised one.
+     * encryptLocal delegates the key floor to deriveKey, which enforces 32 (HKDF cannot add
+     * entropy). A 16..31-byte key is refused — pinned so the floor cannot silently regress to the
+     * weaker 16 the old guard advertised.
      */
     public function testEncryptLocalStillRefusesKeysBelowTheThirtyTwoByteDerivationFloor(): void
     {
         $this->expectException(\Exception::class);
         $this->expectExceptionMessage('at least 32 bytes');
         Security::encryptLocal('x', str_repeat('k', 16));
+    }
+
+    /** Every key-floor message across the local/cross-platform surface must say 32, not 16. */
+    public function testEveryKeyFloorMessageStates32Bytes(): void
+    {
+        $calls = [
+            'encryptLocal'          => fn () => Security::encryptLocal('x', str_repeat('k', 16)),
+            'decryptLocal'          => fn () => Security::decryptLocal(base64_encode(str_repeat('a', 64)), str_repeat('k', 16)),
+            'encryptCrossPlatform'  => fn () => Security::encryptCrossPlatform('x', str_repeat('k', 16)),
+            'decryptCrossPlatform'  => fn () => Security::decryptCrossPlatform('x', str_repeat('k', 16)),
+        ];
+
+        foreach ($calls as $name => $call) {
+            try {
+                $call();
+                $this->fail("{$name} accepted a 16-byte key");
+            } catch (\Exception $e) {
+                $this->assertStringContainsString('at least 32 bytes', $e->getMessage(), $name);
+                $this->assertStringNotContainsString('16 bytes', $e->getMessage(), $name);
+            }
+        }
     }
 
     public function testEncryptLocalReturnsEmptyStringForNullOrEmpty(): void
@@ -1110,65 +1169,198 @@ final class SecurityTest extends TestCase
     }
 
     // ---------------------------------------------------------------------------------------
-    // xssCleanRecursive — a BLACKLIST, documented as such
+    // xssCleanRecursive — an ALLOW-LIST sanitizer (parse + rebuild), not a pattern blacklist
     // ---------------------------------------------------------------------------------------
 
-    public function testXssCleanStripsSpaceSeparatedEventHandler(): void
-    {
-        $this->assertStringNotContainsString('onload', Security::xssCleanRecursive('<svg onload=alert(1)>'));
-    }
-
-    public function testXssCleanRemovesScriptTags(): void
-    {
-        $cleaned = Security::xssCleanRecursive('<script>alert(1)</script>');
-
-        $this->assertStringNotContainsString('<script>', $cleaned);
-        $this->assertStringContainsString('[REMOVED]', $cleaned);
-    }
-
-    public function testXssCleanNeutralizesJavascriptProtocol(): void
-    {
-        $this->assertStringNotContainsString(
-            'javascript:',
-            Security::xssCleanRecursive('<a href="javascript:alert(1)">x</a>')
-        );
-    }
-
     /**
-     * The docblock names `<svg/onload=alert(1)>` and `<img/onerror=... src=x>` as KNOWN BYPASSES
-     * that pass through unchanged, and tells callers this is not an XSS defence. This test pins
-     * that honesty: if a future change silently fixed these two, the docblock's warning would be
-     * stale — and if someone weakens the doc back to "prevents XSS" while these still pass, the
-     * claim is a lie. Either way, this test forces the doc and the code to be reconciled together.
+     * Asserts no ACTIVE construct survived: no event handler, no scripting scheme, and none of the
+     * elements that can execute or that switch the parser into raw-text/foreign-content rules.
+     * Escaped text (e.g. "&lt;script&gt;") is inert and deliberately NOT flagged.
      */
-    public function testDocumentedXssBypassesGenuinelySurviveTheFilter(): void
+    private function assertNoActiveContent(string $cleaned, string $payload): void
     {
-        foreach (['<svg/onload=alert(1)>', '<img/onerror=alert(1) src=x>'] as $bypass) {
-            $this->assertSame(
-                $bypass,
-                Security::xssCleanRecursive($bypass),
-                'Documented bypass no longer survives; xssCleanRecursive\'s docblock must be updated.'
+        $this->assertDoesNotMatchRegularExpression(
+            '/\son[a-z]+\s*=/i',
+            $cleaned,
+            "Event handler survived for payload: {$payload}"
+        );
+
+        foreach (['javascript:', 'vbscript:', 'data:', '-moz-binding'] as $scheme) {
+            $this->assertStringNotContainsStringIgnoringCase(
+                $scheme,
+                $cleaned,
+                "Scheme {$scheme} survived for payload: {$payload}"
+            );
+        }
+
+        foreach (['<script', '<svg', '<math', '<iframe', '<object', '<embed', '<style',
+                  '<form', '<input', '<template', '<noscript', '<xmp', '<base', '<link'] as $tag) {
+            $this->assertStringNotContainsStringIgnoringCase(
+                $tag,
+                $cleaned,
+                "Element {$tag} survived for payload: {$payload}"
             );
         }
     }
 
+    /**
+     * The exact two payloads the previous BLACKLIST let through COMPLETELY UNCHANGED, because its
+     * on*-attribute rule required whitespace before "on" and "/" is also a valid HTML attribute
+     * separator. The old suite pinned their survival; the allow-list rebuild now neutralises them.
+     * These are the headline regression guards for that fix.
+     */
+    public function testPreviouslyDocumentedBypassesAreNeutralised(): void
+    {
+        foreach (['<svg/onload=alert(1)>', '<img/onerror=alert(1) src=x>'] as $bypass) {
+            $cleaned = Security::xssCleanRecursive($bypass);
+
+            $this->assertNotSame($bypass, $cleaned, "Bypass passed through unchanged: {$bypass}");
+            $this->assertNoActiveContent($cleaned, $bypass);
+        }
+    }
+
+    /**
+     * A blacklist is beaten by a shape its author did not foresee, so the fix is only meaningful if
+     * it holds across separators, entity encodings, casing, malformed tags, nesting, foreign
+     * content (SVG/MathML) and mutation-XSS vectors — none of which are enumerated by the
+     * sanitizer. Each of these must come out inert.
+     */
+    #[DataProvider('xssBypassPayloadProvider')]
+    public function testXssBypassBatteryIsNeutralised(string $payload): void
+    {
+        $this->assertNoActiveContent(Security::xssCleanRecursive($payload), $payload);
+    }
+
+    public static function xssBypassPayloadProvider(): array
+    {
+        return array_map(static fn ($p) => [$p], [
+            // Separator tricks that defeated the on*-attribute regex.
+            '<svg/onload=alert(1)>',
+            '<img/onerror=alert(1) src=x>',
+            '<img\ronerror=alert(1) src=x>',
+            '<svg onload=alert(1)>',
+            '<img src=x onerror=alert(1)>',
+            '<img src=x OnErRoR=alert(1)>',
+            '<body onload=alert(1)>',
+            '<div onclick="alert(1)">click</div>',
+            // Scripting schemes, including entity-encoded and whitespace-split forms.
+            '<a href="javascript:alert(1)">x</a>',
+            '<a href="jav&#x09;ascript:alert(1)">x</a>',
+            '<a href="jav&#x0A;ascript:alert(1)">x</a>',
+            '<a href="&#106;avascript:alert(1)">x</a>',
+            '<a href="JaVaScRiPt:alert(1)">x</a>',
+            '<a href=" javascript:alert(1)">x</a>',
+            '<a href="vbscript:msgbox(1)">x</a>',
+            // data: URIs.
+            '<img src="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">',
+            '<a href="data:text/html,<script>alert(1)</script>">x</a>',
+            // Elements that execute or load.
+            '<script>alert(1)</script>',
+            '<iframe src="javascript:alert(1)"></iframe>',
+            '<object data="javascript:alert(1)">',
+            '<embed src="javascript:alert(1)">',
+            '<base href="javascript:">',
+            // Malformed / nested tags.
+            '<<script>alert(1)//<</script>',
+            '<img src="x" onerror="alert(1)"',
+            '<scr<script>ipt>alert(1)</scr</script>ipt>',
+            '<img src=x onerror=alert(1)//',
+            // SVG / MathML foreign content and mutation-XSS vectors.
+            '<svg><script>alert(1)</script></svg>',
+            '<svg><style><!--</style><img src=x onerror=alert(1)>-->',
+            '<math><mtext><table><mglyph><style><img src=x onerror=alert(1)>',
+            '<svg><animate onbegin=alert(1) attributeName=x dur=1s>',
+            '<svg><a xlink:href="javascript:alert(1)"><text>x</text></a></svg>',
+            // Raw-text / parser-confusion elements.
+            '<template><img src=x onerror=alert(1)></template>',
+            '<noscript><p title="</noscript><img src=x onerror=alert(1)>">',
+            '<xmp><img src=x onerror=alert(1)></xmp>',
+            '<style>@import "javascript:alert(1)";</style>',
+            '<div style="background:url(javascript:alert(1))">x</div>',
+            '<div style="-moz-binding:url(evil.xml)">x</div>',
+            // Forms and DOM clobbering.
+            '<form action="javascript:alert(1)"><input name=x></form>',
+            '<a id="location" href="x">clobber</a>',
+        ]);
+    }
+
+    public function testXssCleanStripsEventHandlerAttributesButKeepsTheElement(): void
+    {
+        $this->assertSame('<div>click</div>', Security::xssCleanRecursive('<div onclick="alert(1)">click</div>'));
+    }
+
+    public function testXssCleanDropsScriptElementEntirelyIncludingItsSource(): void
+    {
+        // The whole subtree goes: the script body must not survive even as inert visible text.
+        $this->assertSame('', Security::xssCleanRecursive('<script>alert(1)</script>'));
+        $this->assertSame('hi', Security::xssCleanRecursive('<script>alert(1)</script>hi'));
+    }
+
+    public function testXssCleanDropsJavascriptHrefButKeepsTheLinkText(): void
+    {
+        $this->assertSame('<a>x</a>', Security::xssCleanRecursive('<a href="javascript:alert(1)">x</a>'));
+    }
+
+    /** A sanitizer that destroys every link is useless: benign URLs must survive intact. */
+    public function testXssCleanPreservesSafeUrlSchemes(): void
+    {
+        $this->assertSame(
+            '<a href="http://ok.example/path?q=1">good</a>',
+            Security::xssCleanRecursive('<a href="http://ok.example/path?q=1">good</a>')
+        );
+        $this->assertSame(
+            '<a href="mailto:a@b.example">mail</a>',
+            Security::xssCleanRecursive('<a href="mailto:a@b.example">mail</a>')
+        );
+        $this->assertSame(
+            '<a href="/relative/page#frag">rel</a>',
+            Security::xssCleanRecursive('<a href="/relative/page#frag">rel</a>')
+        );
+    }
+
+    /** Allow-listed formatting markup is the reason to sanitize rather than escape wholesale. */
+    public function testXssCleanPreservesAllowListedMarkup(): void
+    {
+        $this->assertSame('<b>bold</b> and <i>italic</i>', Security::xssCleanRecursive('<b>bold</b> and <i>italic</i>'));
+        $this->assertSame('<p title="hi">t</p>', Security::xssCleanRecursive('<p title="hi">t</p>'));
+        $this->assertSame(
+            '<ul><li>a</li><li>b</li></ul>',
+            Security::xssCleanRecursive('<ul><li>a</li><li>b</li></ul>')
+        );
+    }
+
+    public function testXssCleanEscapesBareMarkupCharactersInText(): void
+    {
+        $this->assertSame('a &lt; b &amp;&amp; c &gt; d', Security::xssCleanRecursive('a < b && c > d'));
+    }
+
+    public function testXssCleanPreservesMultibyteText(): void
+    {
+        $this->assertSame('café ☕ <b>x</b>', Security::xssCleanRecursive('café ☕ <b>x</b>'));
+    }
+
     public function testXssCleanRecursesIntoArrays(): void
     {
-        $cleaned = Security::xssCleanRecursive(['a' => '<script>x</script>', 'n' => ['b' => '<script>y</script>']]);
+        $cleaned = Security::xssCleanRecursive([
+            'a' => '<script>x</script>hi',
+            'n' => ['b' => '<img/onerror=alert(1) src=x>'],
+        ]);
 
-        $this->assertStringContainsString('[REMOVED]', $cleaned['a']);
-        $this->assertStringContainsString('[REMOVED]', $cleaned['n']['b']);
+        $this->assertSame('hi', $cleaned['a']);
+        $this->assertNoActiveContent($cleaned['n']['b'], '<img/onerror=alert(1) src=x>');
     }
 
     public function testXssCleanRecursesIntoObjects(): void
     {
         $object = new \stdClass();
-        $object->a = '<script>x</script>';
+        $object->a = '<script>x</script>hi';
+        $object->nested = '<svg/onload=alert(1)>';
 
         $cleaned = Security::xssCleanRecursive($object);
 
         $this->assertIsObject($cleaned);
-        $this->assertStringContainsString('[REMOVED]', $cleaned->a);
+        $this->assertSame('hi', $cleaned->a);
+        $this->assertNoActiveContent($cleaned->nested, '<svg/onload=alert(1)>');
     }
 
     public function testXssCleanPassesThroughNonStringScalarsUnchanged(): void

@@ -15,7 +15,8 @@ use VD\PHPHelper\S3Storage;
  *
  * NO LIVE AWS. Nothing here performs a network request. Two facts make this possible:
  *  - `new S3Client([...])` is construction-only: it resolves config locally and does not
- *    contact AWS. So the credential/bucket guards in getClient() are fully exercisable.
+ *    contact AWS. So the credential guards in getClient(), and the endpoint/region/
+ *    addressing-style config it builds, are fully exercisable by inspecting the client.
  *  - Every public method validates its arguments (mode, extension, local file, key) BEFORE
  *    issuing an S3 request, so each DENIED path returns without touching the network.
  *
@@ -99,14 +100,38 @@ final class S3StorageTest extends TestCase
     }
 
     /**
+     * Builds the singleton client under a given configuration and returns it for inspection.
+     *
+     * Still zero network: `new S3Client([...])` resolves its config locally, and upload()
+     * builds the client BEFORE it rejects the nonexistent local file. Note no bucket is
+     * registered here on purpose — the client does not need one, which is the point.
+     */
+    private function buildClientWith(callable $configure): S3Client
+    {
+        S3Storage::setKey(self::TEST_ID);
+        S3Storage::setSecret(self::TEST_TOKEN);
+        $configure();
+
+        S3Storage::upload('warmup/file.txt', '/definitely/not/here.txt', true, [], self::TEST_BUCKET);
+
+        $client = self::peekClient();
+        $this->assertInstanceOf(S3Client::class, $client, 'precondition: the client must have been built offline');
+
+        return $client;
+    }
+
+    /**
      * Installs an S3Client whose HTTP transport is the AWS SDK's own MockHandler, and injects
      * it as the class singleton. NOTHING here mocks S3Storage: the subject runs its real
      * logic, and only AWS's wire layer is replaced, so no request leaves the machine.
      *
      * $responses are consumed in order, one per AWS command. Each entry is either an
      * Aws\Result (success) or a \Closure($cmd, $req) returning an exception (failure).
+     *
+     * $withDefaultBucket = false skips setBucket(), for the tests that exercise per-call
+     * bucket resolution with no default registered.
      */
-    private function installMockS3(array $responses): void
+    private function installMockS3(array $responses, bool $withDefaultBucket = true): void
     {
         $mock = new MockHandler();
 
@@ -129,7 +154,9 @@ final class S3StorageTest extends TestCase
             'retries' => 0,
         ]);
 
-        S3Storage::setBucket(self::TEST_BUCKET);
+        if ($withDefaultBucket) {
+            S3Storage::setBucket(self::TEST_BUCKET);
+        }
         (new \ReflectionProperty(S3Storage::class, 'client'))->setValue(null, $client);
     }
 
@@ -148,6 +175,8 @@ final class S3StorageTest extends TestCase
         self::configure();
         S3Storage::setDebug(true);
         S3Storage::setNoOperation(true);
+        S3Storage::setEndpoint('http://127.0.0.1:9000');
+        S3Storage::setUsePathStyleEndpoint(false);
 
         S3Storage::reset();
 
@@ -156,6 +185,11 @@ final class S3StorageTest extends TestCase
         $this->assertFalse(S3Storage::getDebug(), 'reset() must disable debug');
         $this->assertNull(S3Storage::getLastError(), 'reset() must clear lastError');
         $this->assertNull(self::peekClient(), 'reset() must drop the cached client');
+        $this->assertNull(S3Storage::getEndpoint(), 'reset() must clear the custom endpoint');
+        $this->assertFalse(
+            S3Storage::getUsePathStyleEndpoint(),
+            'reset() must drop the path-style override back to the automatic default (AWS => virtual-host)'
+        );
     }
 
     public function testGetLastErrorIsNullBeforeAnyOperation(): void
@@ -177,6 +211,207 @@ final class S3StorageTest extends TestCase
         S3Storage::setRegion('sa-east-1');
 
         $this->assertSame('sa-east-1', S3Storage::getRegion());
+    }
+
+    // ---------------------------------------------------------------------
+    // NEW (pass 2): custom endpoint support. getClient() used to build the S3Client from a
+    // hardcoded config with no way to point it anywhere but AWS — which is precisely why an
+    // S3-compatible container could not be used to exercise this class.
+    //
+    // Asserted through the BUILT CLIENT'S CONFIG, which the SDK resolves locally. Zero
+    // network: no endpoint here is ever contacted.
+    // ---------------------------------------------------------------------
+
+    public function testDefaultsToTheAwsEndpointDerivedFromTheRegion(): void
+    {
+        $client = $this->buildClientWith(fn () => S3Storage::setRegion('sa-east-1'));
+
+        $endpoint = (string)$client->getEndpoint();
+        // Asserted by shape, not literal: the host is the SDK's to derive, not this contract's.
+        $this->assertStringContainsString('amazonaws.com', $endpoint, 'no custom endpoint => real AWS');
+        $this->assertStringContainsString('sa-east-1', $endpoint, 'the region must drive the AWS endpoint');
+        $this->assertNull(S3Storage::getEndpoint());
+    }
+
+    public function testCustomEndpointIsPassedToTheBuiltClient(): void
+    {
+        $client = $this->buildClientWith(fn () => S3Storage::setEndpoint('http://127.0.0.1:9000'));
+
+        $this->assertSame('http://127.0.0.1:9000', (string)$client->getEndpoint());
+    }
+
+    public function testCustomEndpointMayCarryAPathPrefix(): void
+    {
+        // Some gateways expose S3 under a prefix; the path must survive.
+        $client = $this->buildClientWith(fn () => S3Storage::setEndpoint('https://gw.example.com/s3'));
+
+        $this->assertSame('https://gw.example.com/s3', (string)$client->getEndpoint());
+    }
+
+    public function testCustomEndpointRoundTripsAndStripsATrailingSlash(): void
+    {
+        $this->assertTrue(S3Storage::setEndpoint('http://127.0.0.1:9000/'));
+        $this->assertSame('http://127.0.0.1:9000', S3Storage::getEndpoint());
+    }
+
+    public function testEndpointCanBeClearedBackToAws(): void
+    {
+        $this->assertTrue(S3Storage::setEndpoint('http://127.0.0.1:9000'));
+
+        $this->assertTrue(S3Storage::setEndpoint(null), 'null clears the endpoint');
+        $this->assertNull(S3Storage::getEndpoint());
+
+        $this->assertTrue(S3Storage::setEndpoint('http://127.0.0.1:9000'));
+        $this->assertTrue(S3Storage::setEndpoint(''), 'an empty string clears it too');
+        $this->assertNull(S3Storage::getEndpoint());
+    }
+
+    /**
+     * The AWS SDK does NOT validate the endpoint: it accepts "not a url" and turns it into
+     * the relative "not%20a%20url", yielding a client that signs this deployment's
+     * credentials for a nonsense host. setEndpoint() rejects that locally instead.
+     */
+    public function testSetEndpointRejectsMalformedValuesTheSdkWouldSilentlyAccept(): void
+    {
+        $this->assertFalse(S3Storage::setEndpoint('not a url'));
+        $this->assertStringContainsString('must be an absolute http(s) URL', (string)S3Storage::getLastError());
+        $this->assertNull(S3Storage::getEndpoint(), 'a rejected endpoint must not be stored');
+
+        $this->assertFalse(S3Storage::setEndpoint('minio.internal:9000'), 'a scheme is required');
+        $this->assertFalse(S3Storage::setEndpoint('ftp://minio.internal'), 'only http/https address an S3 API');
+        $this->assertFalse(S3Storage::setEndpoint('https://'), 'a host is required');
+        $this->assertFalse(S3Storage::setEndpoint('/just/a/path'), 'a relative path is not an endpoint');
+    }
+
+    public function testSetEndpointRejectsAQueryStringOrFragment(): void
+    {
+        $this->assertFalse(S3Storage::setEndpoint('http://minio.internal:9000?x=1'));
+        $this->assertStringContainsString('must not carry a query string or fragment', (string)S3Storage::getLastError());
+
+        $this->assertFalse(S3Storage::setEndpoint('http://minio.internal:9000#frag'));
+    }
+
+    public function testARejectedEndpointLeavesThePreviousOneIntact(): void
+    {
+        $this->assertTrue(S3Storage::setEndpoint('https://minio.example.com:9000'));
+
+        $this->assertFalse(S3Storage::setEndpoint('!!not a url!!'));
+        $this->assertSame(
+            'https://minio.example.com:9000',
+            S3Storage::getEndpoint(),
+            'a rejected endpoint must not clobber the working one'
+        );
+    }
+
+    public function testSetEndpointInvalidatesTheCachedClient(): void
+    {
+        self::buildClientOffline();
+        $this->assertNotNull(self::peekClient(), 'precondition: a client is cached');
+
+        $this->assertTrue(S3Storage::setEndpoint('http://127.0.0.1:9000'));
+
+        $this->assertNull(
+            self::peekClient(),
+            'setEndpoint() must drop the cached client, otherwise the switch keeps addressing the OLD host '
+            . '(and keeps sending this deployment credentials there)'
+        );
+    }
+
+    public function testClearingTheEndpointAlsoInvalidatesTheCachedClient(): void
+    {
+        S3Storage::setEndpoint('http://127.0.0.1:9000');
+        self::buildClientOffline();
+        $this->assertNotNull(self::peekClient());
+
+        $this->assertTrue(S3Storage::setEndpoint(null));
+
+        $this->assertNull(self::peekClient(), 'going back to AWS must rebuild the client too');
+    }
+
+    public function testARejectedEndpointDoesNotInvalidateTheCachedClient(): void
+    {
+        self::buildClientOffline();
+        $this->assertNotNull(self::peekClient());
+
+        $this->assertFalse(S3Storage::setEndpoint('not a url'));
+
+        $this->assertNotNull(self::peekClient(), 'nothing changed, so there is nothing to rebuild');
+    }
+
+    // ---------------------------------------------------------------------
+    // Path-style addressing: a separate toggle with a tri-state default.
+    // ---------------------------------------------------------------------
+
+    public function testPathStyleDefaultsOffForAwsAndOnForACustomEndpoint(): void
+    {
+        $this->assertFalse(S3Storage::getUsePathStyleEndpoint(), 'AWS uses virtual-host style');
+
+        S3Storage::setEndpoint('http://minio.internal:9000');
+        $this->assertTrue(
+            S3Storage::getUsePathStyleEndpoint(),
+            'MinIO and most S3-compatible servers require path-style; virtual-host does not work against them'
+        );
+    }
+
+    public function testCustomEndpointBuildsAPathStyleClientByDefault(): void
+    {
+        $client = $this->buildClientWith(fn () => S3Storage::setEndpoint('http://127.0.0.1:9000'));
+
+        $this->assertTrue($client->getConfig('use_path_style_endpoint'));
+    }
+
+    public function testAwsClientIsBuiltVirtualHostStyle(): void
+    {
+        $client = $this->buildClientWith(fn () => null);
+
+        $this->assertFalse($client->getConfig('use_path_style_endpoint'));
+    }
+
+    public function testPathStyleCanBeForcedOffForAVirtualHostStyleProvider(): void
+    {
+        // DigitalOcean Spaces / Wasabi serve virtual-host style from a custom endpoint and
+        // break under path-style: implying path-style from the endpoint alone, with no
+        // override, would leave them unusable.
+        $client = $this->buildClientWith(function () {
+            S3Storage::setEndpoint('https://nyc3.digitaloceanspaces.com');
+            S3Storage::setUsePathStyleEndpoint(false);
+        });
+
+        $this->assertFalse(
+            $client->getConfig('use_path_style_endpoint'),
+            'an explicit override must beat the endpoint-implied default'
+        );
+    }
+
+    public function testPathStyleCanBeForcedOnWithoutACustomEndpoint(): void
+    {
+        $client = $this->buildClientWith(fn () => S3Storage::setUsePathStyleEndpoint(true));
+
+        $this->assertTrue($client->getConfig('use_path_style_endpoint'));
+        $this->assertNull(S3Storage::getEndpoint(), 'forcing path-style must not invent an endpoint');
+    }
+
+    public function testNullRestoresTheAutomaticPathStyleDefault(): void
+    {
+        S3Storage::setEndpoint('http://minio.internal:9000');
+        S3Storage::setUsePathStyleEndpoint(false);
+        $this->assertFalse(S3Storage::getUsePathStyleEndpoint());
+
+        S3Storage::setUsePathStyleEndpoint(null);
+        $this->assertTrue(S3Storage::getUsePathStyleEndpoint(), 'null restores the automatic rule');
+    }
+
+    public function testSetUsePathStyleEndpointInvalidatesTheCachedClient(): void
+    {
+        self::buildClientOffline();
+        $this->assertNotNull(self::peekClient());
+
+        S3Storage::setUsePathStyleEndpoint(true);
+
+        $this->assertNull(
+            self::peekClient(),
+            'addressing style is baked into the client at construction, so it must be rebuilt'
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -345,15 +580,115 @@ final class S3StorageTest extends TestCase
         $this->assertStringContainsString('missing AWS_S3_KEY/AWS_S3_SECRET', (string)S3Storage::getLastError());
     }
 
-    public function testDefaultBucketIsRequiredEvenWhenBucketIsPassedPerCall(): void
+    // ---------------------------------------------------------------------
+    // BEHAVIOR CHANGE (pass 2): the bucket is now required per OPERATION, not per client.
+    //
+    // This replaces testDefaultBucketIsRequiredEvenWhenBucketIsPassedPerCall(), which pinned
+    // the old rule that getClient() refused to build without a registered default — so the
+    // per-call $bucket override the class advertised did not actually work. That old test
+    // also proved the guard was load-bearing in an unintended way: with the guard removed it
+    // FAILED by reaching real AWS ("The AWS Access Key Id you provided does not exist in our
+    // records"), because nothing else stopped the call. Hence the mock transport below.
+    // ---------------------------------------------------------------------
+
+    /**
+     * The pin for the guard that was REMOVED. getClient() is exercised directly because the
+     * mock-transport tests below inject the client by reflection and therefore bypass client
+     * construction entirely — they would pass with or without the old guard, so they cannot
+     * be the evidence for this change. Offline: construction resolves config locally.
+     */
+    public function testTheClientIsBuiltWithoutAnyRegisteredDefaultBucket(): void
     {
-        // Documented: getClient() refuses to build without a registered default bucket,
-        // so a per-call $bucket does not rescue a missing setBucket().
         S3Storage::setKey(self::TEST_ID);
         S3Storage::setSecret(self::TEST_TOKEN);
+        $this->assertNull(S3Storage::getBucket(), 'precondition: no default bucket registered');
 
-        $this->assertFalse(S3Storage::list('', false, 'an-explicitly-passed-bucket'));
+        $client = (new \ReflectionMethod(S3Storage::class, 'getClient'))->invoke(null);
+
+        $this->assertInstanceOf(
+            S3Client::class,
+            $client,
+            'the client is not bound to a bucket, so it must build without a registered default'
+        );
+        $this->assertNull(S3Storage::getLastError(), 'building without a default bucket is not an error');
+    }
+
+    public function testAPerCallBucketNoLongerRequiresARegisteredDefault(): void
+    {
+        $this->installMockS3([new Result(['IsTruncated' => false])], false);
+        $this->assertNull(S3Storage::getBucket(), 'precondition: no default bucket registered');
+
+        $this->assertSame([], S3Storage::list('', false, 'an-explicitly-passed-bucket'));
+        $this->assertSame(
+            'an-explicitly-passed-bucket',
+            $this->awsParams['ListObjectsV2'][0]['Bucket'] ?? null,
+            'the explicit per-call bucket must be the one actually addressed'
+        );
+    }
+
+    public function testAnOperationWithNoBucketAnywhereStillFailsWithoutReachingAws(): void
+    {
+        // The guard that matters: dropping the up-front requirement must NOT let an empty
+        // bucket through to AWS.
+        $this->installMockS3([new Result([])], false);
+
+        $this->assertFalse(S3Storage::list(''));
         $this->assertStringContainsString('missing AWS_S3_BUCKET', (string)S3Storage::getLastError());
+        $this->assertSame([], $this->awsCommands, 'an empty bucket must never reach AWS');
+    }
+
+    public function testEveryOperationRefusesToReachAwsWithoutAResolvableBucket(): void
+    {
+        // No responses queued: any AWS command would fail loudly on an empty mock queue.
+        $this->installMockS3([], false);
+
+        $this->assertFalse(S3Storage::createBucket());
+        $this->assertFalse(S3Storage::upload('a/b.txt', $this->tempFile()));
+        $this->assertFalse(S3Storage::copy('a/x.pdf', 'a/y.pdf'));
+        $this->assertFalse(S3Storage::delete('a/b.txt'));
+        $this->assertFalse(S3Storage::list('p/'));
+        $this->assertFalse(S3Storage::find('a/b.txt'));
+        $this->assertFalse(S3Storage::exists('a/b.txt'));
+        $this->assertFalse(S3Storage::download('a/b.txt', 'TEXT'));
+
+        $this->assertSame([], $this->awsCommands, 'no operation may reach AWS without a bucket');
+    }
+
+    public function testDefaultBucketIsStillUsedWhenNoPerCallBucketIsGiven(): void
+    {
+        $this->installMockS3([new Result(['IsTruncated' => false])]);
+
+        $this->assertSame([], S3Storage::list('p/'));
+        $this->assertSame(self::TEST_BUCKET, $this->awsParams['ListObjectsV2'][0]['Bucket'] ?? null);
+    }
+
+    /**
+     * A per-call bucket used to skip every rule setBucket() enforces. copy() interpolates the
+     * source bucket straight into CopySource ("{$fromBucket}/{$fromKey}"), so a name carrying
+     * a '/' silently redirected the copy source to another bucket and key prefix.
+     */
+    public function testAPerCallBucketIsHeldToTheSameNamingRulesAsSetBucket(): void
+    {
+        $this->installMockS3([new Result([])], false);
+
+        $this->assertFalse(
+            S3Storage::copy('a/x.pdf', 'a/y.pdf', false, true, [], 'other-bucket/injected-prefix', self::TEST_BUCKET),
+            'a bucket name containing a path separator must be rejected locally'
+        );
+        $this->assertStringContainsString('may contain only lowercase letters', (string)S3Storage::getLastError());
+        $this->assertSame([], $this->awsCommands, 'an invalid bucket name must not reach AWS');
+    }
+
+    public function testAPerCallBucketIsNormalisedLikeTheDefaultOne(): void
+    {
+        $this->installMockS3([new Result(['IsTruncated' => false])], false);
+
+        $this->assertSame([], S3Storage::list('', false, '  MixedCase-Bucket  '));
+        $this->assertSame(
+            'mixedcase-bucket',
+            $this->awsParams['ListObjectsV2'][0]['Bucket'] ?? null,
+            'S3 bucket names are lowercase; a per-call bucket is normalised like setBucket() does'
+        );
     }
 
     // ---------------------------------------------------------------------

@@ -3,6 +3,7 @@
 namespace VD\PHPHelper;
 
 use InvalidArgumentException;
+use Random\RandomException;
 
 class Number
 {
@@ -17,22 +18,35 @@ class Number
      * being ON it, so this floors the decimal number the caller wrote, not the binary double
      * actually stored. roundDecimal(8.2, 2, 'floor') is 8.2. A genuine 0.2999 still floors to 0.29.
      *
+     * Zero is NOT special-cased: it takes the same path as every other value and comes back as a
+     * float. IEEE-754 signed zero is preserved, so -0.0 returns -0.0 — as does any negative value
+     * that rounds to zero, e.g. roundDecimal(-0.004) — which is === and == equal to 0.0 but casts
+     * to the string "-0". Callers formatting money must normalise the sign themselves if "-0.00"
+     * is unacceptable; this method will not guess.
+     *
      * @param float $value Value to be rounded. Non-finite input passes through: NAN returns NAN,
-     *                     INF returns INF. Zero (and -0.0) short-circuits to 0.0.
+     *                     INF returns INF.
      * @param int $precision Number of decimal places. Defaults to 2. May be negative, which rounds
      *                       to tens/hundreds/... ($precision = -2 turns 8250.0 into 8200.0).
      * @param string $method Rounding mode. Exactly one of 'round', 'floor' or 'ceil',
-     *                       case-sensitive. ANY other value — including 'Floor' or 'trunc' — is
-     *                       SILENTLY replaced with 'round'; no exception, no warning.
-     * @return float Rounded number. Never throws.
+     *                       case-sensitive. Anything else — including the wrong-case 'Floor' and
+     *                       the plausible-but-unsupported 'trunc' — is REJECTED.
+     * @return float Rounded number.
+     *
+     * @throws InvalidArgumentException If $method is not exactly 'round', 'floor' or 'ceil'.
      *
      * @ref https://stackoverflow.com/questions/12277945/php-how-do-i-round-down-to-two-decimal-places
      */
     public static function roundDecimal(float $value, int $precision = 2, string $method = "round"): float {
-        if (empty($value)) return 0;
-
-        if (!in_array($method, ['round', 'floor', 'ceil'])) {
-            $method = "round";
+        // A $method the caller got wrong is a caller bug, not a request to round. Silently
+        // substituting 'round' turned roundDecimal($x, 2, 'FLOOR') into a wrong number that looked
+        // right — the worst possible failure for money arithmetic. Rejecting is also what
+        // randomDecimal() below does with bad arguments, so the class is consistent.
+        if (!in_array($method, ['round', 'floor', 'ceil'], true)) {
+            throw new InvalidArgumentException(
+                "roundDecimal(): \$method must be exactly 'round', 'floor' or 'ceil' (case-sensitive); got "
+                . var_export($method, true) . '.'
+            );
         }
 
         $factor = pow(10, $precision);
@@ -48,9 +62,14 @@ class Number
      * The draw happens on a fixed grid of 10^$decimals steps. Every returned value satisfies
      * $min <= $value <= $max.
      *
-     * NOT cryptographically secure: this uses rand() (Mt19937), which is predictable from
-     * observed output. Never use it for tokens, passwords, salts, nonces or IDs — use
-     * random_int()/random_bytes() for those.
+     * The value is derived from a single integer drawn uniformly over the WHOLE scaled range
+     * [$min * 10^$decimals, $max * 10^$decimals] and then divided back down, so every grid point
+     * in [$min, $max] is equally likely — including both bounds.
+     *
+     * The integer is drawn with random_int(), i.e. from the platform CSPRNG, so the result is not
+     * predictable from previously observed output and is not biased by the modulo/scaling skew
+     * rand() exhibits on wide ranges. Note that the return is still a float on a coarse grid:
+     * for a secret, prefer random_bytes()/Str::generateUniqueKey() over quantised arithmetic.
      *
      * @param float $min Minimum value, inclusive. Must be finite and <= $max. 0.0 is valid.
      * @param float $max Maximum value, inclusive. Must be finite and >= $min. 0.0 is valid.
@@ -68,18 +87,22 @@ class Number
      *
      * @throws InvalidArgumentException If $min or $max is NAN or INF; if $min > $max; if $decimals
      *                                  is negative; if the bounds scaled by 10^$decimals fall
-     *                                  outside the integer range rand() accepts; or if no value on
-     *                                  the requested grid exists within [$min, $max] (e.g.
+     *                                  outside the integer range random_int() accepts; or if no
+     *                                  value on the requested grid exists within [$min, $max] (e.g.
      *                                  randomDecimal(0.24, 0.25, 1) — there is no 1-decimal value
      *                                  in that interval).
+     * @throws RandomException If the platform CSPRNG cannot produce randomness. This is not
+     *                         caught and downgraded to a weaker generator: a caller asking for a
+     *                         random number gets one or gets an exception, never a guessable
+     *                         fallback.
      *
      * @ref https://stackoverflow.com/questions/10419501/use-php-to-generate-random-decimal-beteween-two-decimals
      */
     public static function randomDecimal(float $min, float $max, ?int $decimals = null): float {
         // Both parameters are already typed `float`, so the only non-numeric values that can reach
         // here are NAN and INF. They are rejected rather than replaced with a sentinel: the old
-        // PHP_FLOAT_MIN/PHP_FLOAT_MAX fallbacks could never survive the rand() call below, which
-        // needs ints inside PHP_INT range.
+        // PHP_FLOAT_MIN/PHP_FLOAT_MAX fallbacks could never survive the random_int() call below,
+        // which needs ints inside PHP_INT range.
         if (!is_finite($min) || !is_finite($max)) {
             throw new InvalidArgumentException('randomDecimal(): $min and $max must be finite; NAN and INF are rejected.');
         }
@@ -102,7 +125,7 @@ class Number
 
         if (!is_finite($lowScaled) || !is_finite($highScaled)
             || $lowScaled < (float)PHP_INT_MIN || $highScaled >= (float)PHP_INT_MAX) {
-            throw new InvalidArgumentException('randomDecimal(): [$min, $max] scaled by 10^' . $decimals . ' exceeds the integer range rand() accepts; lower $decimals or narrow the range.');
+            throw new InvalidArgumentException('randomDecimal(): [$min, $max] scaled by 10^' . $decimals . ' exceeds the integer range random_int() accepts; lower $decimals or narrow the range.');
         }
 
         $low = (int)$lowScaled;
@@ -112,7 +135,10 @@ class Number
             throw new InvalidArgumentException('randomDecimal(): no value with ' . $decimals . ' decimal place(s) exists within [' . $min . ', ' . $max . '].');
         }
 
-        return rand($low, $high) / $scale;
+        // random_int() draws uniformly over the inclusive range with rejection sampling, so no grid
+        // point is favoured however wide the range is — unlike rand(), which both skews on wide
+        // ranges and lets an observer reconstruct the Mt19937 state and predict later draws.
+        return random_int($low, $high) / $scale;
     }
 
     /**

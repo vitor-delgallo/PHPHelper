@@ -259,6 +259,96 @@ final class StrTest extends TestCase {
         self::assertMatchesRegularExpression('/^[0-9a-f]{25}$/', Str::generateUniqueKey(5, 5, ''));
     }
 
+    /**
+     * BEHAVIOR CHANGE (pass 2). Every segment used to be cut at a rand() offset out of ONE 128-char
+     * whirlpool hash, so segments within a single key repeated verbatim — reproduced live as
+     * 'PRE-6f972-6f972-fd013-3213e-c98ee'. Segments are now independent random_bytes() draws.
+     *
+     * The parameters are chosen so the two implementations are separated by an enormous margin
+     * rather than by luck. At (32, 8) the old design had only 97 possible start offsets for 8
+     * segments, so a birthday collision hit ~25% of keys; over 60 keys, seeing zero collisions had
+     * probability ~0.75^60 ~ 3e-8, i.e. the old code failed this test essentially always. The new
+     * code collides only if two independent 32-hex-char draws coincide: C(8,2) * 16^-32 per key,
+     * which is ~1e-36 over all 60 keys. No flake in either direction.
+     */
+    public function testGenerateUniqueKeyDoesNotRepeatSegmentsWithinAKey(): void {
+        for ($i = 0; $i < 60; $i++) {
+            $segments = explode('-', Str::generateUniqueKey(32, 8));
+
+            self::assertCount(8, $segments);
+            self::assertSame(
+                $segments,
+                array_values(array_unique($segments)),
+                'segments repeated inside one key: they are being cut from a shared hash, not drawn independently'
+            );
+        }
+    }
+
+    /**
+     * The shared hash was 128 chars of whirlpool, so a key could never carry more than 128 distinct
+     * characters' worth of material however many segments were asked for: at (16, 40) the old code
+     * drew 40 segments from 113 offsets and duplicates were a certainty (pigeonhole gives at most
+     * 113 distinct segments, and the birthday bound makes a repeat overwhelming long before that).
+     * Independent draws have no such ceiling.
+     */
+    public function testGenerateUniqueKeyScalesBeyondTheOldHashLengthWithoutRepeating(): void {
+        $segments = explode('-', Str::generateUniqueKey(16, 40));
+
+        self::assertCount(40, $segments);
+        self::assertCount(40, array_unique($segments), 'a 40-segment key must still have 40 distinct segments');
+        foreach ($segments as $segment) {
+            self::assertMatchesRegularExpression('/^[0-9a-f]{16}$/', $segment);
+        }
+    }
+
+    /**
+     * Odd $segmentLength exercises the hex truncation in randomHex(): ceil(n/2) bytes give one
+     * character too many on odd lengths, and the surplus must be dropped, not leaked into the key.
+     */
+    public function testGenerateUniqueKeyHonoursOddSegmentLengths(): void {
+        foreach ([1, 3, 7, 15, 127] as $length) {
+            $segments = explode('-', Str::generateUniqueKey($length, 3));
+
+            self::assertCount(3, $segments);
+            foreach ($segments as $segment) {
+                self::assertSame($length, strlen($segment), "segment length {$length} must be exact");
+                self::assertMatchesRegularExpression('/^[0-9a-f]+$/', $segment);
+            }
+        }
+    }
+
+    /**
+     * The keys themselves must not collide across calls. The old key's uniqueness rested entirely on
+     * one hash of time + uniqid() + rand(); the new one rests on 100 bits of CSPRNG entropy at the
+     * 5x5 default. 500 keys, no duplicates.
+     */
+    public function testGenerateUniqueKeyDoesNotCollideAcrossCalls(): void {
+        $keys = [];
+        for ($i = 0; $i < 500; $i++) {
+            $keys[] = Str::generateUniqueKey();
+        }
+
+        self::assertCount(500, array_unique($keys));
+    }
+
+    /**
+     * generateUniqueKey() used to be seeded by rand() through uniqid()'s prefix. Nothing in it may
+     * depend on the seedable Mt19937 generator any more: re-seeding must not replay a key.
+     */
+    public function testGenerateUniqueKeyIgnoresTheMtRandSeed(): void {
+        try {
+            mt_srand(999);
+            $first = Str::generateUniqueKey(16, 4);
+
+            mt_srand(999);
+            $second = Str::generateUniqueKey(16, 4);
+
+            self::assertNotSame($first, $second, 'a seeded sequence replayed the key: generateUniqueKey is not CSPRNG-backed');
+        } finally {
+            mt_srand();
+        }
+    }
+
     // ----------------------------------------------------------------------------- generateGuid
 
     public function testGenerateGuidReturnsABareGuidByDefault(): void {

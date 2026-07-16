@@ -331,6 +331,38 @@ final class SystemTest extends TestCase {
         $this->assertGreaterThanOrEqual(0, $result['freeBytes'], 'free memory is never negative');
     }
 
+    /**
+     * usageBytes is exactly memory_get_usage(true) and owes NOTHING to the OS probe. That is not an
+     * incidental detail: SQL::prepareInsertOrUpdateMySQL() leans on it to read process usage inside
+     * its batch loop with a bare memory_get_usage(true) instead of calling this method once per row
+     * and paying for a wmic/proc probe it would discard. If usageBytes ever starts meaning something
+     * else — the machine's used RAM, say — that substitution becomes silently wrong, and this test
+     * is what says so.
+     */
+    public function testGetMemoryUsageUsageBytesIsTheProcessFigureFromMemoryGetUsageTrue(): void {
+        ini_set('memory_limit', '512M');
+
+        $before = memory_get_usage(true);
+        $result = System::getMemoryUsage();
+        $after = memory_get_usage(true);
+
+        $this->assertGreaterThanOrEqual($before, $result['usageBytes']);
+        $this->assertLessThanOrEqual($after, $result['usageBytes']);
+    }
+
+    /**
+     * The same invariant where it actually bites: with the OS probe unavailable, usageBytes must
+     * still be the real process figure rather than 0 or a guess.
+     */
+    public function testGetMemoryUsageUsageBytesStaysRealWhenTheOsProbeIsUnavailable(): void {
+        $output = $this->runInProcessWithoutOsMemoryProbe('512M');
+
+        $this->assertNull($output['server'], 'the OS probe must be unavailable for this test to mean anything');
+        $this->assertArrayNotHasKey('error', $output, $output['error'] ?? '');
+        $this->assertGreaterThan(0, $output['usage']['usageBytes']);
+        $this->assertLessThan(536870912, $output['usage']['usageBytes']);
+    }
+
     public function testGetMemoryUsageFreePercentIsTheFreeShareNotTheUsedShare(): void {
         ini_set('memory_limit', '512M');
 

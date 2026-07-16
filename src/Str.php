@@ -2,6 +2,8 @@
 
 namespace VD\PHPHelper;
 
+use Random\RandomException;
+
 /**
  * Static string helpers.
  *
@@ -15,6 +17,31 @@ namespace VD\PHPHelper;
  *   truncateWithTooltip() is the single method that emits HTML, and it encodes what it emits.
  */
 class Str {
+    /**
+     * Upper bound for generateUniqueKey()'s $segmentLength; anything above it falls back to 5.
+     *
+     * Historically this was implied by the 128-char whirlpool hash the segments were cut from.
+     * The hash is gone, but the cap is kept as the documented contract and as a sanity bound on
+     * how many random bytes one call will draw.
+     */
+    private const MAX_KEY_SEGMENT_LENGTH = 127;
+
+    /**
+     * Draws $length lowercase hex characters from the platform CSPRNG.
+     *
+     * bin2hex() of ceil($length / 2) bytes yields at least $length characters; the surplus
+     * character on odd lengths is discarded. Every hex character is independent and uniform, so
+     * truncating does not bias what remains.
+     *
+     * @param int $length Number of hex characters, >= 1.
+     * @return string Exactly $length characters matching /^[0-9a-f]+$/.
+     *
+     * @throws RandomException If the platform CSPRNG cannot produce randomness.
+     */
+    private static function randomHex(int $length): string {
+        return substr(bin2hex(random_bytes(intdiv($length + 1, 2))), 0, $length);
+    }
+
     /**
      * Removes invisible (control) characters from a string.
      *
@@ -195,7 +222,7 @@ class Str {
     }
 
     /**
-     * Generates a key made of random hash segments, with an optional prefix, unique ID and suffix.
+     * Generates a key made of random hex segments, with an optional prefix, unique ID and suffix.
      *
      * Layout, joined by $separator:
      *     [$prefix] segment1 [$uniqueId] segment2 ... segmentN [$suffix]
@@ -203,15 +230,21 @@ class Str {
      * $segmentCount random segments, and none is ever silently dropped. The key therefore always
      * carries exactly $segmentCount random segments, whichever optional parts are supplied.
      *
-     * NOT cryptographically secure. Every segment is cut at a rand() offset out of ONE whirlpool
-     * hash of the current time + uniqid(), so segments within a key may repeat or overlap and the
-     * whole key is only as unpredictable as rand()/uniqid(). Use it for readable identifiers —
-     * never as a token, session ID, password-reset key or any value that must be unguessable.
-     * For those use random_bytes()/generateGuid().
+     * Each random segment is an INDEPENDENT draw from random_bytes() — the platform CSPRNG —
+     * rendered as lowercase hex. A key therefore carries $segmentLength * $segmentCount * 4 bits
+     * of entropy: 100 bits at the 5x5 default, which is enough for a token or a session ID.
+     *
+     * Two properties the caller must still respect:
+     * - $prefix, $uniqueId and $suffix are caller-supplied and contribute NO entropy. Only the
+     *   random segments do, so shrinking $segmentLength/$segmentCount shrinks the real strength
+     *   no matter how long the decorated key looks.
+     * - Segments are drawn independently rather than cut out of one shared hash, so two segments
+     *   repeating inside a key now means a genuine 16^-$segmentLength coincidence per pair, not
+     *   the ~1-in-13 structural collision the old shared-128-char-hash design produced at the 5x5
+     *   default (it could emit 'PRE-6f972-6f972-fd013-3213e-c98ee').
      *
      * @param int $segmentLength Characters per random segment. Must be 1..127; ANY other value
-     *                           (including a value >= the 128-char hash length) silently falls
-     *                           back to 5.
+     *                           (including anything above 127) silently falls back to 5.
      * @param int $segmentCount Number of RANDOM segments. Must be >= 1; any other value silently
      *                          falls back to 5.
      * @param string $separator Placed between every part. "" yields a key with no separators.
@@ -227,6 +260,10 @@ class Str {
      *                               the ID is embedded whole and the key grows instead.
      *
      * @return string The generated key.
+     *
+     * @throws RandomException If the platform CSPRNG cannot produce randomness. There is
+     *                         deliberately no weaker fallback: a failed draw raises instead of
+     *                         quietly returning a guessable key.
      */
     public static function generateUniqueKey(
         int $segmentLength = 5,
@@ -237,11 +274,8 @@ class Str {
         string $suffix = '',
         bool $ignoreLengthOnId = true
     ): string {
-        $hash = hash('whirlpool', DateTime::getCurrentFormattedDate('Y-m-d H:i:s') . md5(uniqid((string) rand(), true)) . DateTime::getCurrentFormattedDate('Y-m-d H:i:s'));
-        $hashLength = strlen($hash);
-
         // Sanitize segment length
-        if ($segmentLength <= 0 || $segmentLength >= $hashLength) {
+        if ($segmentLength <= 0 || $segmentLength > self::MAX_KEY_SEGMENT_LENGTH) {
             $segmentLength = 5;
         }
 
@@ -268,8 +302,9 @@ class Str {
         }
 
         for ($i = 0; $i < $segmentCount; $i++) {
-            $start = rand(0, $hashLength - $segmentLength);
-            $parts[] = substr($hash, $start, $segmentLength);
+            // Drawn per segment, not sliced out of one shared hash: that is what makes the whole
+            // key CSPRNG-backed and removes the structural repeats the shared hash produced.
+            $parts[] = self::randomHex($segmentLength);
 
             if ($i === 0 && $uniqueIdFormatted !== '') {
                 $parts[] = $uniqueIdFormatted;

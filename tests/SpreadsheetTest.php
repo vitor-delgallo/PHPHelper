@@ -136,25 +136,142 @@ final class SpreadsheetTest extends TestCase {
         self::assertSame([], Spreadsheet::excelToArray($path, false));
     }
 
-    public function testDuplicatedHeadersCollapseAndTheRightmostColumnWins(): void {
+    // -------------------------------------------- finding: $withHeader silently lost columns
+    //
+    // The three tests below replace two pass-1 tests that pinned the OLD, lossy behavior
+    // (testDuplicatedHeadersCollapseAndTheRightmostColumnWins,
+    // testBlankHeaderCellBecomesTheEmptyStringKey). That behavior is now a deliberate throw, so the
+    // assertions were rewritten to pin the NEW contract rather than deleted.
+
+    /**
+     * Was: two 'Name' columns collapsed into one key and the RIGHTMOST silently won, so a bulk
+     * import read a value from a column it never asked for and nothing reported the other. The
+     * ambiguity is unresolvable inside the reader, so it is handed to the caller.
+     */
+    public function testDuplicatedHeadersThrowInsteadOfCollapsingOntoOneKey(): void {
         $path = $this->makeXlsx(['Data' => [
             ['Name', 'Name'],
             ['left', 'right'],
         ]]);
 
-        self::assertSame([['Name' => 'right']], Spreadsheet::excelToArray($path));
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Duplicate header "Name"');
+
+        Spreadsheet::excelToArray($path);
     }
 
-    public function testBlankHeaderCellBecomesTheEmptyStringKey(): void {
+    /**
+     * Header names are trimmed, so 'Name' and 'Name ' are the same column name. Untrimmed they were
+     * two distinct keys and the caller reading $row['Name'] silently never saw the second column;
+     * trimmed without this check they would collapse. Either way a value went missing without a word.
+     */
+    public function testHeadersDifferingOnlyByWhitespaceThrowAsDuplicates(): void {
+        $path = $this->makeXlsx(['Data' => [
+            ['Name', 'Name '],
+            ['left', 'right'],
+        ]]);
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Duplicate header "Name"');
+
+        Spreadsheet::excelToArray($path);
+    }
+
+    /** Surrounding whitespace is not part of a column's name. */
+    public function testHeaderNamesAreTrimmed(): void {
+        $path = $this->makeXlsx(['Data' => [
+            ['  Name  ', "Age\n"],
+            ['Ann', 30],
+        ]]);
+
+        self::assertSame([['Name' => 'Ann', 'Age' => '30']], Spreadsheet::excelToArray($path));
+    }
+
+    /**
+     * Was: the blank header became the key '' and 'orphan' was returned under it — and a second
+     * unnamed column would have overwritten it. An unnamed column carrying data is the same silent
+     * loss as a duplicate, so it throws.
+     */
+    public function testBlankHeaderOverAColumnWithDataThrowsInsteadOfKeyingItUnderTheEmptyString(): void {
         $path = $this->makeXlsx(['Data' => [
             ['Name', null],
             ['Ann', 'orphan'],
         ]]);
 
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('holds data but its header cell B1 is blank');
+
+        Spreadsheet::excelToArray($path);
+    }
+
+    /**
+     * The other half of the blank-header rule: an unnamed column with nothing under it is dropped.
+     * Discarding it loses no value, and a trailing empty column is too common to reject a file over.
+     */
+    public function testBlankHeaderOverAnEmptyColumnIsDroppedRatherThanKeyedUnderTheEmptyString(): void {
+        $path = $this->makeXlsx(['Data' => [
+            ['Name', null],
+            ['Ann', null],
+            ['Bob', '   '], // whitespace-only is blank by the documented definition
+        ]]);
+
         $rows = Spreadsheet::excelToArray($path);
 
-        self::assertCount(1, $rows);
-        self::assertSame(['Name' => 'Ann', '' => 'orphan'], $rows[0]);
+        self::assertSame([['Name' => 'Ann'], ['Name' => 'Bob']], $rows);
+        foreach ($rows as $row) {
+            self::assertArrayNotHasKey('', $row);
+        }
+    }
+
+    /**
+     * A header row that names nothing while the rows below carry data is not a header row at all.
+     */
+    public function testEntirelyBlankHeaderRowOverDataThrows(): void {
+        $path = $this->makeXlsx(['Data' => [
+            [null, null],
+            ['Ann', '30'],
+        ]]);
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Column A of');
+
+        Spreadsheet::excelToArray($path);
+    }
+
+    /**
+     * The documented escape hatch, and the reason throwing costs the caller nothing: every file the
+     * $withHeader = true rules reject is still readable, losslessly, keyed by column letter. Both
+     * 'Name' columns survive here — which is exactly what the old collapse destroyed.
+     */
+    public function testWithHeaderFalseReadsADuplicateHeaderFileLosslessly(): void {
+        $path = $this->makeXlsx(['Data' => [
+            ['Name', 'Name'],
+            ['left', 'right'],
+        ]]);
+
+        self::assertSame(
+            [
+                ['A' => 'Name', 'B' => 'Name'],
+                ['A' => 'left', 'B' => 'right'],
+            ],
+            Spreadsheet::excelToArray($path, false)
+        );
+    }
+
+    /** Same escape hatch for the unnamed-column rejection: nothing is lost, the key is the letter. */
+    public function testWithHeaderFalseReadsABlankHeaderFileLosslessly(): void {
+        $path = $this->makeXlsx(['Data' => [
+            ['Name', null],
+            ['Ann', 'orphan'],
+        ]]);
+
+        self::assertSame(
+            [
+                ['A' => 'Name', 'B' => null],
+                ['A' => 'Ann', 'B' => 'orphan'],
+            ],
+            Spreadsheet::excelToArray($path, false)
+        );
     }
 
     public function testRemoveEmptyRowsDropsWhitespaceOnlyRowsAndReindexesContiguously(): void {
@@ -335,11 +452,15 @@ final class SpreadsheetTest extends TestCase {
         $missing = $this->tempPath();
         $garbage = $this->tempPath('txt');
         file_put_contents($garbage, "\x00\x01\x02\xFF\xFE\x7F\x00\x99\x88"); // binary: no reader claims it
+        $duplicate = $this->makeXlsx(['Data' => [['Name', 'Name'], ['left', 'right']]]);
+        $unnamed = $this->makeXlsx(['Data' => [['Name', null], ['Ann', 'orphan']]]);
 
         $cases = [
             'missing file'       => fn() => Spreadsheet::excelToArray($missing),
             'unidentifiable'     => fn() => Spreadsheet::excelToArray($garbage),
             'unknown sheet name' => fn() => Spreadsheet::excelToArray($book, true, 'Nope'),
+            'duplicate header'   => fn() => Spreadsheet::excelToArray($duplicate),
+            'unnamed column'     => fn() => Spreadsheet::excelToArray($unnamed),
         ];
 
         foreach ($cases as $label => $call) {

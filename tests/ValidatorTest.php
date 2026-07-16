@@ -96,11 +96,18 @@ final class ValidatorTest extends TestCase {
      */
     public static function providerNonOctalThatOctdecWouldSilentlyAccept(): array {
         return [
-            'plus sign'      => ['+7'],
-            'leading space'  => [' 7'],
-            'trailing space' => ['7 '],
-            'negative zero'  => ['-0'],
-            'negative'       => ['-7'],
+            'plus sign'        => ['+7'],
+            'leading space'    => [' 7'],
+            'trailing space'   => ['7 '],
+            'negative zero'    => ['-0'],
+            'negative'         => ['-7'],
+            // File::getPermissionMode() and File::writeFile() gate chmod modes on this method, and
+            // an anchored regex would NOT close this one: PCRE's '$' also matches just before a
+            // trailing newline, so /^0?[0-7]+$/ accepts "0755\n" and octdec() then returns 493.
+            // The character-set test has no such hole; a mode read from a file or a form must not
+            // smuggle one in.
+            'trailing newline' => ["0755\n"],
+            'embedded newline' => ["07\n07"],
         ];
     }
 

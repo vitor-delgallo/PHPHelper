@@ -14,10 +14,17 @@ class Mailer {
      *                       username) is optional — it defaults to 'email'.
      *                       REQUIRED unless $useConfig is one of the recognised provider shortcuts
      *                       (see $useConfig): 'host', 'port' and 'secure'.
-     *                       'secure' is handed straight to PHPMailer's SMTPSecure: 'tls' negotiates
-     *                       STARTTLS and 'ssl' opens an implicit-TLS connection. It may not be left
-     *                       empty (the guard below rejects that), and ANY other non-empty value
-     *                       means NO ENCRYPTION — 'user'/'pass' then travel in cleartext.
+     *                       'secure' must be EXACTLY one of three values (case-insensitive, outer
+     *                       whitespace trimmed): 'tls' negotiates STARTTLS
+     *                       (PHPMailer::ENCRYPTION_STARTTLS), 'ssl' opens an implicit-TLS
+     *                       connection (PHPMailer::ENCRYPTION_SMTPS), and 'none' is the explicit,
+     *                       deliberate opt-out that permits 'user'/'pass' to travel in cleartext.
+     *                       ANYTHING else — a typo ('tsl'), an empty string, a non-string — returns
+     *                       FALSE without sending. Cleartext is NOT reachable by accident: it costs
+     *                       you the exact word 'none'.
+     *                       Note that 'none' means "do not REQUIRE encryption", not "refuse it":
+     *                       PHPMailer's SMTPAutoTLS still upgrades to STARTTLS opportunistically
+     *                       when the server advertises it.
      *                       A missing required key makes this function return FALSE without
      *                       sending, throwing, or logging.
      * @param array $sendTo List of recipients, each ['email' => string (required), 'name' => string
@@ -54,16 +61,25 @@ class Mailer {
      *                    raw HTML body: pass HTML as $body. $body is used instead whenever
      *                    $template is null/empty, names no existing view, or the Laravel View
      *                    facade is not installed at all (this library does not depend on Laravel).
+     *                    A view that EXISTS but fails to render is NOT one of those cases: it
+     *                    returns FALSE rather than quietly mailing $body in the template's place.
      * @param bool $confirm Request read confirmation
-     * @param bool $useEmbeddedImages When TRUE, every <img> in the resolved body whose src is a
-     *                    readable LOCAL file is attached to the message and its tag rewritten to
-     *                    <img src="cid:attach-N">. An <img> whose src is empty, remote (http/https),
-     *                    a data: URI, or an unreadable path is left in the body EXACTLY as the
-     *                    caller wrote it: it is not embedded, and it does not fail the send.
-     *                    SECURITY: an src is treated as a path to read and attach, with NO
-     *                    allow-list, scheme check, or traversal check of any kind. Do NOT enable
-     *                    this on a body built from untrusted input — <img src="/etc/passwd"> in an
-     *                    attacker-controlled body attaches that file to the outgoing mail.
+     * @param bool $useEmbeddedImages When TRUE, every <img> in the resolved body whose src resolves
+     *                    to a readable file INSIDE $embeddedImagesBaseDir is attached to the message
+     *                    and its tag rewritten to <img src="cid:attach-N">. EVERY other <img> — an
+     *                    empty src, any URI scheme (http:, https:, data:, file:, phar:, …), an
+     *                    unreadable or non-existent path, or a path that resolves OUTSIDE the base
+     *                    directory — is left in the body EXACTLY as the caller wrote it: nothing is
+     *                    read, nothing is attached, and the send does not fail.
+     *                    Requires $embeddedImagesBaseDir; see there.
+     * @param string|null $embeddedImagesBaseDir The ONLY directory an embedded <img> src is allowed
+     *                    to resolve to. REQUIRED when $useEmbeddedImages is TRUE: if it is null,
+     *                    blank, or not an existing directory, the send returns FALSE without
+     *                    sending, because "attach whatever the body points at" is not an offer this
+     *                    function makes. Containment is enforced AFTER realpath(), so neither ../
+     *                    nor a symlink can escape the allow-list — a src is only ever read when the
+     *                    file it truly resolves to lies under this directory. Ignored entirely when
+     *                    $useEmbeddedImages is FALSE.
      * @param string $charset Charset (default: UTF-8)
      * @param bool $useAuth Whether to authenticate with $configs['user'] / $configs['pass'].
      *                      Governs the CREDENTIALS ONLY — 'host', 'port' and 'secure' are applied
@@ -76,13 +92,16 @@ class Mailer {
      *                        SMTP conversation is printed to STDOUT (PHPMailer's default), so this
      *                        must stay FALSE outside a console.
      *
-     * @return bool TRUE on success. FALSE on a missing/invalid $configs key, on an empty $sendTo /
-     *              $subject / $body, and on any PHPMailer failure — those are caught and swallowed
-     *              here, so a FALSE carries no reason, no exception and no log line.
-     *              CAUTION: only \PHPMailer\PHPMailer\Exception is caught. Any OTHER Throwable
-     *              raised while the message is built PROPAGATES to the caller — including the
-     *              ErrorException that a strict error handler (Laravel's, for one) makes out of a
-     *              PHP warning. So this function can both return FALSE and throw.
+     * @return bool TRUE on success. FALSE on a missing/invalid $configs key (including a 'secure'
+     *              outside {'tls','ssl','none'}), on $useEmbeddedImages without a usable
+     *              $embeddedImagesBaseDir, on an empty $sendTo / $subject / $body, on a $template
+     *              that fails to render, and on any PHPMailer failure — those are caught and
+     *              swallowed here, so a FALSE carries no reason, no exception and no log line.
+     *              CAUTION: outside the $template render (which is total: any Throwable from Blade
+     *              becomes FALSE), only \PHPMailer\PHPMailer\Exception is caught. Any OTHER
+     *              Throwable raised while the message is built PROPAGATES to the caller — including
+     *              the ErrorException that a strict error handler (Laravel's, for one) makes out of
+     *              a PHP warning. So this function can both return FALSE and throw.
      */
     public static function sendMail(
         array $configs,
@@ -102,6 +121,7 @@ class Mailer {
         ?string $template = null,
         bool $confirm = false,
         bool $useEmbeddedImages = false,
+        ?string $embeddedImagesBaseDir = null,
         string $charset = 'UTF-8',
         bool $useAuth = true,
         bool $isSMTP = true,
@@ -121,12 +141,40 @@ class Mailer {
             $configs['email'] = $configs['user'];
         }
 
+        $isShortcut = !empty($useConfig) && in_array($useConfig, ['no-config', 'gmail', 'office365', 'yahoo', 'hotmail'], true);
+
+        // A shortcut overwrites 'secure' itself further down, so it is the caller-supplied transport
+        // — and ONLY that — whose encryption has to survive this. Validating against the exact
+        // accepted set is the whole point: the old guard rejected an EMPTY 'secure' but waved
+        // through every other string as "no encryption", which made a one-letter typo ('tsl') a
+        // silent downgrade that put 'user'/'pass' on the wire in the clear. Cleartext now costs the
+        // caller the explicit word 'none'.
+        if (!$isShortcut) {
+            $secure = self::normaliseSmtpSecure($configs['secure'] ?? null);
+            if ($secure === null) {
+                return false;
+            }
+            $configs['secure'] = $secure;
+        }
+
+        // Embedding reads files off the local disk and mails them OUT, so it is deny-by-default:
+        // without an allow-listed base directory there is no set of files this may touch, and
+        // "embed anything the body points at" is not on offer. Resolved ONCE here so the per-<img>
+        // containment check compares two already-canonical paths.
+        $imagesBaseDir = null;
+        if ($useEmbeddedImages) {
+            $resolvedBase = ($embeddedImagesBaseDir !== null && trim($embeddedImagesBaseDir) !== '' && !str_contains($embeddedImagesBaseDir, "\0"))
+                ? realpath($embeddedImagesBaseDir)
+                : false;
+            if ($resolvedBase === false || !is_dir($resolvedBase)) {
+                return false;
+            }
+            $imagesBaseDir = $resolvedBase;
+        }
+
         if (
             empty($configs) ||
-            (
-                (empty($useConfig) || !in_array($useConfig, ['no-config', 'gmail', 'office365', 'yahoo', 'hotmail'])) &&
-                (empty($configs['secure']) || empty($configs['host']) || empty($configs['port']))
-            ) ||
+            (!$isShortcut && (empty($configs['host']) || empty($configs['port']))) ||
             (empty($configs['user']) && $useConfig !== 'no-config') ||
             (empty($configs['pass']) && $useConfig !== 'no-config') ||
             empty($configs['email']) ||
@@ -172,25 +220,38 @@ class Mailer {
         // view is a pure enhancement layered on top. Gating the whole resolution on
         // class_exists(View::class) left $template null for every non-Laravel consumer of this
         // library, which sent the recipient an empty message and still returned TRUE.
-        if (
-            !empty($template) &&
-            class_exists(\Illuminate\Support\Facades\View::class) &&
-            \Illuminate\Support\Facades\View::exists($template)
-        ) {
-            $template = \Illuminate\Support\Facades\View::make($template, [
-                'lang'      => $lang,
-                'debugMode' => $debugMode,
-                'sendTo'    => $sendTo,
-                'subject'   => $subject,
-                'body'      => $body,
-            ])->render();
+        if (!empty($template) && class_exists(\Illuminate\Support\Facades\View::class)) {
+            // Resolving a view runs the CALLER'S Blade: a compile error, a missing @include or an
+            // exception thrown inside the template is a failed send, not this function's problem to
+            // rethrow. It sat outside every try, so it escaped a signature that promises bool.
+            // Catching \Throwable (not just PHPMailer's Exception) is what makes that promise true —
+            // a Blade error is an ErrorException/ViewException, which the PHPMailer-only catch below
+            // would sail straight past.
+            // FALSE rather than a silent fall back to $body: the caller asked for a specific
+            // template, and quietly mailing something else in its place is a worse answer than
+            // reporting the failure.
+            try {
+                $rendered = \Illuminate\Support\Facades\View::exists($template)
+                    ? \Illuminate\Support\Facades\View::make($template, [
+                        'lang'      => $lang,
+                        'debugMode' => $debugMode,
+                        'sendTo'    => $sendTo,
+                        'subject'   => $subject,
+                        'body'      => $body,
+                    ])->render()
+                    : null;
+            } catch (\Throwable $e) {
+                return false;
+            }
+
+            $template = $rendered ?? $body;
         } else {
             $template = $body;
         }
 
         $params = compact(
-            'useEmbeddedImages', 'stringFiles', 'useConfig', 'useAuth', 'isSMTP', 'lang', 'confirm', 'wrap',
-            'headers', 'priority', 'charset', 'cc', 'cco', 'reply', 'template', 'files', 'debugMode'
+            'useEmbeddedImages', 'imagesBaseDir', 'stringFiles', 'useConfig', 'useAuth', 'isSMTP', 'lang', 'confirm',
+            'wrap', 'headers', 'priority', 'charset', 'cc', 'cco', 'reply', 'template', 'files', 'debugMode'
         );
 
         $mail = new \PHPMailer\PHPMailer\PHPMailer(true);
@@ -298,22 +359,30 @@ class Mailer {
 
                     $imgTag = $imgsBody[0][$keyPart];
                     $cid    = "attach-" . $keyPart;
-                    $src    = self::getImageSrc($imgTag);
+
+                    // The src decides only WHETHER a file we already vetted gets attached — it is
+                    // never itself handed to the mailer. Passing the raw src to addEmbeddedImage()
+                    // made every <img> an arbitrary-file-read primitive that mails the file OUT:
+                    // <img src="/etc/passwd"> in an attacker-influenced body attached /etc/passwd
+                    // to the outgoing message. Only a path that truly resolves inside the caller's
+                    // allow-listed base directory survives resolveEmbeddableImage().
+                    $path = self::resolveEmbeddableImage(self::getImageSrc($imgTag), $params['imagesBaseDir']);
 
                     $embedded = false;
-                    if($src !== '') {
+                    if($path !== null) {
                         try {
-                            $mail->addEmbeddedImage($src, $cid, $cid);
+                            $mail->addEmbeddedImage($path, $cid, $cid);
                             $embedded = true;
                         } catch (\PHPMailer\PHPMailer\Exception $e) {
-                            // Not a readable local file (remote URL, data: URI, bad path).
                             $embedded = false;
                         }
                     }
 
                     // Point the tag at the attachment we just made, or — when it could not be
-                    // embedded — put the caller's own tag back. Dropping it would silently strip
-                    // the image out of the body; rethrowing would fail an otherwise valid send.
+                    // embedded — put the caller's own tag back untouched, leaving it a plain
+                    // reference the mail client may or may not fetch. Dropping it would silently
+                    // strip the image out of the body; rethrowing would fail an otherwise valid
+                    // send.
                     $mail->Body .= $embedded ? ('<img src="cid:' . $cid . '">') : $imgTag;
                 }
             }
@@ -330,6 +399,100 @@ class Mailer {
         }
 
         return $ret;
+    }
+
+    /**
+     * Normalises $configs['secure'] to the exact value PHPMailer's SMTPSecure accepts.
+     *
+     * The accepted set is CLOSED and matching is case-insensitive with the outer whitespace
+     * trimmed: 'tls' (ENCRYPTION_STARTTLS), 'ssl' (ENCRYPTION_SMTPS), and 'none' — the explicit
+     * cleartext opt-out, which maps to '' (PHPMailer's own "no required encryption" value).
+     * Anything else, including a non-string and the empty string, is NULL: a typo must fail the
+     * send rather than quietly downgrade the connection and leak the credentials.
+     *
+     * @param mixed $secure The raw $configs['secure'], entirely unvalidated
+     * @return string|null The value for SMTPSecure, or NULL when $secure is not an accepted keyword
+     */
+    private static function normaliseSmtpSecure(mixed $secure): ?string {
+        if (!is_string($secure)) {
+            return null;
+        }
+
+        return match (Str::strToLower(trim($secure))) {
+            \PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_STARTTLS => \PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_STARTTLS,
+            \PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_SMTPS    => \PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_SMTPS,
+            'none'                                              => '',
+            default                                             => null,
+        };
+    }
+
+    /**
+     * Resolves an <img> src to a real, readable file INSIDE $baseDir — or NULL when it must not be
+     * attached to an outgoing message.
+     *
+     * This is the allow-list that keeps $useEmbeddedImages from being an arbitrary file read. It
+     * returns NULL — never a path — for a blank src, any URI scheme (http:, https:, data:, file:,
+     * phar:, …), a path that does not resolve to a readable file, and, above all, a file that
+     * resolves OUTSIDE $baseDir. Containment is verified only AFTER realpath() has collapsed every
+     * ../ and followed every symlink, so no amount of traversal in the src can escape: it is the
+     * FINAL location of the file that must satisfy the prefix, not the string the caller wrote.
+     * The comparison is case-insensitive on Windows, matching that filesystem's own semantics.
+     *
+     * @param string $src The raw src exactly as getImageSrc() returned it — assumed hostile
+     * @param string $baseDir An already realpath()'d, existing directory: the ONLY place an src may
+     *                        resolve to. Passing an unresolved path here would defeat the check.
+     * @return string|null The resolved absolute path, safe to attach; or NULL when $src is not
+     *                     embeddable, in which case NOTHING about the file may be read or sent
+     */
+    private static function resolveEmbeddableImage(string $src, string $baseDir): ?string {
+        $src = trim($src);
+        // A NUL byte makes the path functions below throw a ValueError, which would escape past the
+        // PHPMailer-only catch in sendMail().
+        if ($src === '' || str_contains($src, "\0")) {
+            return null;
+        }
+
+        // A URI scheme is not a path, and this is what keeps "data:"/"http:"/"phar:" out of
+        // realpath(). Requiring 2+ characters before the colon is deliberate: it keeps a Windows
+        // drive letter ("C:/img/logo.png") a PATH rather than a bogus "c:" scheme.
+        if (preg_match('#^[a-zA-Z][a-zA-Z0-9+.\-]{1,}:#', $src) === 1) {
+            return null;
+        }
+
+        $candidate = self::isAbsolutePath($src) ? $src : $baseDir . DIRECTORY_SEPARATOR . $src;
+        $real      = realpath($candidate);
+        if ($real === false || !is_file($real) || !is_readable($real)) {
+            return null;
+        }
+
+        // Compare against the base WITH a trailing separator, so a sibling directory whose name
+        // merely starts with the base ("/srv/assets-secret" vs "/srv/assets") cannot pass.
+        $prefix = rtrim($baseDir, '\\/') . DIRECTORY_SEPARATOR;
+        $inside = DIRECTORY_SEPARATOR === '\\'
+            ? strncasecmp($real, $prefix, strlen($prefix)) === 0
+            : strncmp($real, $prefix, strlen($prefix)) === 0;
+
+        return $inside ? $real : null;
+    }
+
+    /**
+     * Tells whether $path is absolute, on either POSIX or Windows.
+     *
+     * TRUE for a leading '/' or '\' (including a UNC '\\server\share') and for a drive-letter root
+     * such as 'C:\x' or 'C:/x'. A bare 'C:x' is NOT absolute — it is drive-relative.
+     *
+     * @param string $path The path to classify
+     * @return bool TRUE when $path is absolute
+     */
+    private static function isAbsolutePath(string $path): bool {
+        if ($path === '') {
+            return false;
+        }
+        if ($path[0] === '/' || $path[0] === '\\') {
+            return true;
+        }
+
+        return preg_match('#^[a-zA-Z]:[\\\\/]#', $path) === 1;
     }
 
     /**
@@ -359,7 +522,9 @@ class Mailer {
      * If $imgTag holds more than one <img>, the FIRST one's src is returned.
      *
      * The src is returned RAW — it is not validated, resolved, or sanitised, and it is not checked
-     * against any scheme or path allow-list. Whatever the HTML said is what you get.
+     * against any scheme or path allow-list. Whatever the HTML said is what you get, so treat the
+     * result as hostile: sendMail()'s $useEmbeddedImages does its own allow-list check before a src
+     * is ever allowed to name a file, and does not trust this value.
      *
      * @param string $imgTag HTML <img> tag to extract the src from
      * @return string The value of the src attribute, or an empty string if not found

@@ -4,6 +4,16 @@ namespace VD\PHPHelper;
 
 class SQL {
     /**
+     * The only shape an identifier derived from DATA may have.
+     *
+     * Deliberately far narrower than what MySQL accepts: identifiers cannot be escaped, so anything
+     * auto-derived is either provably inert or refused. A caller who genuinely has a column outside
+     * this set (a unicode name, a dot-qualified reference) passes $insertFields explicitly, which is
+     * their own SQL text and is not checked against this.
+     */
+    private const AUTO_IDENTIFIER_PATTERN = '/^[A-Za-z0-9_$]+$/';
+
+    /**
      * Escapes a value and renders it as a literal usable inside a MySQL statement.
      *
      * Total function: every accepted input becomes a valid SQL literal, and every input that has
@@ -110,9 +120,19 @@ class SQL {
      * a dataset, and consumes the rows it wrote out of $data so the caller can loop until done.
      *
      * Batching. Rows are appended until the memory grown since entry crosses a third of the free
-     * memory reported by {@see System::getMemoryUsage()}, then the statement is closed. Only the
-     * rows actually consumed are removed from $data, and the surviving rows KEEP THEIR OUTER KEYS,
-     * so the drain loop is:
+     * memory reported by {@see System::getMemoryUsage()}, then the statement is closed. That figure
+     * is PHP's own memory_limit headroom capped by the physical memory the OS still has free — the
+     * budget the script can actually spend, not merely the machine's free RAM. The OS probe behind
+     * it costs milliseconds (it shells out), so it is read ONCE per call; the per-row check uses
+     * memory_get_usage(true), the same number getMemoryUsage() reports as usageBytes.
+     *
+     * When that budget is UNKNOWABLE — memory_limit is "-1" AND the OS probe fails, which
+     * getMemoryUsage() reports as freeBytes 0 — the ceiling is 0 and every batch closes after a
+     * single row. The drain loop still terminates and still emits every row exactly once, but it
+     * costs one statement per row; set a real memory_limit to get real batches.
+     *
+     * Only the rows actually consumed are removed from $data, and the surviving rows KEEP THEIR
+     * OUTER KEYS, so the drain loop is:
      *
      *     while (($sql = SQL::prepareInsertOrUpdateMySQL($rows, 'clients')) !== true) {
      *         if ($sql === false) { throw new \RuntimeException('could not build the statement'); }
@@ -128,9 +148,10 @@ class SQL {
      *    are identifiers and SQL fragments, and no escaping makes an identifier safe. They MUST be
      *    literals from your own code — never user input, never a request key.
      *  - When $insertFields is null the column list is derived from THE KEYS OF THE FIRST ROW of
-     *    $data, and those keys are then interpolated raw as identifiers. If $data is built from
-     *    user input, pass $insertFields explicitly as an allow-list — otherwise a crafted array
-     *    key is SQL injection.
+     *    $data — names that come from the data rather than from your source. Those are NOT trusted:
+     *    each must match /^[A-Za-z0-9_$]+$/ or the call THROWS, and they are rendered backtick-
+     *    quoted. A crafted array key cannot reach the statement. Pass $insertFields explicitly when
+     *    you need a column this pattern refuses (a unicode or dot-qualified name).
      *  - Row VALUES are escaped by the default formatter via {@see self::escapeString()}, with
      *    that method's documented limits. A custom $rowFormatter escapes its own values; nothing
      *    here checks it. Prefer real prepared statements for untrusted values.
@@ -142,7 +163,8 @@ class SQL {
      *        false.
      * @param string|null $insertFields Comma-separated column names for the INSERT clause, e.g.
      *        "id,name". Trusted identifiers, interpolated raw. Null auto-derives them from the
-     *        first row's keys, skipping keys whose value is an array or object.
+     *        first row's keys, skipping keys whose value is an array or object; auto-derived names
+     *        are validated against /^[A-Za-z0-9_$]+$/ and rendered backtick-quoted.
      * @param string|null $updateFields Comma-separated "col=expr" pairs for the ON DUPLICATE KEY
      *        UPDATE clause. Trusted fragment, interpolated raw. Null auto-generates
      *        "col=VALUES(col)" for every insert column.
@@ -163,9 +185,12 @@ class SQL {
      *         every remaining row skipped by the formatter); FALSE on error (empty $table, no
      *         resolvable insert column, or a formatter that returned false).
      *
-     * @throws \InvalidArgumentException From the default formatter, through self::escapeString(),
-     *         when a column of $insertFields holds a value with no safe literal form
-     *         (array/object/resource/NAN/INF). A custom formatter throws whatever it throws.
+     * @throws \InvalidArgumentException When an auto-derived column name (a key of the first row,
+     *         used only when $insertFields is null) is not a valid identifier — see the SECURITY
+     *         note above. $data is left untouched. Also from the default formatter, through
+     *         self::escapeString(), when a column of $insertFields holds a value with no safe
+     *         literal form (array/object/resource/NAN/INF). A custom formatter throws whatever it
+     *         throws.
      */
     public static function prepareInsertOrUpdateMySQL(
         array &$data,
@@ -183,11 +208,13 @@ class SQL {
             return false;
         }
 
+        $autoDerived = $insertFields === null;
+
         // The insert column list must be resolved UNCONDITIONALLY: it is the default formatter's
         // only input, and it is what keeps every value group aligned with the INSERT column list.
         // Deriving it only when a field list was omitted left the fully documented call
         // (both field lists given, default formatter) reading an undefined $global['__insert'].
-        if ($insertFields !== null) {
+        if (!$autoDerived) {
             // Columns come from what the caller actually asked to insert, NOT from the row keys:
             // a row carrying extra keys must not desynchronise the value groups.
             $insertColumns = [];
@@ -215,14 +242,29 @@ class SQL {
                         continue;
                     }
 
-                    $insertColumns[] = (string) $column;
+                    $column = (string) $column;
+
+                    // This name comes from the DATA, not from the caller's source: with $data built
+                    // from user input, the array key is attacker-chosen. It is about to be
+                    // interpolated as an IDENTIFIER, and no escaping makes an identifier safe, so
+                    // the only defence is to refuse anything that is not provably inert.
+                    if (!preg_match(self::AUTO_IDENTIFIER_PATTERN, $column)) {
+                        throw new \InvalidArgumentException(sprintf(
+                            'SQL::prepareInsertOrUpdateMySQL(): cannot auto-derive the column name %s '
+                                . 'from the dataset — an identifier cannot be escaped, so only '
+                                . '[A-Za-z0-9_$] is accepted here. Pass $insertFields explicitly as an '
+                                . 'allow-list if this column is legitimate.',
+                            var_export($column, true)
+                        ));
+                    }
+
+                    $insertColumns[] = $column;
                 }
 
                 break; // only use first row
             }
 
             $insertColumns = array_values(array_unique($insertColumns));
-            $insertFields = implode(',', $insertColumns);
         }
 
         if (empty($insertColumns)) {
@@ -234,8 +276,22 @@ class SQL {
 
         $global['__insert'] = $insertColumns;
 
+        // How each column is RENDERED into SQL. $global['__insert'] keeps the bare names, because
+        // that is what the formatter indexes the row with; quoting belongs to the SQL text only.
+        //  - auto-derived: this method wrote those identifiers, so it quotes them. Validated above
+        //    to contain no backtick, so the quoting cannot be broken out of, and it is what lets an
+        //    ordinary column named after a reserved word ("order", "key") survive at all.
+        //  - explicit: the caller's own SQL text, interpolated raw and untouched, as documented.
+        $renderedColumns = $autoDerived
+            ? array_map(static fn (string $col): string => '`' . $col . '`', $insertColumns)
+            : $insertColumns;
+
+        if ($autoDerived) {
+            $insertFields = implode(',', $renderedColumns);
+        }
+
         if ($updateFields === null) {
-            $updateFields = implode(',', array_map(fn($col) => "$col=VALUES($col)", $insertColumns));
+            $updateFields = implode(',', array_map(fn($col) => "$col=VALUES($col)", $renderedColumns));
         }
 
         // Define default row formatter if not provided
@@ -257,6 +313,10 @@ class SQL {
         $insertPrefix = "INSERT INTO $table ($insertFields) VALUES ";
         $updateClause = "ON DUPLICATE KEY UPDATE $updateFields";
 
+        // Paid ONCE, here. getMemoryUsage() probes the OPERATING SYSTEM for physical memory (two
+        // wmic subprocesses on Windows, a /proc/meminfo read elsewhere) and only freeBytes needs
+        // that probe. The loop below re-reads process usage with memory_get_usage(true), which is
+        // exactly what this method reports as usageBytes — same arithmetic, no subprocess per row.
         $memory = System::getMemoryUsage();
         $maxBytes = $memory['freeBytes'] / 3;
         $initialUsage = $memory['usageBytes'];
@@ -270,7 +330,7 @@ class SQL {
                 continue;
             }
 
-            $currentUsage = System::getMemoryUsage()['usageBytes'] - $initialUsage;
+            $currentUsage = memory_get_usage(true) - $initialUsage;
             $values = $rowFormatter($row, $key, $global);
 
             if ($values === false) {

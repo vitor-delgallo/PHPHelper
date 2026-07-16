@@ -538,7 +538,9 @@ class Security {
 
         // Sets the IV (Initialization Vector) length using the algorithm
         $cipher = "aes-256-gcm";
-        $version = "v2";
+        // Must be the SAME constant encryptFileV2 writes and binds into every block's AAD: a
+        // hardcoded literal here silently stops decrypting new files the moment the constant moves.
+        $version = self::FILE_V2_VERSION;
         $iv_length = openssl_cipher_iv_length($cipher);
         $tag_length = 16;
 
@@ -854,18 +856,20 @@ class Security {
     /**
      * Encrypts a string using AES-256-CTR with authentication (MAC).
      *
-     * It derives two keys from the provided 32-byte key:
+     * It derives two keys from the provided master key:
      * - One for encryption (encKey)
      * - One for message authentication (authKey)
      *
      * The result is the MAC concatenated with the IV and ciphertext, encoded in Base64.
      *
-     * @param mixed $str The plaintext to encrypt
-     * @param string $key A 32-byte encryption key
+     * @param mixed $str The plaintext to encrypt (null/empty encrypt to "")
+     * @param string $key Master key of AT LEAST 32 bytes. Shorter keys are REJECTED, including
+     *                    16..31-byte ones: HKDF cannot add entropy, so a sub-32-byte master would
+     *                    never reach real 256-bit strength.
      * @param string|null $salt Optional salt for key derivation
      *
      * @return string Encrypted string, Base64 encoded
-     * @throws \Exception If the key is invalid or secure random bytes can't be generated
+     * @throws \Exception If the key is shorter than 32 bytes, or secure random bytes can't be generated
      *
      * @link https://stackoverflow.com/questions/9262109/simplest-two-way-encryption-using-php
      */
@@ -883,10 +887,7 @@ class Security {
         }
         $str = (string) $str;
 
-        // Checks if the key is empty or it does not has the min length
-        if (empty($key) || mb_strlen($key, '8bit') < 16) {
-            throw new \Exception("Invalid encryption key. The key must be at least 16 bytes long.");
-        }
+        // The 32-byte floor is enforced once, by deriveKey (see MIN_KEY_BYTES).
         $key = self::deriveKey($key, 32, $salt, 'local');
 
         // Derive encryption and authentication keys using HKDF
@@ -925,12 +926,13 @@ class Security {
      *
      * It verifies the MAC before attempting decryption. If the MAC is invalid, an exception is thrown.
      *
-     * @param string|null $str The encrypted string, Base64 encoded
-     * @param string $key A 32-byte encryption key
+     * @param string|null $str The encrypted string, Base64 encoded ("" for an empty value)
+     * @param string $key Master key of AT LEAST 32 bytes — the same one passed to encryptLocal.
+     *                    Shorter keys are REJECTED (see encryptLocal).
      * @param string|null $salt Optional salt for key derivation
      *
      * @return string|false Decrypted string or false if decryption fails
-     * @throws \Exception If the key is invalid, Base64 is malformed, or MAC verification fails
+     * @throws \Exception If the key is shorter than 32 bytes, Base64 is malformed, or MAC verification fails
      *
      * @link https://stackoverflow.com/questions/9262109/simplest-two-way-encryption-using-php
      */
@@ -943,10 +945,7 @@ class Security {
             return "";
         }
 
-        // Checks if the key is empty or it does not has the min length
-        if (empty($key) || mb_strlen($key, '8bit') < 16) {
-            throw new \Exception("Invalid encryption key. The key must be at least 16 bytes long.");
-        }
+        // The 32-byte floor is enforced once, by deriveKey (see MIN_KEY_BYTES).
         $key = self::deriveKey($key, 32, $salt, 'local');
 
         // Derive encryption and authentication keys using HKDF
@@ -993,7 +992,8 @@ class Security {
      * Encrypts a string, can be used cross-platform.
      *
      * @param mixed $var Value to be encrypted
-     * @param string $key Encryption key 
+     * @param string $key Master key of AT LEAST 32 bytes. Shorter keys are REJECTED (HKDF cannot
+     *                    add entropy).
      * @param string|null $salt Salt for key derivation
      *
      * @return string|null
@@ -1013,10 +1013,7 @@ class Security {
             return $var;
         }
 
-        // Checks if the key is empty or it does not has the min length
-        if (empty($key) || mb_strlen($key, '8bit') < 16) {
-            throw new \Exception("Invalid encryption key. The key must be at least 16 bytes long.");
-        }
+        // The 32-byte floor is enforced once, by deriveKey (see MIN_KEY_BYTES).
         $key = self::deriveKey($key, 32, $salt);
 
         if ($var === true) {
@@ -1032,7 +1029,8 @@ class Security {
      * Decrypts a string, can be used cross-platform.
      *
      * @param mixed $encrypted Text to be decrypted
-     * @param string $key Decryption key
+     * @param string $key Master key of AT LEAST 32 bytes — the same one passed to
+     *                    encryptCrossPlatform. Shorter keys are REJECTED.
      * @param string|null $salt Salt for key derivation
      *
      * @return mixed
@@ -1052,10 +1050,7 @@ class Security {
             return $encrypted;
         }
 
-        // Checks if the key is empty or it does not has the min length
-        if (empty($key) || mb_strlen($key, '8bit') < 16) {
-            throw new \Exception("Invalid encryption key. The key must be at least 16 bytes long.");
-        }
+        // The 32-byte floor is enforced once, by deriveKey (see MIN_KEY_BYTES).
         $key = self::deriveKey($key, 32, $salt);
 
         $ret = \AesBridge\Gcm::decrypt($encrypted, $key);
@@ -1164,73 +1159,277 @@ class Security {
     }
 
     /**
-     * Best-effort, defence-in-depth stripping of common HTML/JS injection vectors from a value or
-     * array.
+     * Elements this sanitizer is willing to EMIT, mapped to the attributes allowed on each
+     * (on top of XSS_GLOBAL_ATTRIBUTES). Anything absent here is never emitted.
      *
-     * NOT AN XSS DEFENCE. DO NOT RELY ON IT AS ONE. This is a BLACKLIST filter (adapted from the
-     * StackOverflow answer referenced below), and blacklists are bypassable by construction. Known
-     * bypasses that pass through this function COMPLETELY UNCHANGED:
+     * Deliberately excluded, and NOT to be added without re-reading xssCleanRecursive's soundness
+     * argument — adding any of these breaks it:
+     *  - Raw-text / escapable-raw-text elements (script, style, textarea, title, xmp, noembed,
+     *    noframes, plaintext): their content is NOT parsed as markup, so escaped text inside them
+     *    does not stay inert when the browser re-parses our output.
+     *  - Foreign content (svg, math): switches the parser into XML-ish rules mid-document, which is
+     *    the engine behind most mutation-XSS (mXSS) vectors.
+     *  - id / name-bearing form controls: DOM clobbering.
      *
-     *     <svg/onload=alert(1)>
-     *     <img/onerror=alert(1) src=x>
+     * @var array<string, string[]>
+     */
+    private const XSS_ALLOWED_ELEMENTS = [
+        'a' => ['href'], 'abbr' => [], 'b' => [], 'blockquote' => ['cite'], 'br' => [],
+        'caption' => [], 'cite' => [], 'code' => [], 'col' => ['span'], 'colgroup' => ['span'],
+        'dd' => [], 'del' => ['cite', 'datetime'], 'div' => [], 'dl' => [], 'dt' => [], 'em' => [],
+        'figcaption' => [], 'figure' => [], 'h1' => [], 'h2' => [], 'h3' => [], 'h4' => [],
+        'h5' => [], 'h6' => [], 'hr' => [], 'i' => [], 'img' => ['src', 'alt', 'width', 'height'],
+        'ins' => ['cite', 'datetime'], 'kbd' => [], 'li' => ['value'], 'mark' => [],
+        'ol' => ['start', 'reversed'], 'p' => [], 'pre' => [], 'q' => ['cite'], 's' => [],
+        'samp' => [], 'small' => [], 'span' => [], 'strong' => [], 'sub' => [], 'sup' => [],
+        'table' => [], 'tbody' => [], 'td' => ['colspan', 'rowspan'], 'tfoot' => [],
+        'th' => ['colspan', 'rowspan', 'scope'], 'thead' => [], 'tr' => [], 'u' => [], 'ul' => [],
+        'var' => [], 'wbr' => [],
+    ];
+
+    /**
+     * Attributes allowed on every allow-listed element.
      *
-     * The on*-attribute rule requires a whitespace or quote character immediately before "on", so
-     * any other valid HTML attribute separator ("/" above) evades it. `<svg onload=...>` with a
-     * SPACE is stripped — which is what makes this dangerous: it looks like it works when you test
-     * it casually.
+     * "style" is deliberately absent: CSS is its own injection context (expression(),
+     * url(javascript:), -moz-binding). "id"/"name" are absent to avoid DOM clobbering.
      *
-     * The only sound defence is CONTEXT-CORRECT OUTPUT ENCODING at the point of rendering
-     * (htmlspecialchars() for HTML text, a JSON encoder for a <script> context, a URL encoder for an
-     * attribute that becomes a URL), plus a Content-Security-Policy. Use this function only as an
-     * extra layer behind those — never as the thing that makes untrusted input safe.
+     * @var string[]
+     */
+    private const XSS_GLOBAL_ATTRIBUTES = ['title', 'lang', 'dir', 'class'];
+
+    /**
+     * Allow-listed elements that are void (self-closing, never given a closing tag).
      *
-     * @param mixed $input The variable to filter
-     * @return mixed The filtered result — NOT a guarantee of safety
+     * @var string[]
+     */
+    private const XSS_VOID_ELEMENTS = ['br', 'hr', 'img', 'col', 'wbr'];
+
+    /**
+     * Allow-listed attributes whose value is a URL and therefore needs scheme validation.
+     *
+     * @var string[]
+     */
+    private const XSS_URL_ATTRIBUTES = ['href', 'src', 'cite'];
+
+    /**
+     * URL schemes permitted in an XSS_URL_ATTRIBUTES value. A scheme-less (relative) URL is also
+     * allowed; anything else — javascript:, vbscript:, data:, blob:, file: — is dropped.
+     *
+     * @var string[]
+     */
+    private const XSS_ALLOWED_URL_SCHEMES = ['http', 'https', 'mailto', 'tel', 'ftp', 'ftps'];
+
+    /**
+     * Elements whose ENTIRE SUBTREE is discarded rather than unwrapped.
+     *
+     * Soundness does not depend on this list (an unwrapped subtree emits only escaped text and
+     * allow-listed elements, which is already inert). It exists so that dropping <script> does not
+     * leave its source code behind as visible page text.
+     *
+     * @var string[]
+     */
+    private const XSS_DROP_SUBTREE_ELEMENTS = [
+        'script', 'style', 'svg', 'math', 'template', 'noscript', 'noembed', 'noframes', 'iframe',
+        'object', 'embed', 'applet', 'frame', 'frameset', 'link', 'meta', 'base', 'title', 'head',
+        'xml', 'form', 'input', 'button', 'select', 'textarea', 'option', 'optgroup', 'canvas',
+        'audio', 'video', 'source', 'track', 'param', 'marquee', 'xmp', 'plaintext', 'listing',
+        'portal', 'keygen', 'menuitem', 'bgsound', 'layer', 'ilayer',
+    ];
+
+    /**
+     * Escapes a string so it is inert in an HTML text or quoted-attribute context.
+     *
+     * @param string $text Raw text
+     * @return string
+     */
+    private static function xssEscape(string $text): string {
+        return htmlspecialchars($text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    }
+
+    /**
+     * Validates a URL attribute value against XSS_ALLOWED_URL_SCHEMES.
+     *
+     * The scheme is matched against a PROBE copy with every control character and every kind of
+     * whitespace removed, because browsers ignore those when resolving a scheme: "jav&#x09;ascript:"
+     * decodes to "jav\tascript:" and still executes. Testing the raw value would miss it.
+     *
+     * @param string $value Decoded attribute value
+     * @return string|null The ORIGINAL value when the scheme is allowed (or the URL is relative);
+     *                     null when the attribute must be dropped.
+     */
+    private static function xssSafeUrl(string $value): ?string {
+        $probe = preg_replace('/[\p{C}\p{Z}\s]+/u', '', $value);
+
+        // preg_replace returns null on a malformed-UTF-8 subject: fail CLOSED.
+        if ($probe === null || $probe === "") {
+            return null;
+        }
+
+        if (preg_match('/^([a-z][a-z0-9+.\-]*):/i', $probe, $matches)) {
+            if (!in_array(strtolower($matches[1]), self::XSS_ALLOWED_URL_SCHEMES, true)) {
+                return null;
+            }
+        } elseif (str_starts_with($probe, ":")) {
+            return null;
+        }
+
+        return $value;
+    }
+
+    /**
+     * Recursively rebuilds one parsed DOM node as sanitized HTML.
+     *
+     * This is the whole allow-list: it can only ever emit (a) text escaped by xssEscape(), or
+     * (b) an element named in XSS_ALLOWED_ELEMENTS carrying only allow-listed, escaped attributes.
+     * Comments, CDATA, processing instructions and doctypes are dropped — a comment is an mXSS
+     * vector and carries no display value here.
+     *
+     * @param \DOMNode $node Node to rebuild
+     * @return string Sanitized HTML
+     */
+    private static function xssSanitizeNode(\DOMNode $node): string {
+        if ($node instanceof \DOMText || $node instanceof \DOMCdataSection) {
+            return self::xssEscape($node->nodeValue ?? "");
+        }
+        if (!($node instanceof \DOMElement)) {
+            // Comment, processing instruction, doctype, ...
+            return "";
+        }
+
+        $tag = strtolower($node->nodeName);
+        if (in_array($tag, self::XSS_DROP_SUBTREE_ELEMENTS, true)) {
+            return "";
+        }
+
+        $children = "";
+        foreach ($node->childNodes as $child) {
+            $children .= self::xssSanitizeNode($child);
+        }
+
+        // Not allow-listed but not dangerous either: drop the tag, keep the sanitized content.
+        if (!array_key_exists($tag, self::XSS_ALLOWED_ELEMENTS)) {
+            return $children;
+        }
+
+        $allowedAttributes = array_merge(self::XSS_GLOBAL_ATTRIBUTES, self::XSS_ALLOWED_ELEMENTS[$tag]);
+
+        $html = "<" . $tag;
+        foreach ($node->attributes as $attribute) {
+            $name = strtolower($attribute->nodeName);
+            if (!in_array($name, $allowedAttributes, true)) {
+                // Every event handler (on*) lands here, whatever separator introduced it.
+                continue;
+            }
+
+            $value = $attribute->nodeValue ?? "";
+            if (in_array($name, self::XSS_URL_ATTRIBUTES, true)) {
+                $value = self::xssSafeUrl($value);
+                if ($value === null) {
+                    continue;
+                }
+            }
+
+            // $name is a literal from the allow-list, so only the value can carry hostile bytes.
+            $html .= " " . $name . '="' . self::xssEscape($value) . '"';
+        }
+
+        if (in_array($tag, self::XSS_VOID_ELEMENTS, true)) {
+            return $html . " />";
+        }
+
+        return $html . ">" . $children . "</" . $tag . ">";
+    }
+
+    /**
+     * Sanitizes one HTML string by parsing it and rebuilding it against the allow-list.
+     *
+     * @param string $data Untrusted HTML
+     * @return string Sanitized HTML, safe for an HTML body context
+     */
+    private static function xssSanitizeHtml(string $data): string {
+        // Fail CLOSED when we cannot parse: escape everything instead. This destroys markup but can
+        // never execute. ext-dom is only a "suggest" of this package, so its absence must be safe.
+        if (!class_exists(\DOMDocument::class) || !mb_check_encoding($data, 'UTF-8')) {
+            return self::xssEscape($data);
+        }
+
+        $document = new \DOMDocument();
+
+        // Hostile input is expected to be malformed; libxml must not emit warnings for it. Restore
+        // the caller's error mode rather than clobbering it.
+        $previousErrorMode = libxml_use_internal_errors(true);
+        $loaded = $document->loadHTML(
+            '<html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"></head>'
+            . '<body>' . $data . '</body></html>',
+            LIBXML_NONET | LIBXML_NOERROR | LIBXML_NOWARNING
+        );
+        libxml_clear_errors();
+        libxml_use_internal_errors($previousErrorMode);
+
+        if (!$loaded) {
+            return self::xssEscape($data);
+        }
+
+        $body = $document->getElementsByTagName('body')->item(0);
+        if ($body === null) {
+            return self::xssEscape($data);
+        }
+
+        $html = "";
+        foreach ($body->childNodes as $child) {
+            $html .= self::xssSanitizeNode($child);
+        }
+
+        return $html;
+    }
+
+    /**
+     * Sanitizes untrusted HTML down to a safe subset, recursively over arrays and objects.
+     *
+     * This is an ALLOW-LIST sanitizer. The string is PARSED (DOMDocument) and then REBUILT from the
+     * parse tree: the output can only contain elements named in XSS_ALLOWED_ELEMENTS, carrying only
+     * allow-listed attributes, with every text and attribute value escaped. Everything else — every
+     * event handler, every unknown attribute, every javascript:/vbscript:/data: URI, <script>,
+     * <svg>, <math>, comments — is dropped. Nothing is pattern-matched, so there is no separator,
+     * entity or casing trick to "evade": a novel bypass shape would have to make the PARSER hand us
+     * an allow-listed element with an allow-listed attribute, which is exactly the safe subset.
+     *
+     * This REPLACES a blacklist that had live bypasses (`<svg/onload=alert(1)>` and
+     * `<img/onerror=alert(1) src=x>` passed through it unchanged, because its on*-attribute rule
+     * required whitespace before "on" and "/" is also a valid attribute separator). Both are now
+     * neutralised, along with the wider bypass battery pinned in SecurityTest.
+     *
+     * Why the output stays inert once the browser re-parses it (the mXSS argument): the allow-list
+     * contains no raw-text element (script/style/textarea/title/xmp/...) and no foreign-content
+     * element (svg/math). Those are the only constructs whose descendants get parsed under
+     * different rules, so our serialized output re-parses to the tree we sanitized. This matters
+     * because DOMDocument uses libxml's HTML4 parser, which does NOT implement the HTML5 parsing
+     * algorithm — refusing to emit those elements is what makes the divergence unexploitable.
+     *
+     * HONEST LIMITS — still true, read them:
+     *  - Output is safe for an HTML BODY (element content) context ONLY. It is NOT pre-escaped for
+     *    an attribute, <script>, <style> or URL context. Interpolating it into any of those is
+     *    still an injection.
+     *  - It does NOT replace context-correct output encoding + a Content-Security-Policy. Use it to
+     *    accept rich text you intend to RENDER as HTML; for input you will render as plain text,
+     *    escape at output instead — that is simpler and strictly safer.
+     *  - It REWRITES rather than preserves: markup is normalized (tags lowercased, attributes
+     *    reordered/quoted, unknown tags unwrapped, `&` escaped). Do not use it on a value you need
+     *    back byte-for-byte, and sanitize on OUTPUT (or store both forms) rather than destroying
+     *    the original on input.
+     *  - If ext-dom is unavailable, or the input is not valid UTF-8, it falls back to escaping the
+     *    whole string (htmlspecialchars, ENT_QUOTES|ENT_SUBSTITUTE): still safe, but it destroys
+     *    legitimate markup.
+     *
+     * @param mixed $input The value to sanitize. Arrays and objects are walked recursively to every
+     *                     scalar leaf (an object's public properties are rewritten IN PLACE, and
+     *                     the same instance is returned). Non-string scalars are returned unchanged.
+     * @return mixed The sanitized value
      */
     public static function xssCleanRecursive(mixed $input): mixed {
         if ($input === null || $input === "" || is_bool($input) || filter_var($input, FILTER_VALIDATE_INT) || filter_var($input, FILTER_VALIDATE_FLOAT)) {
             return $input;
         }
-
-        /**
-         * Internal XSS cleaning function for strings.
-         *
-         * @param string $data The string to clean
-         * @return string
-         *
-         * @ref https://stackoverflow.com/questions/1336776/xss-filtering-function-in-php
-         */
-        $xssClean = function (string $data): string {
-            // Fix &entity\n;
-            $data = str_replace(['&amp;', '&lt;', '&gt;'], ['&amp;amp;', '&amp;lt;', '&amp;gt;'], $data);
-            $data = preg_replace('/(&#*\w+)[\x00-\x20]+;/u', '$1;', $data);
-            $data = preg_replace('/(&#x*[0-9A-F]+);*/iu', '$1;', $data);
-            $data = html_entity_decode($data, ENT_COMPAT, 'UTF-8');
-
-            // Remove attributes starting with "on" or xmlns
-            $data = preg_replace('#(<[^>]+?[\x00-\x20"\'])(?:on|xmlns)[^>]*+>#iu', '$1>', $data);
-
-            // Remove javascript: and vbscript: protocols
-            $data = preg_replace('#([a-z]*)[\x00-\x20]*=[\x00-\x20]*([`\'"]*)[\x00-\x20]*j[\x00-\x20]*a[\x00-\x20]*v[\x00-\x20]*a[\x00-\x20]*s[\x00-\x20]*c[\x00-\x20]*r[\x00-\x20]*i[\x00-\x20]*p[\x00-\x20]*t[\x00-\x20]*:#iu', '$1=$2nojavascript...', $data);
-            $data = preg_replace('#([a-z]*)[\x00-\x20]*=([\'"]*)[\x00-\x20]*v[\x00-\x20]*b[\x00-\x20]*s[\x00-\x20]*c[\x00-\x20]*r[\x00-\x20]*i[\x00-\x20]*p[\x00-\x20]*t[\x00-\x20]*:#iu', '$1=$2novbscript...', $data);
-            $data = preg_replace('#([a-z]*)[\x00-\x20]*=([\'"]*)[\x00-\x20]*-moz-binding[\x00-\x20]*:#u', '$1=$2nomozbinding...', $data);
-
-            // Remove style expressions (IE-specific XSS vectors)
-            $data = preg_replace('#(<[^>]+?)style[\x00-\x20]*=[\x00-\x20]*[`\'"]*.*?expression[\x00-\x20]*\([^>]*+>#i', '$1>', $data);
-            $data = preg_replace('#(<[^>]+?)style[\x00-\x20]*=[\x00-\x20]*[`\'"]*.*?behaviour[\x00-\x20]*\([^>]*+>#i', '$1>', $data);
-            $data = preg_replace('#(<[^>]+?)style[\x00-\x20]*=[\x00-\x20]*[`\'"]*.*?s[\x00-\x20]*c[\x00-\x20]*r[\x00-\x20]*i[\x00-\x20]*p[\x00-\x20]*t[\x00-\x20]*:*[^>]*+>#iu', '$1>', $data);
-
-            // Remove namespaced elements
-            $data = preg_replace('#<\/*\w+:\w[^>]*+>#i', '', $data);
-
-            // Remove undesirable tags
-            do {
-                $oldData = $data;
-                $data = preg_replace('#<\/*(?:applet|b(?:ase|gsound|link)|embed|frame(?:set)?|i(?:frame|layer)|l(?:ayer|ink)|meta|object|s(?:cript|tyle)|title|xml)[^>]*+>#i', '[REMOVED]', $data);
-            } while ($oldData !== $data);
-
-            return $data;
-        };
 
         if (is_array($input)) {
             foreach ($input as $key => $value) {
@@ -1243,7 +1442,7 @@ class Security {
         }
 
         if (is_string($input)) {
-            return $xssClean($input);
+            return self::xssSanitizeHtml($input);
         }
 
         return $input;
@@ -1269,11 +1468,12 @@ class Security {
      *                         $ifNull is returned. Pass null to filter $source itself.
      * @param mixed $ifNull Default value to return if $source is null, or the key is missing/null
      * @param bool $decodeStr Whether to decode the string using a custom decoder
-     * @param bool $xssClean Runs xssCleanRecursive(). Read that method's docblock before enabling
-     *                       this: it is a BEST-EFFORT BLACKLIST with known bypasses (e.g.
-     *                       `<svg/onload=...>` passes through untouched), NOT an XSS defence.
-     *                       Enabling this flag does NOT make untrusted input safe to render —
-     *                       escape at the point of output instead.
+     * @param bool $xssClean Runs xssCleanRecursive(), an ALLOW-LIST sanitizer that reduces the value
+     *                       to a safe HTML subset. Read that method's docblock before enabling this:
+     *                       its output is safe for an HTML BODY context only (not an attribute,
+     *                       <script>, <style> or URL context), and it REWRITES markup rather than
+     *                       preserving it byte-for-byte. Enable it only for rich text you intend to
+     *                       RENDER as HTML; for values you render as plain text, escape at output.
      * @param bool $stripTags Whether to strip HTML tags
      * @param bool $htmlEntities Whether to apply htmlentities()
      * @param bool $addSlashes Whether to apply addslashes()

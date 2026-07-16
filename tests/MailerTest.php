@@ -3,6 +3,8 @@
 namespace VD\PHPHelper\Tests;
 
 use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\PreserveGlobalState;
+use PHPUnit\Framework\Attributes\RunInSeparateProcess;
 use PHPUnit\Framework\TestCase;
 use VD\PHPHelper\Mailer;
 
@@ -160,8 +162,10 @@ SINK;
     /**
      * A complete, valid $configs pointed at the sink.
      *
-     * 'secure' => 'none' is deliberate: the docblock says any non-empty value other than 'tls'/'ssl'
-     * means no encryption, and the sink speaks plaintext.
+     * 'secure' => 'none' is deliberate: the sink speaks plaintext, and 'none' is now the EXPLICIT —
+     * and only — way to ask for that. It used to be just one of infinitely many junk values that
+     * happened to mean "no encryption", which is exactly the hole that made a typo a credential
+     * leak; see testSendMailRefusesATypoInSecureInsteadOfDowngradingToCleartext.
      */
     private function configs(int $port): array
     {
@@ -276,6 +280,122 @@ SINK;
         unset($configs['email']);
         $configs['user'] = 'not-an-address';
 
+        self::assertFalse(Mailer::sendMail(
+            $configs,
+            [['email' => 'to@example.com', 'name' => 'To']],
+            'Subject',
+            '<p>Body</p>'
+        ));
+    }
+
+    // ---------------------------------------------------------------- $configs['secure'] (closed set)
+
+    /**
+     * FINDING (fixed): the guard rejected an EMPTY 'secure' but handed ANY other string straight to
+     * PHPMailer's SMTPSecure, where everything that is not 'tls'/'ssl' silently means NO encryption.
+     * So the only way to say "no encryption" was a junk value — and a one-letter typo ('tsl' for
+     * 'tls') was indistinguishable from one. The send SUCCEEDED and put 'user'/'pass' on the wire in
+     * the clear, which is about as quiet as a credential leak gets.
+     *
+     * The sink is what makes this a real proof: it speaks plaintext and logs every command, so
+     * before the fix this test observes a TRUE return AND the password sitting in the session log.
+     * Now the typo is refused before a socket is ever opened.
+     */
+    public function testSendMailRefusesATypoInSecureInsteadOfDowngradingToCleartext(): void
+    {
+        $port = $this->startSink();
+        $configs = $this->configs($port);
+        $configs['secure'] = 'tsl'; // the typo
+
+        self::assertFalse(
+            Mailer::sendMail($configs, [['email' => 'to@example.com', 'name' => 'To']], 'Subject', '<p>Body</p>'),
+            'a typo in secure must fail the send, not silently downgrade it'
+        );
+
+        $session = $this->sinkCapture()['session'];
+        self::assertStringNotContainsString(base64_encode('secret'), $session, 'the password reached the wire in the clear');
+        self::assertStringNotContainsString(base64_encode('smtp-user'), $session);
+        self::assertStringNotContainsString('MAIL FROM', $session, 'nothing at all should have been sent');
+    }
+
+    /**
+     * The accepted set is CLOSED: 'tls' | 'ssl' | 'none'. Anything else returns FALSE, so cleartext
+     * is never reachable by accident — it costs the caller the exact word 'none'.
+     *
+     * @return array<string, array{0: mixed}>
+     */
+    public static function invalidSecureProvider(): array
+    {
+        return [
+            'typo for tls'      => ['tsl'],
+            'typo for ssl'      => ['sll'],
+            'empty string'      => [''],
+            'blank string'      => ['   '],
+            'spelled out'       => ['starttls'],
+            'protocol version'  => ['tlsv1.2'],
+            'boolean-ish true'  => ['true'],
+            'boolean-ish no'    => ['no'],
+            'junk'              => ['whatever'],
+            'not a string'      => [true],
+            'null'              => [null],
+        ];
+    }
+
+    #[DataProvider('invalidSecureProvider')]
+    public function testSendMailReturnsFalseForASecureOutsideTheAcceptedSet(mixed $secure): void
+    {
+        $configs = $this->configs(1);
+        $configs['secure'] = $secure;
+
+        self::assertFalse(Mailer::sendMail(
+            $configs,
+            [['email' => 'to@example.com', 'name' => 'To']],
+            'Subject',
+            '<p>Body</p>'
+        ));
+    }
+
+    /** 'none' is the explicit cleartext opt-out, matched case-insensitively with the edges trimmed. */
+    public function testSendMailAcceptsTheExplicitCleartextOptOutCaseInsensitively(): void
+    {
+        $port = $this->startSink();
+        $configs = $this->configs($port);
+        $configs['secure'] = '  NoNe  ';
+
+        self::assertTrue(Mailer::sendMail(
+            $configs,
+            [['email' => 'to@example.com', 'name' => 'To']],
+            'Subject',
+            '<p>explicitly cleartext</p>'
+        ));
+
+        self::assertStringContainsString('<p>explicitly cleartext</p>', $this->sinkCapture()['eml']);
+    }
+
+    /**
+     * 'tls'/'ssl' stay accepted by the guard. They cannot reach this plaintext sink — PHPMailer
+     * fails the handshake and sendMail returns FALSE — so what this pins is that they are ACCEPTED
+     * values (unlike 'tsl', which never gets far enough to try) and that a failed handshake is a
+     * clean FALSE rather than an escaping exception.
+     *
+     * @return array<string, array{0: string}>
+     */
+    public static function acceptedEncryptionProvider(): array
+    {
+        return [
+            'starttls' => ['tls'],
+            'smtps'    => ['SSL'], // also pins case-insensitivity
+        ];
+    }
+
+    #[DataProvider('acceptedEncryptionProvider')]
+    public function testSendMailAcceptsTheDocumentedEncryptionKeywords(string $secure): void
+    {
+        $configs = $this->configs(1);
+        $configs['secure'] = $secure;
+
+        // Port 1 refuses instantly: the value passed the guard and died at the connection, which is
+        // a different failure from the guard's flat refusal — and still a bool.
         self::assertFalse(Mailer::sendMail(
             $configs,
             [['email' => 'to@example.com', 'name' => 'To']],
@@ -413,6 +533,85 @@ SINK;
         self::assertStringContainsString('plain text marker', $eml);
     }
 
+    /**
+     * FINDING (fixed): View::make()->render() sat OUTSIDE every try block, so a Blade compile error
+     * — an ErrorException/ViewException, which the PHPMailer-only catch would not have held anyway —
+     * escaped a function whose signature promises bool.
+     *
+     * Laravel is not installed, so the facade is faked. That has to happen in a SEPARATE PROCESS:
+     * defining Illuminate\Support\Facades\View in the shared one would make class_exists() true for
+     * every other test, and testSendMailUsesBodyAsTheMessageBodyWithoutLaravelInstalled explicitly
+     * asserts the opposite.
+     */
+    #[RunInSeparateProcess]
+    #[PreserveGlobalState(false)]
+    public function testSendMailReturnsFalseWhenTheTemplateFailsToRender(): void
+    {
+        self::assertFalse(class_exists(\Illuminate\Support\Facades\View::class), 'the facade must start absent');
+
+        eval('namespace Illuminate\Support\Facades; class View {
+            public static function exists($view) { return true; }
+            public static function make($view, $data = []) { throw new \RuntimeException("Blade compile error"); }
+        }');
+
+        // Port 1 is never reached: rendering fails first. No exception may escape.
+        self::assertFalse(Mailer::sendMail(
+            $this->configs(1),
+            [['email' => 'to@example.com', 'name' => 'To']],
+            'Subject',
+            '<p>Body</p>',
+            null,
+            null,
+            [],
+            [],
+            0,
+            0,
+            [],
+            [],
+            [],
+            [],
+            'emails.broken'
+        ));
+    }
+
+    /** The happy path of that same resolution: a view that renders becomes the body. */
+    #[RunInSeparateProcess]
+    #[PreserveGlobalState(false)]
+    public function testSendMailUsesTheRenderedViewAsTheBodyWhenTheTemplateExists(): void
+    {
+        eval('namespace Illuminate\Support\Facades; class View {
+            public static function exists($view) { return $view === "emails.welcome"; }
+            public static function make($view, $data = []) { return new class($data) {
+                public function __construct(private array $data) {}
+                public function render() { return "<p>RENDERED:" . $this->data["subject"] . "</p>"; }
+            }; }
+        }');
+
+        $port = $this->startSink();
+
+        self::assertTrue(Mailer::sendMail(
+            $this->configs($port),
+            [['email' => 'to@example.com', 'name' => 'To']],
+            'Hello',
+            '<p>raw body that the template replaces</p>',
+            null,
+            null,
+            [],
+            [],
+            0,
+            0,
+            [],
+            [],
+            [],
+            [],
+            'emails.welcome'
+        ));
+
+        $eml = $this->sinkCapture()['eml'];
+        self::assertStringContainsString('<p>RENDERED:Hello</p>', $eml);
+        self::assertStringNotContainsString('raw body that the template replaces', $eml);
+    }
+
     // ---------------------------------------------------------------- $useAuth
 
     /**
@@ -445,6 +644,7 @@ SINK;
             null,
             false,
             false,
+            null,
             'UTF-8',
             false // $useAuth
         ));
@@ -508,7 +708,8 @@ SINK;
             [],
             null,
             false,
-            true // $useEmbeddedImages
+            true,           // $useEmbeddedImages
+            $this->tmpDir   // $embeddedImagesBaseDir — the png lives here
         );
 
         self::assertTrue($ok);
@@ -550,7 +751,8 @@ SINK;
             [],
             null,
             false,
-            true
+            true,
+            $this->tmpDir
         );
 
         self::assertTrue($ok);
@@ -603,7 +805,8 @@ SINK;
             [],
             null,
             false,
-            true
+            true,
+            $this->tmpDir
         );
 
         self::assertTrue($ok, 'an unembeddable image must not fail the send');
@@ -635,11 +838,370 @@ SINK;
             [],
             null,
             false,
-            true
+            true,
+            $this->tmpDir
         );
 
         self::assertTrue($ok);
         self::assertStringContainsString('<p>no images here</p>', $this->sinkCapture()['eml']);
+    }
+
+    // ------------------------------------------------- $useEmbeddedImages: the allow-list
+
+    /**
+     * Builds the exfiltration fixture: an allow-listed base dir holding one legitimate image, and an
+     * off-limits file OUTSIDE it that no <img> may ever reach. It stands in for the /etc/passwd of
+     * the original report — the point is only that it is a readable file the caller never
+     * allow-listed.
+     *
+     * @return array{base: string, png: string, offLimits: string}
+     */
+    private function makeAllowListFixture(): array
+    {
+        $base = $this->tmpDir . DIRECTORY_SEPARATOR . 'allowed';
+        mkdir($base);
+        file_put_contents($base . DIRECTORY_SEPARATOR . 'logo.png', base64_decode(
+            'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
+        ));
+
+        $outOfBounds = $this->tmpDir . DIRECTORY_SEPARATOR . 'off-limits.txt';
+        file_put_contents($outOfBounds, self::OFF_LIMITS_MARKER);
+
+        return [
+            'base'      => $base,
+            'png'       => $base . DIRECTORY_SEPARATOR . 'logo.png',
+            'offLimits' => $outOfBounds,
+        ];
+    }
+
+    /** Contents of the out-of-bounds file. If this ever reaches the wire, the allow-list failed. */
+    private const OFF_LIMITS_MARKER = 'CONTENTS-THAT-MUST-NEVER-BE-MAILED';
+
+    /** Asserts the off-limits file is absent from $eml in every encoding an attachment could use. */
+    private function assertNotExfiltrated(string $eml): void
+    {
+        self::assertStringNotContainsString(
+            self::OFF_LIMITS_MARKER,
+            $eml,
+            'the out-of-bounds file was mailed out verbatim'
+        );
+        self::assertStringNotContainsString(
+            base64_encode(self::OFF_LIMITS_MARKER),
+            $eml,
+            'the out-of-bounds file was mailed out as a base64 attachment'
+        );
+        self::assertStringNotContainsString(
+            chunk_split(base64_encode(self::OFF_LIMITS_MARKER)),
+            $eml
+        );
+    }
+
+    /**
+     * Cleans up the extra directory the allow-list fixture makes, which tearDown()'s flat glob
+     * cannot remove.
+     */
+    protected function tearDownAllowListFixture(): void
+    {
+        $base = $this->tmpDir . DIRECTORY_SEPARATOR . 'allowed';
+        if (is_dir($base)) {
+            foreach ((array) glob($base . DIRECTORY_SEPARATOR . '*') as $file) {
+                @unlink($file);
+            }
+            @rmdir($base);
+        }
+    }
+
+    /**
+     * FINDING (fixed): the src of every <img> was passed straight to addEmbeddedImage() with NO
+     * allow-list, scheme check, or traversal check. That made $useEmbeddedImages an arbitrary file
+     * read on any attacker-influenced body — and worse than an LFI, because the file is mailed OUT.
+     *
+     * ../ is the classic escape, and it must not work even though the traversal is spelled inside
+     * an otherwise legitimate-looking path under the allow-listed directory. Containment is checked
+     * AFTER realpath() collapses the ../, so what is compared is where the file REALLY is.
+     */
+    public function testSendMailRefusesToEmbedAFileReachedByTraversingOutOfTheBaseDir(): void
+    {
+        $port    = $this->startSink();
+        $fixture = $this->makeAllowListFixture();
+
+        // Starts inside the allow-list, climbs out. realpath() resolves it to the off-limits file.
+        $traversal = $fixture['base'] . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . 'off-limits.txt';
+        self::assertFileExists($traversal, 'the traversal must really resolve, or this proves nothing');
+
+        $tag = '<img src="' . $traversal . '">';
+        $ok  = Mailer::sendMail(
+            $this->configs($port),
+            [['email' => 'to@example.com', 'name' => 'To']],
+            'Subject',
+            '<p>x</p>' . $tag,
+            null,
+            null,
+            [],
+            [],
+            0,
+            0,
+            [],
+            [],
+            [],
+            [],
+            null,
+            false,
+            true,
+            $fixture['base']
+        );
+
+        self::assertTrue($ok, 'a rejected image must not fail the send');
+
+        $eml = $this->sinkCapture()['eml'];
+        $this->assertNotExfiltrated($eml);
+        // Rejected means "left exactly as the caller wrote it", not "embedded" and not "dropped".
+        self::assertStringContainsString($tag, $eml);
+        self::assertStringNotContainsString('cid:attach-', $eml);
+
+        $this->tearDownAllowListFixture();
+    }
+
+    /** The plain shape of the same attack: an absolute path that simply is not under the base dir. */
+    public function testSendMailRefusesToEmbedAnAbsolutePathOutsideTheBaseDir(): void
+    {
+        $port    = $this->startSink();
+        $fixture = $this->makeAllowListFixture();
+
+        $tag = '<img src="' . $fixture['offLimits'] . '">';
+        $ok  = Mailer::sendMail(
+            $this->configs($port),
+            [['email' => 'to@example.com', 'name' => 'To']],
+            'Subject',
+            '<p>x</p>' . $tag,
+            null,
+            null,
+            [],
+            [],
+            0,
+            0,
+            [],
+            [],
+            [],
+            [],
+            null,
+            false,
+            true,
+            $fixture['base']
+        );
+
+        self::assertTrue($ok);
+
+        $eml = $this->sinkCapture()['eml'];
+        $this->assertNotExfiltrated($eml);
+        self::assertStringContainsString($tag, $eml);
+        self::assertStringNotContainsString('cid:attach-', $eml);
+
+        $this->tearDownAllowListFixture();
+    }
+
+    /** A file genuinely inside the base dir is still embedded — the allow-list allows, not just denies. */
+    public function testSendMailEmbedsAFileInsideTheBaseDir(): void
+    {
+        $port    = $this->startSink();
+        $fixture = $this->makeAllowListFixture();
+
+        $ok = Mailer::sendMail(
+            $this->configs($port),
+            [['email' => 'to@example.com', 'name' => 'To']],
+            'Subject',
+            '<img src="' . $fixture['png'] . '">',
+            null,
+            null,
+            [],
+            [],
+            0,
+            0,
+            [],
+            [],
+            [],
+            [],
+            null,
+            false,
+            true,
+            $fixture['base']
+        );
+
+        self::assertTrue($ok);
+
+        $eml = $this->sinkCapture()['eml'];
+        self::assertStringContainsString('<img src="cid:attach-0">', $eml);
+        self::assertStringContainsString('Content-ID: <attach-0>', $eml);
+
+        $this->tearDownAllowListFixture();
+    }
+
+    /** ...and a RELATIVE src is resolved against the base dir, not the process CWD. */
+    public function testSendMailResolvesARelativeSrcAgainstTheBaseDir(): void
+    {
+        $port    = $this->startSink();
+        $fixture = $this->makeAllowListFixture();
+
+        $ok = Mailer::sendMail(
+            $this->configs($port),
+            [['email' => 'to@example.com', 'name' => 'To']],
+            'Subject',
+            '<img src="logo.png">',
+            null,
+            null,
+            [],
+            [],
+            0,
+            0,
+            [],
+            [],
+            [],
+            [],
+            null,
+            false,
+            true,
+            $fixture['base']
+        );
+
+        self::assertTrue($ok);
+        self::assertStringContainsString('<img src="cid:attach-0">', $this->sinkCapture()['eml']);
+
+        $this->tearDownAllowListFixture();
+    }
+
+    /** ...and a relative traversal out of the base dir is refused just like an absolute one. */
+    public function testSendMailRefusesARelativeTraversalOutOfTheBaseDir(): void
+    {
+        $port    = $this->startSink();
+        $fixture = $this->makeAllowListFixture();
+
+        $tag = '<img src="../off-limits.txt">';
+        $ok  = Mailer::sendMail(
+            $this->configs($port),
+            [['email' => 'to@example.com', 'name' => 'To']],
+            'Subject',
+            '<p>x</p>' . $tag,
+            null,
+            null,
+            [],
+            [],
+            0,
+            0,
+            [],
+            [],
+            [],
+            [],
+            null,
+            false,
+            true,
+            $fixture['base']
+        );
+
+        self::assertTrue($ok);
+
+        $eml = $this->sinkCapture()['eml'];
+        $this->assertNotExfiltrated($eml);
+        self::assertStringContainsString($tag, $eml);
+
+        $this->tearDownAllowListFixture();
+    }
+
+    /**
+     * Deny-by-default: asking to embed without naming an allow-listed directory is a refusal, not a
+     * best-effort "embed whatever the body points at". A silent no-op would be worse — it would send
+     * a message whose images are all broken and still report success.
+     *
+     * @return array<string, array{0: string|null}>
+     */
+    public static function unusableBaseDirProvider(): array
+    {
+        return [
+            'null'             => [null],
+            'empty string'     => [''],
+            'blank string'     => ['   '],
+            'no such dir'      => ['/no/such/directory/anywhere'],
+        ];
+    }
+
+    #[DataProvider('unusableBaseDirProvider')]
+    public function testSendMailReturnsFalseWhenEmbeddingIsRequestedWithoutAUsableBaseDir(?string $baseDir): void
+    {
+        self::assertFalse(Mailer::sendMail(
+            $this->configs(1),
+            [['email' => 'to@example.com', 'name' => 'To']],
+            'Subject',
+            '<img src="logo.png">',
+            null,
+            null,
+            [],
+            [],
+            0,
+            0,
+            [],
+            [],
+            [],
+            [],
+            null,
+            false,
+            true,
+            $baseDir
+        ));
+    }
+
+    /** A FILE is not a directory: it cannot be an allow-list. */
+    public function testSendMailReturnsFalseWhenTheBaseDirIsAFile(): void
+    {
+        $png = $this->makePng();
+
+        self::assertFalse(Mailer::sendMail(
+            $this->configs(1),
+            [['email' => 'to@example.com', 'name' => 'To']],
+            'Subject',
+            '<img src="dot.png">',
+            null,
+            null,
+            [],
+            [],
+            0,
+            0,
+            [],
+            [],
+            [],
+            [],
+            null,
+            false,
+            true,
+            $png
+        ));
+    }
+
+    /** $embeddedImagesBaseDir is inert when embedding is off — it must not become a new way to fail. */
+    public function testSendMailIgnoresTheBaseDirWhenEmbeddingIsDisabled(): void
+    {
+        $port = $this->startSink();
+
+        self::assertTrue(Mailer::sendMail(
+            $this->configs($port),
+            [['email' => 'to@example.com', 'name' => 'To']],
+            'Subject',
+            '<p>Body</p>',
+            null,
+            null,
+            [],
+            [],
+            0,
+            0,
+            [],
+            [],
+            [],
+            [],
+            null,
+            false,
+            false,                      // $useEmbeddedImages OFF
+            '/no/such/directory/at/all' // ...so this is never looked at
+        ));
+
+        self::assertStringContainsString('<p>Body</p>', $this->sinkCapture()['eml']);
     }
 
     // ---------------------------------------------------------------- recipient / attachment keys
@@ -808,6 +1370,7 @@ SINK;
             null,
             false,
             false,
+            null,
             'UTF-8'
         ));
 

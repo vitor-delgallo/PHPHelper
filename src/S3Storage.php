@@ -19,6 +19,8 @@ use Aws\Exception\AwsException;
  * - Register and query the class default bucket; you may override the bucket
  *   via method parameters.
  * - Query the class default region.
+ * - Point the client at a custom S3-compatible endpoint (MinIO, Ceph, LocalStack …)
+ *   via setEndpoint(), with path-style addressing handled by setUsePathStyleEndpoint().
  * - Bucket creation.
  * - Register and query the last error message.
  *
@@ -32,13 +34,15 @@ use Aws\Exception\AwsException;
  *   from the return value alone, only from the getLastError() text.
  *
  * Configuration is mandatory, and missing configuration is NOT no‑op:
- * - Without setKey() + setSecret(), and without setBucket(), every public method
- *   returns false (or [] / null per its own signature) with a "not configured"
- *   message in getLastError(). An unconfigured deployment therefore HARD-FAILS; it
- *   does not degrade gracefully. Call setNoOperation(true) if graceful degradation
- *   is what you want.
- * - A default bucket registered with setBucket() is required even when you pass
- *   $bucket explicitly to every method call: the client is not built without one.
+ * - Without setKey() + setSecret(), every public method returns false (or [] / null per
+ *   its own signature) with a "not configured" message in getLastError(). An unconfigured
+ *   deployment therefore HARD-FAILS; it does not degrade gracefully. Call
+ *   setNoOperation(true) if graceful degradation is what you want.
+ * - A bucket is required per OPERATION, not per client: each method resolves the explicit
+ *   $bucket you pass, falling back to the default registered with setBucket(). Registering
+ *   a default is therefore optional as long as every call names its own bucket. A call that
+ *   resolves to no bucket at all fails locally with "missing AWS_S3_BUCKET" and never
+ *   reaches AWS.
  */
 class S3Storage
 {
@@ -77,6 +81,28 @@ class S3Storage
      * @var string|null
      */
     private static ?string $region = null;
+
+    /**
+     * Custom S3-compatible endpoint the client should address.
+     *
+     * - Null (the default) means "use the AWS endpoint the SDK derives from the region".
+     * - When set, it is an absolute http(s) URL with a host, validated by setEndpoint().
+     *
+     * @var string|null
+     */
+    private static ?string $endpoint = null;
+
+    /**
+     * Explicit path-style addressing override, or null for the automatic default.
+     *
+     * Tri-state on purpose (see setUsePathStyleEndpoint()):
+     * - null  -> automatic: path-style ON when a custom endpoint is set, OFF otherwise.
+     * - true  -> force path-style (https://host/bucket/key).
+     * - false -> force virtual-host style (https://bucket.host/key).
+     *
+     * @var bool|null
+     */
+    private static ?bool $usePathStyleEndpoint = null;
 
     /**
      * AWS access key used to authenticate requests to S3.
@@ -151,11 +177,117 @@ class S3Storage
         self::$client = null;
         self::$bucket = null;
         self::$region = null;
+        self::$endpoint = null;
+        self::$usePathStyleEndpoint = null;
         self::$key = null;
         self::$secret = null;
         self::$noOperation = false;
         self::$lastError = null;
         self::$debug = false;
+    }
+
+    /**
+     * Defines a custom S3-compatible endpoint (MinIO, Ceph, LocalStack, a private gateway …).
+     *
+     * - Pass null or an empty string to clear it and go back to the AWS endpoint the SDK
+     *   derives from getRegion().
+     * - The value must be an absolute http(s) URL including a host, with no query string or
+     *   fragment. This is validated here BECAUSE THE SDK DOES NOT: handing the AWS SDK a
+     *   malformed endpoint such as "not a url" is accepted silently (it becomes the relative
+     *   "not%20a%20url"), producing a client that signs requests for a nonsense host instead
+     *   of failing. A rejected value leaves the previous endpoint untouched.
+     * - A trailing slash is stripped for stable comparison; the path, if any, is preserved
+     *   (some gateways expose S3 under a prefix).
+     * - Discards any cached S3 client, so the new endpoint takes effect on the next
+     *   operation. The endpoint is baked into the client at construction; without this
+     *   invalidation, a switch would keep addressing the PREVIOUS host — including sending
+     *   this deployment's credentials there.
+     * - Pairs with setUsePathStyleEndpoint(): by default, setting an endpoint switches the
+     *   client to path-style addressing, which MinIO and most S3-compatible servers require.
+     *
+     * SECURITY: an "http://" endpoint transmits the request — including the Authorization
+     * signature — in the clear. That is accepted here on purpose, because a local MinIO on
+     * "http://127.0.0.1:9000" is the ordinary development case, but it is NOT safe across an
+     * untrusted network: use https for any endpoint you do not control end to end.
+     *
+     * @param string|null $endpoint Absolute http(s) endpoint URL, or null/'' to use AWS.
+     *
+     * @return bool True if defined (or cleared) successfully; false on an invalid value
+     *              (use getLastError() for details).
+     */
+    public static function setEndpoint(?string $endpoint): bool
+    {
+        $endpoint = trim($endpoint ?? '');
+        if ($endpoint === '') {
+            self::$endpoint = null;
+            self::$client = null;
+            return true;
+        }
+
+        $parts = parse_url($endpoint);
+        if ($parts === false || empty($parts['host']) || !in_array(strtolower($parts['scheme'] ?? ''), ['http', 'https'], true)) {
+            self::$lastError = "[AWS S3] setEndpoint(): The endpoint '{$endpoint}' must be an absolute http(s) URL including a host (e.g. https://minio.example.com:9000).";
+            return false;
+        }
+
+        if (!empty($parts['query']) || !empty($parts['fragment'])) {
+            self::$lastError = "[AWS S3] setEndpoint(): The endpoint '{$endpoint}' must not carry a query string or fragment.";
+            return false;
+        }
+
+        self::$endpoint = rtrim($endpoint, '/');
+        self::$client = null;
+        return true;
+    }
+
+    /**
+     * Returns the custom endpoint currently configured.
+     *
+     * @return string|null The endpoint, or null when the SDK's region-derived AWS endpoint is used.
+     */
+    public static function getEndpoint(): ?string
+    {
+        return self::$endpoint;
+    }
+
+    /**
+     * Forces path-style addressing on or off, or restores the automatic default.
+     *
+     * This is a SEPARATE toggle rather than something implied by setEndpoint(), because the
+     * two properties are genuinely independent and neither implication holds universally:
+     * MinIO/Ceph/LocalStack need path-style, but other S3-compatible providers (DigitalOcean
+     * Spaces, Wasabi) serve virtual-host style from a custom endpoint and break under
+     * path-style. Implying it from the endpoint alone would leave those unusable with no way
+     * out. The tri-state keeps the convenient default AND the escape hatch:
+     * - null (default): path-style ON when a custom endpoint is set, OFF for real AWS — the
+     *   right answer for the common MinIO case with no extra call, and the right answer for
+     *   AWS, which has deprecated path-style for newer buckets.
+     * - true/false: explicit, wins over the automatic rule in both directions.
+     *
+     * Discards any cached S3 client: addressing style is baked in at construction.
+     *
+     * @param bool|null $usePathStyleEndpoint True/false to force; null to restore the automatic default.
+     *
+     * @return void
+     */
+    public static function setUsePathStyleEndpoint(?bool $usePathStyleEndpoint): void
+    {
+        self::$usePathStyleEndpoint = $usePathStyleEndpoint;
+        self::$client = null;
+    }
+
+    /**
+     * Returns the RESOLVED addressing style that the next client will be built with.
+     *
+     * Resolves the tri-state described in setUsePathStyleEndpoint(): the explicit override
+     * when one was set, otherwise "true when a custom endpoint is configured". It reports the
+     * effective boolean, not whether an override is in place.
+     *
+     * @return bool True if the client uses path-style addressing; false for virtual-host style.
+     */
+    public static function getUsePathStyleEndpoint(): bool
+    {
+        return self::$usePathStyleEndpoint ?? (self::$endpoint !== null);
     }
 
     /**
@@ -322,32 +454,104 @@ class S3Storage
      */
     public static function setBucket(?string $bucket): bool
     {
-        $bucket = strtolower(trim($bucket ?? ''));
-        if (empty($bucket)) {
-            self::$lastError = "[AWS S3] setBucket(): The bucket name '{$bucket}' cannot be empty.";
-            return false;
-        }
+        $bucket = self::normaliseBucketName($bucket);
 
-        $len = strlen($bucket);
-        if ($len < 3 || $len > 63) {
-            self::$lastError = "[AWS S3] setBucket(): The bucket name '{$bucket}' must be between 3 and 63 characters.";
-            return false;
-        }
-
-        // Only a–z, 0–9, dot and hyphen
-        if (!preg_match('/^[a-z0-9.\-]+$/', $bucket)) {
-            self::$lastError = "[AWS S3] setBucket(): The bucket name '{$bucket}' may contain only lowercase letters, numbers, dot (.) and hyphen (-).";
-            return false;
-        }
-
-        // Must not be an IPv4 address (e.g. 192.168.0.1)
-        if (preg_match('/^\d{1,3}(\.\d{1,3}){3}$/', $bucket)) {
-            self::$lastError = "[AWS S3] setBucket(): The bucket name '{$bucket}' must not be in the format of an IP address.";
+        $error = self::validateBucketName($bucket);
+        if ($error !== null) {
+            self::$lastError = "[AWS S3] setBucket(): {$error}";
             return false;
         }
 
         self::$bucket = $bucket;
         return true;
+    }
+
+    /**
+     * Normalises a bucket name to the only form S3 accepts: trimmed and lowercase.
+     *
+     * @param string|null $bucket Raw bucket name.
+     *
+     * @return string Normalised name ('' when nothing usable was given).
+     */
+    private static function normaliseBucketName(?string $bucket): string
+    {
+        return strtolower(trim($bucket ?? ''));
+    }
+
+    /**
+     * Applies the S3 bucket naming rules to an ALREADY normalised name.
+     *
+     * Shared by setBucket() and by the per-call bucket guard (see requireBucket()), so a
+     * bucket passed straight to a method is held to exactly the same rules as a registered
+     * default instead of going unchecked to AWS.
+     *
+     * @param string $bucket Normalised bucket name.
+     *
+     * @return string|null Null when the name is valid; the error detail otherwise.
+     */
+    private static function validateBucketName(string $bucket): ?string
+    {
+        if ($bucket === '') {
+            return "The bucket name '{$bucket}' cannot be empty.";
+        }
+
+        $len = strlen($bucket);
+        if ($len < 3 || $len > 63) {
+            return "The bucket name '{$bucket}' must be between 3 and 63 characters.";
+        }
+
+        // Only a–z, 0–9, dot and hyphen
+        if (!preg_match('/^[a-z0-9.\-]+$/', $bucket)) {
+            return "The bucket name '{$bucket}' may contain only lowercase letters, numbers, dot (.) and hyphen (-).";
+        }
+
+        // Must not be an IPv4 address (e.g. 192.168.0.1)
+        if (preg_match('/^\d{1,3}(\.\d{1,3}){3}$/', $bucket)) {
+            return "The bucket name '{$bucket}' must not be in the format of an IP address.";
+        }
+
+        return null;
+    }
+
+    /**
+     * Resolves and validates the bucket for a SINGLE operation.
+     *
+     * Resolution order: the explicit $bucket passed to the method, falling back to the
+     * default registered with setBucket(). This is where the per-call override the class
+     * advertises actually takes effect — the client itself needs no bucket, so requiring a
+     * registered default before one could be built (the previous behaviour) contradicted the
+     * override for no benefit.
+     *
+     * The resolved name goes through the same rules as setBucket(). That closes a real hole:
+     * a per-call bucket used to be interpolated straight into copy()'s CopySource
+     * ("{$fromBucket}/{$fromKey}"), so a name containing '/' could silently redirect the copy
+     * source to a different bucket and key prefix. Names are now rejected locally instead.
+     *
+     * @param string $method Calling method name, for the getLastError() prefix convention.
+     * @param string $bucket Explicit bucket for this call ('' to use the default).
+     *
+     * @return string|false The resolved, validated bucket name; false when unusable
+     *                      (getLastError() is populated and the caller must not reach AWS).
+     */
+    private static function requireBucket(string $method, string $bucket = ''): string|false
+    {
+        $resolved = self::normaliseBucketName($bucket);
+        if ($resolved === '') {
+            $resolved = self::normaliseBucketName(self::getBucket());
+        }
+
+        if ($resolved === '') {
+            self::$lastError = "[AWS S3] {$method}(): S3 not configured: missing AWS_S3_BUCKET. Pass \$bucket to {$method}() or register a default with setBucket().";
+            return false;
+        }
+
+        $error = self::validateBucketName($resolved);
+        if ($error !== null) {
+            self::$lastError = "[AWS S3] {$method}(): {$error}";
+            return false;
+        }
+
+        return $resolved;
     }
 
     /**
@@ -386,8 +590,11 @@ class S3Storage
      * - If the key/secret are missing, sets lastError and returns null. It does NOT enable
      *   no‑op mode: missing configuration makes callers return false, not logical success.
      *   No‑op is entered ONLY through setNoOperation(true).
-     * - If no default bucket has been registered via setBucket(), sets lastError and returns
-     *   null — this applies even when the caller passes $bucket per method call.
+     * - A bucket is NOT required here: the client is not bound to one. Each method resolves
+     *   and validates its own bucket through requireBucket(), which is what makes the
+     *   documented per-call $bucket override real.
+     * - Addresses the endpoint from setEndpoint() when one is set (AWS's region-derived
+     *   endpoint otherwise), with the addressing style resolved by getUsePathStyleEndpoint().
      * - On initialisation error, sets lastError and returns null.
      *
      * @return S3Client|null S3 client, or null in no‑op mode / when unconfigured / on error.
@@ -416,21 +623,25 @@ class S3Storage
             return null;
         }
 
-        $bucket = self::getBucket();
-        if (empty($bucket)) {
-            self::$lastError = '[AWS S3] getClient(): S3 not configured: missing AWS_S3_BUCKET.';
-            return null;
-        }
-
         try {
-            self::$client = new S3Client([
+            $config = [
                 'version' => 'latest',
                 'region'  => self::getRegion(),
                 'credentials' => [
                     'key'    => $key,
                     'secret' => $secret,
                 ],
-            ]);
+                // Always explicit: the SDK's own default is virtual-host style, and stating
+                // the resolved value keeps the built client's addressing inspectable.
+                'use_path_style_endpoint' => self::getUsePathStyleEndpoint(),
+            ];
+
+            $endpoint = self::getEndpoint();
+            if ($endpoint !== null) {
+                $config['endpoint'] = $endpoint;
+            }
+
+            self::$client = new S3Client($config);
         } catch (\Throwable $e) {
             self::$lastError = '[AWS S3] getClient(): Failed to initialise S3Client: ' . $e->getMessage();
             return null;
@@ -526,11 +737,15 @@ class S3Storage
     private static function getHead(string $key, string $bucket = ''): array
     {
         $client = self::getClient();
-        $bucket = !empty($bucket) ? $bucket : self::getBucket();
         if (self::isNoOperation()) {
             return [];
         } elseif ($client === null) {
             throw new \Exception('Unable to obtain client to perform connection!');
+        }
+
+        $bucket = self::requireBucket('getHead', $bucket);
+        if ($bucket === false) {
+            throw new \Exception('Unable to resolve a bucket to perform connection!');
         }
 
         $h = $client->headObject([
@@ -553,8 +768,8 @@ class S3Storage
      *   returns false here (see the class-level Return conventions).
      * - If the bucket already exists, returns true.
      * - If it is created successfully, returns true.
-     * - On a failure (AWS/IO, or missing key/secret/default bucket), returns false and
-     *   populates getLastError().
+     * - On a failure (AWS/IO, or missing key/secret, or no bucket resolvable from $bucket
+     *   and the default), returns false and populates getLastError().
      *
      * Notes:
      * - The bucket name must be globally unique across AWS.
@@ -567,10 +782,14 @@ class S3Storage
     public static function createBucket(string $bucket = ''): bool
     {
         $client = self::getClient();
-        $bucket = !empty($bucket) ? $bucket : self::getBucket();
         if (self::isNoOperation()) {
             return true;
         } elseif ($client === null) {
+            return false;
+        }
+
+        $bucket = self::requireBucket('createBucket', $bucket);
+        if ($bucket === false) {
             return false;
         }
 
@@ -644,10 +863,14 @@ class S3Storage
         string $bucket = ''
     ): string|bool {
         $client = self::getClient();
-        $bucket = !empty($bucket) ? $bucket : self::getBucket();
         if (self::isNoOperation()) {
             return true;
         } elseif ($client === null) {
+            return false;
+        }
+
+        $bucket = self::requireBucket('upload', $bucket);
+        if ($bucket === false) {
             return false;
         }
 
@@ -731,16 +954,19 @@ class S3Storage
         string $toBucket = ''
     ): bool {
         $client = self::getClient();
-        $fromBucket = !empty($fromBucket) ? $fromBucket : self::getBucket();
-        $toBucket   = !empty($toBucket) ? $toBucket   : self::getBucket();
         if (self::isNoOperation()) {
             return true;
         } elseif ($client === null) {
             return false;
         }
 
-        if (empty($fromBucket) || empty($toBucket)) {
-            self::$lastError = '[AWS S3] copy(): fromKey/toKey cannot be empty.';
+        $fromBucket = self::requireBucket('copy', $fromBucket);
+        if ($fromBucket === false) {
+            return false;
+        }
+
+        $toBucket = self::requireBucket('copy', $toBucket);
+        if ($toBucket === false) {
             return false;
         }
 
@@ -833,12 +1059,18 @@ class S3Storage
     public static function delete(string $key, bool $recursive = false, string $bucket = ''): bool
     {
         $client = self::getClient();
-        $bucket = !empty($bucket) ? $bucket : self::getBucket();
         if (self::isNoOperation()) {
             return true;
         } elseif ($client === null) {
             return false;
-        } elseif (empty($key)) {
+        }
+
+        $bucket = self::requireBucket('delete', $bucket);
+        if ($bucket === false) {
+            return false;
+        }
+
+        if (empty($key)) {
             self::$lastError = "[AWS S3] delete(): Error deleting object(s): The key in bucket '{$bucket}' cannot be empty!";
             return false;
         }
@@ -998,7 +1230,6 @@ class S3Storage
     public static function download(string $key, string $mode = 'TEXT', string $bucket = ''): mixed
     {
         $client = self::getClient();
-        $bucket = !empty($bucket) ? $bucket : self::getBucket();
 
         $realMode = explode(':', strtoupper(trim($mode ?? '')), 2)[0];
         switch ($realMode) {
@@ -1039,6 +1270,11 @@ class S3Storage
             // no‑op: simulate success on file/output operations; empty string when returning in memory
             return ($realMode === 'SAVE' || $realMode === 'DOWNLOAD_TEXT' || $realMode === 'DOWNLOAD_STREAM') ? true : '';
         } elseif ($client === null) {
+            return false;
+        }
+
+        $bucket = self::requireBucket('download', $bucket);
+        if ($bucket === false) {
             return false;
         }
 
@@ -1176,10 +1412,14 @@ class S3Storage
     public static function list(string $prefix = '', bool $withMeta = false, string $bucket = ''): array|false
     {
         $client = self::getClient();
-        $bucket = !empty($bucket) ? $bucket : self::getBucket();
         if (self::isNoOperation()) {
             return [];
         } elseif ($client === null) {
+            return false;
+        }
+
+        $bucket = self::requireBucket('list', $bucket);
+        if ($bucket === false) {
             return false;
         }
 
@@ -1233,10 +1473,14 @@ class S3Storage
     public static function find(string $key, string $bucket = ''): array|null|false
     {
         $client = self::getClient();
-        $bucket = !empty($bucket) ? $bucket : self::getBucket();
         if (self::isNoOperation()) {
             return null;
         } elseif ($client === null) {
+            return false;
+        }
+
+        $bucket = self::requireBucket('find', $bucket);
+        if ($bucket === false) {
             return false;
         }
 

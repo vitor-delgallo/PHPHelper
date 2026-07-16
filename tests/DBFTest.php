@@ -359,6 +359,37 @@ final class DBFTest extends TestCase {
         $this->assertSame([], $all['records'], 'no field table means no parseable records');
     }
 
+    /**
+     * The read-amplification DoS, second shape.
+     *
+     * testReadBasicStopsOnGarbageHeaderWithoutFieldTable covers the case where no field table parses
+     * at all, so the record loop is skipped outright by the `$unpackString !== ''` guard and never
+     * runs. This pins the OTHER shape: a VALID field table with a RecordCount forged to the value
+     * from the original report (0x01010101 = 16,843,009) behind a file holding one real record. Here
+     * the loop does run, and only the `break` on a short read bounds it to the bytes on disk.
+     *
+     * The existing forged-count test uses 5000, which is small enough to pass even if that `break`
+     * were weakened to a `continue` — this one would hammer an exhausted handle 16.8M times instead.
+     * The time bound is deliberately ~1600x the observed runtime (0.003s), so it cannot flake, but
+     * a reintroduced amplification fails it loudly instead of hanging the suite.
+     */
+    public function testReadBasicDoesNotAmplifyReadsForForgedRecordCountBehindValidFieldTable(): void {
+        $path = $this->makeDbf(
+            [['NAME', 'C', 10, 0]],
+            [['Alice']],
+            ['recordCount' => 0x01010101]
+        );
+
+        $started = microtime(true);
+        $all = DBF::DBFReadBasic($path, 'all');
+        $elapsed = microtime(true) - $started;
+
+        $this->assertSame(16843009, $all['header']['RecordCount'], 'the header is reported as it is on disk');
+        $this->assertCount(1, $all['records'], 'only the record actually backed by bytes is returned');
+        $this->assertSame(['NAME' => 'Alice'], $all['records'][0]);
+        $this->assertLessThan(5.0, $elapsed, 'the record loop must be bounded by the file, not by RecordCount');
+    }
+
     /** A RecordCount larger than the file can back returns the records that really exist. */
     public function testReadBasicReturnsOnlyTheRecordsTheFileActuallyHolds(): void {
         $path = $this->makeDbf(

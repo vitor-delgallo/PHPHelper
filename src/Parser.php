@@ -452,34 +452,19 @@ class Parser {
      * @return bool
      */
     public static function getBool(mixed $value): bool {
-        // These four guards must run BEFORE Validator::isCompletelyEmpty(). That helper is built on
-        // emptyExceptZero() (which deliberately keeps zero as non-empty) and its zero-catching branch
-        // is dead code: `filter_var($value, FILTER_VALIDATE_INT) && ...` short-circuits because
-        // filter_var returns int(0), which is itself falsy. Delegating blindly therefore reports
-        // false/0/'0' as TRUE while reporting the STRING 'false' as FALSE — an inversion that fails
-        // OPEN on a permission or visibility flag. It also casts the value to string internally,
-        // which warns on an array and throws on an object.
-        if (is_bool($value)) {
-            return $value;
-        }
-        if (is_int($value) || is_float($value)) {
-            return $value != 0;
-        }
-        if (is_array($value)) {
-            return $value !== [];
-        }
+        // Judge a Stringable by its STRING value rather than letting it reach isCompletelyEmpty()
+        // as an object. That helper defers to emptyExceptZero(), which calls any property-less
+        // object empty — so a wrapper around 'yes' would read as FALSE. This guard is load-bearing
+        // and is NOT redundant with isCompletelyEmpty().
+        //
+        // Every other type is delegated. The bool/int/float/array/object/numeric-string guards that
+        // used to sit here existed only because isCompletelyEmpty()'s zero-catching branch was dead
+        // code (`filter_var(...) && ...` short-circuited on the falsy int(0) it was looking for), so
+        // delegating reported 0/'0' as TRUE. That branch now tests `!== false` and detects zero, and
+        // isCompletelyEmpty() guards arrays, resources and non-Stringable objects before any string
+        // cast, so the duplication is gone.
         if ($value instanceof \Stringable) {
-            // Judge by the string value, not by the property count: emptyExceptZero() would call a
-            // property-less Stringable EMPTY, so a wrapper around 'yes' would read as false.
             $value = (string) $value;
-        }
-        if (is_object($value)) {
-            // Matches emptyExceptZero()'s own `empty((array) $value)` rule. No non-Stringable object
-            // may reach isCompletelyEmpty(), which would throw casting it to string.
-            return (array) $value !== [];
-        }
-        if (is_string($value) && is_numeric($value)) {
-            return (float) $value != 0.0;
         }
 
         return !Validator::isCompletelyEmpty($value);

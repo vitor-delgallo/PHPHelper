@@ -207,6 +207,58 @@ final class FileTest extends TestCase {
         $this->assertSame(File::getDefaultMode(), File::getPermissionMode(''));
     }
 
+    /**
+     * LIVE SECURITY CONTROL. getPermissionMode('+7') must never resolve to 0007 — owner nothing,
+     * world rwx. It did exactly that while the octal check round-tripped through octdec(), which
+     * silently DROPS the '+' and reads the rest as 7. A malformed mode must land on the safe
+     * default instead.
+     *
+     * Now that File delegates to Validator::isOctal(), this pins the collapsed route too: a
+     * regression in Validator::isOctal() surfaces here as a real permission bug.
+     */
+    public function testGetPermissionModeNeverResolvesASignedModeToWorldRwx(): void {
+        foreach (['+7', ' 7', '7 ', '-0', '-7'] as $mode) {
+            $resolved = File::getPermissionMode($mode);
+
+            $this->assertSame(
+                File::getDefaultMode(),
+                $resolved,
+                "A malformed mode '{$mode}' must fall back to the default, not be parsed."
+            );
+            $this->assertNotSame(0o007, $resolved, "'{$mode}' must never become world-rwx/owner-nothing.");
+        }
+    }
+
+    /**
+     * The old private File::isOctalMode() used preg_match('/^0?[0-7]+$/'), whose '$' also matches
+     * just BEFORE a trailing newline — so "0755\n" passed the check and octdec() then happily
+     * returned 493. Validator::isOctal() tests the character set with strspn() and has no such
+     * hole, so the collapse tightened this. A mode with a trailing newline is malformed and must
+     * fall back to the default rather than being honoured.
+     */
+    public function testGetPermissionModeRejectsAModeWithATrailingNewline(): void {
+        // Both modes must DIFFER from the 0755 default, or the assertion could pass while the
+        // newline-suffixed mode was being parsed and honoured.
+        $this->assertSame(File::getDefaultMode(), File::getPermissionMode("700\n"));
+        $this->assertSame(File::getDefaultMode(), File::getPermissionMode("0777\n"));
+    }
+
+    public function testSetDefaultModeIgnoresAModeWithATrailingNewline(): void {
+        File::setDefaultMode('700');
+        File::setDefaultMode("0777\n");
+
+        $this->assertSame(octdec('700'), File::getDefaultMode(), 'A newline-suffixed mode must not become the default.');
+    }
+
+    /**
+     * writeFile() rejects a malformed mode rather than silently widening to the default. That
+     * guard now runs through Validator::isOctal(), so the newline hole is closed there too.
+     */
+    public function testWriteFileRejectsAPermissionModeWithATrailingNewline(): void {
+        $this->expectException(\InvalidArgumentException::class);
+        File::writeFile($this->path('nl.txt'), 'x', false, "0600\n");
+    }
+
     // ---------------------------------------------------------------------
     // createDir
     // ---------------------------------------------------------------------
@@ -799,6 +851,75 @@ final class FileTest extends TestCase {
         $this->assertFalse(File::zipDirectory($this->path('nope'), $this->path('o.zip')));
     }
 
+    /**
+     * REGRESSION: getZipName() exploded the FULL PATH on '.' and dropped everything after the last
+     * dot, so a dot in a DIRECTORY name rewrote the destination whenever the leaf carried no
+     * extension of its own: "<tmp>/v1.2/backup" became "<tmp>/v1.zip" — a DIFFERENT directory.
+     * zipDirectory() then returned TRUE, so the caller believed the archive was where it asked for.
+     *
+     * The output leaf is seeded as an existing file so getPathInfo() reports it as the file part
+     * (an extension-less name is otherwise treated as a directory, which never reaches getZipName).
+     */
+    public function testZipDirectoryHonoursAnOutputPathWhoseDirectoryContainsADot(): void {
+        $src = $this->path('src');
+        $this->seedFile('src' . DIRECTORY_SEPARATOR . 'a.txt', 'A');
+
+        $this->seedFile('v1.2' . DIRECTORY_SEPARATOR . 'backup', 'placeholder');
+        $out = $this->path('v1.2', 'backup');
+
+        $this->assertTrue(File::zipDirectory($src, $out, null, true));
+
+        $this->assertFileExists(
+            $this->path('v1.2', 'backup.zip'),
+            'The archive must be written inside the dotted directory the caller named.'
+        );
+        $this->assertFileDoesNotExist(
+            $this->path('v1.zip'),
+            'The dotted DIRECTORY name must not be truncated into a different destination.'
+        );
+        $this->assertSame(['a.txt'], $this->zipEntries($this->path('v1.2', 'backup.zip')));
+    }
+
+    /**
+     * REGRESSION: with no dot ANYWHERE in the path, the explode() loop produced an empty base and
+     * getZipName() returned a bare ".zip" — a RELATIVE path, so the archive was written as a hidden
+     * file into the process's current working directory, far from the requested location, and
+     * zipDirectory() still returned TRUE.
+     */
+    public function testZipDirectoryHonoursAnExtensionlessOutputPathWithNoDotAtAll(): void {
+        $src = $this->path('src');
+        $this->seedFile('src' . DIRECTORY_SEPARATOR . 'a.txt', 'A');
+
+        $this->seedFile('plainout', 'placeholder');
+        $out = $this->path('plainout');
+
+        $strayInCwd = getcwd() . DIRECTORY_SEPARATOR . '.zip';
+        $this->assertFileDoesNotExist($strayInCwd, 'Precondition: no stray .zip in the working directory.');
+
+        $this->assertTrue(File::zipDirectory($src, $out, null, true));
+
+        $this->assertFileExists(
+            $this->path('plainout.zip'),
+            'An extension-less output must simply gain ".zip" beside itself.'
+        );
+        $this->assertFileDoesNotExist($strayInCwd, 'The archive must never collapse into a bare ".zip" in the CWD.');
+        $this->assertSame(['a.txt'], $this->zipEntries($this->path('plainout.zip')));
+    }
+
+    /**
+     * The documented "backup.tar.gz -> backup.tar.zip" rule must survive the rewrite: only the
+     * LAST extension of the leaf is replaced.
+     */
+    public function testZipDirectoryReplacesOnlyTheLastExtensionOfTheOutputName(): void {
+        $src = $this->path('src');
+        $this->seedFile('src' . DIRECTORY_SEPARATOR . 'a.txt', 'A');
+        $out = $this->path('backup.tar.gz');
+
+        $this->assertTrue(File::zipDirectory($src, $out, null, true));
+
+        $this->assertFileExists($this->path('backup.tar.zip'));
+    }
+
     public function testZipDirectoryReturnsFalseWhenTheSourceIsAFile(): void {
         $file = $this->seedFile('plain.txt');
         $this->assertFalse(File::zipDirectory($file, $this->path('o.zip')));
@@ -968,7 +1089,9 @@ final class FileTest extends TestCase {
         $this->assertStringNotContainsString(' ', $name);
         $this->assertStringNotContainsString('!', $name);
         $this->assertMatchesRegularExpression('/^[A-Za-z0-9\-_.]+$/', $name);
-        $this->assertStringEndsWith('.phpx', $name);
+        // The extension goes through the SAME sanitizer as the base name, so its space becomes '_'
+        // just like anywhere else. It was '.phpx' while the space->'_' step was dead code.
+        $this->assertStringEndsWith('.p_hpx', $name);
     }
 
     public function testRenameUploadFileStripsSeparatorsFromAnExtensionSuppliedOutsideOfFiles(): void {
@@ -1032,15 +1155,32 @@ final class FileTest extends TestCase {
     }
 
     /**
-     * The sanitizer folds accents to ASCII and STRIPS every other character, spaces included —
-     * its str_replace(' ', '_') is dead code, because the following [^A-Za-z0-9\-] filter removes
-     * the underscore it just inserted. Pinned as-is: the docblock documents this literally.
+     * The sanitizer folds accents to ASCII and turns each space into '_'.
+     *
+     * REGRESSION: the str_replace(' ', '_') was dead code — the following [^A-Za-z0-9\-] filter
+     * stripped the underscore it had just inserted, so 'relatório final.csv' welded into
+     * 'relatoriofinal_<ts>.csv'. '_' is now in the allowlist, so the replacement survives. '_' is
+     * not a path or shell metacharacter, so the sanitizer stays just as strict.
      */
-    public function testRenameUploadFileFoldsAccentsAndStripsSpaces(): void {
+    public function testRenameUploadFileFoldsAccentsAndTurnsSpacesIntoUnderscores(): void {
         $name = File::renameUploadFile('relatório final.csv');
 
         $this->assertStringEndsWith('.csv', $name);
-        $this->assertMatchesRegularExpression('/^relatoriofinal_\d{14}\d{1,3}\.csv$/', $name);
+        $this->assertMatchesRegularExpression('/^relatorio_final_\d{14}\d{1,3}\.csv$/', $name);
+    }
+
+    /**
+     * The '_' allowlist entry must not let anything else through: the result is still confined to
+     * [A-Za-z0-9_-] plus the single dot before the extension. A '_' already present in the original
+     * name is preserved rather than stripped.
+     */
+    public function testRenameUploadFileKeepsUnderscoresWithoutWideningTheCharset(): void {
+        $name = File::renameUploadFile('my_file name!@#$.csv');
+
+        $this->assertMatchesRegularExpression('/^my_file_name_\d{14}\d{1,3}\.csv$/', $name);
+        $this->assertStringNotContainsString('/', $name);
+        $this->assertStringNotContainsString('\\', $name);
+        $this->assertStringNotContainsString('!', $name);
     }
 
     public function testRenameUploadFileFallsBackTo125ForANonPositiveMaxLength(): void {
@@ -1183,10 +1323,42 @@ final class FileTest extends TestCase {
         $this->assertTrue(true, 'downloadFile() returned instead of terminating the process.');
     }
 
-    public function testDownloadFileWithAnUnresolvableFileReturnsQuietlyWhenNotTerminating(): void {
+    /**
+     * REGRESSION: a missing file used to exit(0) when $terminateAfterDownload was true (the
+     * DEFAULT), handing the client an empty HTTP 200 that looks exactly like a successful
+     * download, while the docblock advertised '@throws \Exception If the file cannot be opened'.
+     * The caller's try/catch never fired. It must now fail loudly.
+     *
+     * The default $terminateAfterDownload=true is used deliberately: under the old code this test
+     * would exit(0) and kill the PHPUnit runner rather than fail.
+     */
+    public function testDownloadFileThrowsForAMissingFileInsteadOfExitingWithAnEmptySuccess(): void {
         $this->expectOutputString('');
-        File::downloadFile($this->path('missing.bin'), 'x.bin', false, false);
+        $this->expectException(\Exception::class);
+        $this->expectExceptionMessage('does not exist or is not readable');
 
-        $this->assertFileDoesNotExist($this->path('missing.bin'));
+        File::downloadFile($this->path('missing.bin'), 'x.bin');
+    }
+
+    public function testDownloadFileThrowsForAnUnresolvableFileEvenWhenNotTerminating(): void {
+        $this->expectOutputString('');
+        $this->expectException(\Exception::class);
+
+        File::downloadFile($this->path('missing.bin'), 'x.bin', false, false);
+    }
+
+    /**
+     * A missing file must fail BEFORE any header is sent, so the caller can still turn the
+     * exception into a real error response instead of a half-written 200.
+     */
+    public function testDownloadFileDoesNotEmitOutputWhenTheFileIsMissing(): void {
+        $this->expectOutputString('');
+
+        try {
+            File::downloadFile($this->path('missing.bin'), 'x.bin', false, false);
+            $this->fail('downloadFile() must throw for a missing file.');
+        } catch (\Exception $e) {
+            $this->assertStringContainsString('does not exist or is not readable', $e->getMessage());
+        }
     }
 }
