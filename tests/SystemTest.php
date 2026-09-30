@@ -10,8 +10,8 @@ use VD\PHPHelper\System;
 final class SystemTest extends TestCase {
     private ?string $originalMemoryLimit = null;
 
-    /** @var list<string> Absolute paths of temp files to remove in tearDown. */
-    private array $tempFiles = [];
+    /** @var string|null This test's private scratch directory, created on demand. */
+    private ?string $tmp = null;
 
     protected function setUp(): void {
         $this->originalMemoryLimit = (string) ini_get('memory_limit');
@@ -27,12 +27,26 @@ final class SystemTest extends TestCase {
 
         System::timer(null, 'clear');
 
-        foreach ($this->tempFiles as $file) {
-            if (is_file($file)) {
-                @unlink($file);
+        // makeSeed() tests seed the process-wide generator; give later tests a random one back.
+        mt_srand();
+
+        if ($this->tmp !== null) {
+            foreach (scandir($this->tmp) ?: [] as $entry) {
+                if ($entry !== '.' && $entry !== '..') {
+                    @unlink($this->tmp . DIRECTORY_SEPARATOR . $entry);
+                }
             }
+            @rmdir($this->tmp);
+            $this->tmp = null;
         }
-        $this->tempFiles = [];
+    }
+
+    private function scratchDir(): string {
+        if ($this->tmp === null) {
+            $this->tmp = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'phphelper_systemtest_' . bin2hex(random_bytes(8));
+            mkdir($this->tmp, 0777, true);
+        }
+        return $this->tmp;
     }
 
     // ---------------------------------------------------------------------
@@ -246,13 +260,17 @@ final class SystemTest extends TestCase {
     // getServerMemoryUsage()
     // ---------------------------------------------------------------------
 
+    /**
+     * Live smoke test of the real OS probe. The null branch used to be `assertNull($result)` right
+     * after `if ($result === null)` — a tautology that "passed" on every host without wmic or
+     * /proc/meminfo, i.e. it tested nothing there. The parsing and assembly steps are covered
+     * deterministically in SystemHardeningTest; here a null host is reported as a skip.
+     */
     public function testGetServerMemoryUsageReturnsNullOrAFullyConsistentArray(): void {
         $result = System::getServerMemoryUsage();
 
         if ($result === null) {
-            // Documented and routine: no wmic (Windows 11 24H2+), unreadable /proc/meminfo, etc.
-            $this->assertNull($result);
-            return;
+            $this->markTestSkipped('The OS did not expose physical memory numbers on this host (documented as routine).');
         }
 
         $this->assertSame(
@@ -268,6 +286,7 @@ final class SystemTest extends TestCase {
         $this->assertIsFloat($result['freePercent']);
 
         $this->assertGreaterThan(0, $result['totalBytes'], 'a non-null result must have a real total');
+        $this->assertLessThanOrEqual($result['totalBytes'], $result['freeBytes']);
         $this->assertSame($result['totalBytes'] - $result['freeBytes'], $result['usageBytes']);
     }
 
@@ -549,18 +568,26 @@ final class SystemTest extends TestCase {
         $this->assertSame($viaSrand, $viaHelper);
     }
 
-    public function testMakeSeedWithNullSeedsFromTimeAndKeepsRandUsable(): void {
+    /**
+     * The old version only checked that rand(1, 10) stayed within 1..10 — true for ANY seed, or
+     * none. A null seed must be non-reproducible: two calls must not replay the same sequence
+     * (identical 5-draw sequences from two distinct seeds are a ~2^-155 event).
+     */
+    public function testMakeSeedWithNullSeedsANonReproducibleSequence(): void {
         System::makeSeed(null);
+        $first = [rand(), rand(), rand(), rand(), rand()];
 
-        $value = rand(1, 10);
-        $this->assertGreaterThanOrEqual(1, $value);
-        $this->assertLessThanOrEqual(10, $value);
-
-        // Default argument must behave exactly like an explicit null.
+        usleep(1000);
         System::makeSeed();
-        $value = rand(1, 10);
-        $this->assertGreaterThanOrEqual(1, $value);
-        $this->assertLessThanOrEqual(10, $value);
+        $second = [rand(), rand(), rand(), rand(), rand()];
+
+        $this->assertNotSame($first, $second, 'A null seed must not be a fixed seed.');
+
+        srand(0);
+        $fixed = [rand(), rand(), rand(), rand(), rand()];
+        $this->assertNotSame($fixed, $first);
+
+        mt_srand();
     }
 
     // ---------------------------------------------------------------------
@@ -733,8 +760,7 @@ final class SystemTest extends TestCase {
         }
 
         $autoload = dirname(__DIR__) . '/vendor/autoload.php';
-        $script = sys_get_temp_dir() . '/phphelper_system_' . bin2hex(random_bytes(8)) . '.php';
-        $this->tempFiles[] = $script;
+        $script = $this->scratchDir() . DIRECTORY_SEPARATOR . 'child.php';
 
         $code = <<<'PHP'
 <?php

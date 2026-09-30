@@ -8,7 +8,10 @@ use Random\RandomException;
 class Number
 {
     /**
-     * Rounds a float to a number of decimal places, using round-half-up, floor or ceil.
+     * Rounds a float to a number of decimal places, using round-half-away-from-zero, floor or ceil.
+     *
+     * 'round' breaks ties AWAY FROM ZERO, like PHP's round(): 2.675 -> 2.68 but -0.125 -> -0.13
+     * (not -0.12, which "half up" would mean for a negative number). It is not banker's rounding.
      *
      * Scaling a float by 10^$precision reintroduces binary representation error: 8.2 * 100 is
      * 819.9999999999999, not 820. PHP's native round() compensates internally, floor()/ceil() do
@@ -17,6 +20,14 @@ class Number
      * doing money/tax arithmetic must know: a value within ~1e-9 of a grid point is treated as
      * being ON it, so this floors the decimal number the caller wrote, not the binary double
      * actually stored. roundDecimal(8.2, 2, 'floor') is 8.2. A genuine 0.2999 still floors to 0.29.
+     * The same snap applies to ties under 'round' (a scaled 2.4999999996 counts as the tie 2.5
+     * and goes to 3) and to 'ceil' (roundDecimal(1e-12, 2, 'ceil') is 0.0, not 0.01).
+     *
+     * A finite value whose scaled form overflows (|$value| * 10^$precision > PHP_FLOAT_MAX) is
+     * returned unchanged: such a double provably has no digits beyond $precision, so it is
+     * already rounded. It used to come back as INF. (INF remains possible in one genuine case:
+     * rounding a value within one step of PHP_FLOAT_MAX UP at a negative $precision, where the
+     * next multiple of 10^-$precision is not representable.)
      *
      * Zero is NOT special-cased: it takes the same path as every other value and comes back as a
      * float. IEEE-754 signed zero is preserved, so -0.0 returns -0.0 — as does any negative value
@@ -29,7 +40,7 @@ class Number
      * @param int $precision Number of decimal places. Defaults to 2. May be negative, which rounds
      *                       to tens/hundreds/... — and, being $method-dependent like every other
      *                       precision, $precision = -2 turns 8250.0 into 8300.0 under the default
-     *                       'round' (82.5 is a tie, and ties go up), but into 8200.0 under 'floor'
+     *                       'round' (82.5 is a tie, and ties go away from zero), but into 8200.0 under 'floor'
      *                       and 8300.0 under 'ceil'.
      *                       MUST satisfy -323 <= $precision <= 308, the exact range over which
      *                       10**$precision is a finite, non-zero double. Outside it the arithmetic
@@ -75,9 +86,18 @@ class Number
             );
         }
 
-        // round(..., 9) neutralises the scaling error before floor/ceil see it; it is a no-op for
-        // the 'round' branch, which already corrects internally.
-        return $method(round($value * $factor, 9)) / $factor;
+        $scaled = $value * $factor;
+
+        // A double this large has an exponent so high that its lowest binary digit lies above
+        // 10^-$precision (true for every $precision up to ~418; 308 is the cap), so it has
+        // nothing left to round. Without this, INF / $factor returned INF for finite input.
+        if (is_finite($value) && !is_finite($scaled)) {
+            return $value;
+        }
+
+        // round(..., 9) neutralises the scaling error (8.2 * 100 = 819.9999999999999) before
+        // $method sees it. For 'round' it also snaps near-ties onto the tie; see the docblock.
+        return $method(round($scaled, 9)) / $factor;
     }
 
     /**
@@ -101,8 +121,9 @@ class Number
      * @param float $min Minimum value, inclusive. Must be finite and <= $max. 0.0 is valid.
      * @param float $max Maximum value, inclusive. Must be finite and >= $min. 0.0 is valid.
      * @param int|null $decimals Number of decimal places to draw at, >= 0. When null (default) it
-     *                           is DERIVED from how many decimal digits $min and $max have once
-     *                           cast to string, taking the larger of the two. This default is
+     *                           is DERIVED from how many decimal digits $min and $max have when
+     *                           rendered with 14 significant digits (PHP's default float-to-string
+     *                           form), taking the larger of the two. This default is
      *                           surprising and is preserved only for convenience: whole-valued
      *                           bounds stringify without a '.' at all — (string)1.0 === "1" — so
      *                           randomDecimal(1.0, 10.0) derives 0 decimals and returns WHOLE
@@ -196,14 +217,17 @@ class Number
      * after the '.' gives a meaningless answer. The exponent is subtracted so the count reflects
      * the actual position of the last significant decimal place.
      *
-     * The count is bounded by the `precision` ini setting, which governs float-to-string casting;
-     * it is NOT the mathematically exact decimal expansion of the double.
+     * The value is rendered with 14 significant digits, so this is NOT the mathematically exact
+     * decimal expansion of the double. 14 is pinned rather than inherited: a plain (string) cast
+     * follows the `precision` ini, and under precision=17 (string)0.1 is "0.10000000000000001",
+     * which silently turned a 0.1-step draw into a 1e-17-step one — or, for larger bounds, into
+     * an "exceeds the integer range" exception. %H is the locale-INDEPENDENT %G.
      *
      * @param float $value Finite value to inspect.
      * @return int Number of decimal places, >= 0. Whole-valued floats yield 0.
      */
     private static function decimalDigitsOf(float $value): int {
-        $text = (string)$value;
+        $text = sprintf('%.14H', $value);
 
         $exponent = 0;
         $exponentPos = stripos($text, 'E');

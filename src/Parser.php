@@ -4,7 +4,27 @@ namespace VD\PHPHelper;
 
 class Parser {
     /**
-     * Decodes TEXT-type values (e.g. Unicode escape sequences like \u00ed).
+     * Nesting limit for arrayToXml(), matching json_encode()'s default depth. Anything deeper is
+     * almost always a reference cycle, which used to recurse until PHP ran out of memory.
+     */
+    private const XML_MAX_DEPTH = 512;
+
+    /**
+     * XML 1.0 NameStartChar / NameChar, minus ':' (a prefix would need a namespace declaration
+     * that arrayToXml() never emits).
+     */
+    private const XML_NAME_START_CHARS = 'A-Z_a-z\x{C0}-\x{D6}\x{D8}-\x{F6}\x{F8}-\x{2FF}\x{370}-\x{37D}\x{37F}-\x{1FFF}'
+        . '\x{200C}-\x{200D}\x{2070}-\x{218F}\x{2C00}-\x{2FEF}\x{3001}-\x{D7FF}\x{F900}-\x{FDCF}\x{FDF0}-\x{FFFD}\x{10000}-\x{EFFFF}';
+    private const XML_NAME_CHARS = self::XML_NAME_START_CHARS . '\-.0-9\x{B7}\x{300}-\x{36F}\x{203F}-\x{2040}';
+
+    /**
+     * Decodes TEXT-type values (e.g. Unicode escape sequences like í).
+     *
+     * A UTF-16 surrogate PAIR (😀, the form every JSON encoder uses for a character
+     * outside the BMP such as an emoji) is decoded as the single character it encodes. Each half
+     * used to be converted on its own, which produced bytes that are not valid UTF-8 at all — so
+     * the result then failed json_encode(), mb_* functions and database writes. A LONE surrogate
+     * (half a pair) encodes nothing and becomes U+FFFD.
      *
      * @param string|null $str String to decode
      * @return string|null
@@ -12,13 +32,34 @@ class Parser {
      * @ref https://stackoverflow.com/questions/2934563/how-to-decode-unicode-escape-sequences-like-u00ed-to-proper-utf-8-encoded-cha
      */
     public static function decodeText(?string $str): ?string {
-        return empty($str) ? $str : preg_replace_callback('/\\\\u([0-9a-fA-F]{4})/i', function ($match) {
-            return mb_convert_encoding(pack('H*', $match[1]), 'UTF-8', 'UCS-2BE');
-        }, $str);
+        if (empty($str)) {
+            return $str;
+        }
+
+        return preg_replace_callback(
+            '/\\\\u([dD][89abAB][0-9a-fA-F]{2})\\\\u([dD][c-fC-F][0-9a-fA-F]{2})|\\\\u([0-9a-fA-F]{4})/',
+            static function (array $match): string {
+                // With the alternation, a single-unit match leaves groups 1-2 empty and sets 3.
+                if (isset($match[3])) {
+                    $unit = hexdec($match[3]);
+                    if ($unit >= 0xD800 && $unit <= 0xDFFF) {
+                        return "\u{FFFD}";
+                    }
+
+                    return mb_convert_encoding(pack('H*', $match[3]), 'UTF-8', 'UTF-16BE');
+                }
+
+                return mb_convert_encoding(pack('H*', $match[1] . $match[2]), 'UTF-8', 'UTF-16BE');
+            },
+            $str
+        );
     }
 
     /**
      * Recursively decodes TEXT-type values within an array.
+     *
+     * Only strings (and strings inside nested arrays) are decoded; every other value, including
+     * objects, is returned untouched. Keys are preserved.
      *
      * @param array $arr Array to decode
      * @return array
@@ -36,6 +77,7 @@ class Parser {
             }
             if (is_string($item)) $item = self::decodeText($item);
         }
+        unset($item);
 
         return $arr;
     }
@@ -44,27 +86,38 @@ class Parser {
      * Converts an array or object into XML, filling $xml in place.
      *
      * Mapping rules:
-     *  - A NON-numeric key becomes an element of that name.
-     *  - A NUMERIC key (i.e. any list element) becomes an `<item>` element, because a number is not
+     *  - An INTEGER key (i.e. any list element) becomes an `<item>` element, because a number is not
      *    a legal XML element name. So `['ids' => [1, 2]]` yields `<ids><item>1</item><item>2</item></ids>`.
+     *  - A string key that is a legal XML element name (XML 1.0 Name, without ':') becomes an element
+     *    of that name.
+     *  - ANY OTHER string key — '', 'bad key', '1abc', 'ns:el', 'a><evil' — becomes
+     *    `<item key="…">`, the original key carried (escaped) in the attribute. Such keys used to be
+     *    emitted as element names verbatim, producing MALFORMED XML (and, for a key built from input,
+     *    markup injection), and '' threw a ValueError.
      *  - Nested arrays/objects recurse; scalars become text content. NULL and FALSE become an empty
      *    element, TRUE becomes "1" (PHP string casting).
-     *  - Values are entity-escaped, so any text (including '&' and '<') round-trips through a parser.
+     *  - An OBJECT is read the way json_encode() reads it: a \JsonSerializable contributes whatever
+     *    jsonSerialize() returns, a \DateTimeInterface becomes its DATE_ATOM string, an enum its value
+     *    (backed) or name (pure), and any other object its PUBLIC properties only. It used to be cast
+     *    with (array), which exposes PRIVATE and PROTECTED properties under NUL-mangled keys — an
+     *    entity's password hash went out as `<>HASH</>`, in malformed XML.
+     *  - Text is escaped, so any value (including '&' and '<') round-trips through a parser. Invalid
+     *    UTF-8 and characters XML 1.0 forbids (most C0 controls) are replaced with U+FFFD; both used
+     *    to make libxml DROP THE WHOLE VALUE, silently or with a warning.
      *
      * @param array|object $data The data to convert. An empty array yields just the empty root node.
      * @param \SimpleXMLElement|null $xml BY REFERENCE. Pass null (the default) to have the root node
      *                                    created and assigned here; pass an existing node to append into it.
      * @param string $rootNode Name of the root node, used ONLY when $xml is null. Falls back to 'root'
-     *                         when empty. MUST be a valid XML element name.
+     *                         when empty. MUST be a legal XML element name.
      *
      * @return void The result is written to $xml, which is never null after a successful call.
      *
-     * @throws \Exception If $rootNode is not a valid XML element name (SimpleXMLElement cannot parse it).
-     *
-     * ELEMENT NAMES ARE NOT VALIDATED OR SANITIZED: non-numeric keys are used verbatim. A key that is
-     * not a legal XML name (e.g. 'bad key') is emitted as-is, producing a MALFORMED document with no
-     * warning and no exception — it only fails later, in whatever parses it. VALUES are escaped and are
-     * always safe; KEYS are not. Never build element names from untrusted input.
+     * @throws \InvalidArgumentException If $rootNode is not a legal XML element name (it used to be
+     *                                   pasted into markup and parsed, so 'r evil="1"' silently added
+     *                                   an attribute), or if the data nests deeper than 512 levels —
+     *                                   which in practice means a reference cycle, and used to exhaust
+     *                                   memory with an uncatchable fatal error.
      *
      * @ref https://stackoverflow.com/questions/37618094/php-convert-array-to-xml
      */
@@ -75,33 +128,109 @@ class Parser {
         if ($xml === null) {
             // empty() is deliberate: '' and '0' are both invalid XML element names.
             if (empty($rootNode)) $rootNode = "root";
+            if (!self::isXmlName($rootNode)) {
+                throw new \InvalidArgumentException('arrayToXml(): $rootNode must be a legal XML element name.');
+            }
+            // Safe to interpolate only BECAUSE it was validated as a Name just above.
             $xml = new \SimpleXMLElement("<{$rootNode}/>");
         }
 
-        if (is_object($data)) {
-            $data = (array) $data;
+        self::appendXmlChildren($xml, $data, 0);
+    }
+
+    /**
+     * Appends $data under $xml; the recursive body of arrayToXml().
+     *
+     * @param \SimpleXMLElement $xml The node to fill.
+     * @param mixed $data The array/object to append. An object that normalises to a scalar sets $xml's text.
+     * @param int $depth Current nesting depth.
+     */
+    private static function appendXmlChildren(\SimpleXMLElement $xml, mixed $data, int $depth): void {
+        if ($depth > self::XML_MAX_DEPTH) {
+            throw new \InvalidArgumentException(
+                'arrayToXml(): data nests deeper than ' . self::XML_MAX_DEPTH . ' levels (a reference cycle?).'
+            );
+        }
+
+        $data = self::normaliseXmlValue($data);
+        if (!is_array($data)) {
+            // Assigning to [0] sets the element's text, escaped by SimpleXML itself.
+            $xml[0] = self::xmlSafeText($data);
+            return;
         }
 
         foreach ($data as $key => $value) {
-            $name = is_numeric($key) ? 'item' : (string) $key;
+            $keyIsForeign = is_string($key) && !self::isXmlName($key);
+            $name = is_int($key) || $keyIsForeign ? 'item' : $key;
+            $value = self::normaliseXmlValue($value);
 
-            if (is_array($value) || is_object($value)) {
-                $subnode = $xml->addChild($name);
-                // addChild() returns null on an invalid element name (after warning). Never recurse
-                // with null: the by-reference param would build an orphan root that is silently
-                // dropped, losing the whole subtree without a trace.
-                if ($subnode === null) {
-                    continue;
-                }
-                self::arrayToXml($value, $subnode);
-                continue;
+            if (is_array($value)) {
+                $child = $xml->addChild($name);
+                self::appendXmlChildren($child, $value, $depth + 1);
+            } else {
+                // addChild() parses its value for entity references — a raw '&' made it warn and DROP
+                // the value — so it gets pre-escaped text. Our own entities are not double-escaped.
+                $child = $xml->addChild($name, htmlspecialchars(self::xmlSafeText($value), ENT_XML1 | ENT_QUOTES, 'UTF-8'));
             }
 
-            // addChild() escapes '<' and '>' but NOT '&': given a raw '&' it warns and DROPS the
-            // value entirely. Pre-escaping avoids that, and does not double-escape — addChild
-            // leaves the '&' of our own entities untouched.
-            $xml->addChild($name, htmlspecialchars((string) $value, ENT_XML1, 'UTF-8'));
+            if ($keyIsForeign) {
+                // addAttribute() escapes on its own; pre-escaping here would double-escape.
+                $child->addAttribute('key', self::xmlSafeText($key));
+            }
         }
+    }
+
+    /**
+     * Reduces an object to what json_encode() would see; leaves every other value alone.
+     *
+     * @param mixed $value Any value.
+     * @return mixed A non-object: an array, or a scalar/null/resource.
+     */
+    private static function normaliseXmlValue(mixed $value): mixed {
+        // Bounded: a jsonSerialize() may return another object, and one returning $this must not spin.
+        for ($hops = 0; is_object($value) && $hops < 8; $hops++) {
+            $value = match (true) {
+                $value instanceof \JsonSerializable  => $value->jsonSerialize(),
+                $value instanceof \DateTimeInterface => $value->format(DATE_ATOM),
+                $value instanceof \BackedEnum        => $value->value,
+                $value instanceof \UnitEnum          => $value->name,
+                // Called from THIS class, so only the object's public properties are visible.
+                default                              => get_object_vars($value),
+            };
+        }
+
+        return is_object($value) ? get_object_vars($value) : $value;
+    }
+
+    /**
+     * Turns a scalar into text XML 1.0 can carry: valid UTF-8 and no forbidden characters.
+     *
+     * @param mixed $value A non-array value.
+     * @return string Raw (unescaped) text.
+     */
+    private static function xmlSafeText(mixed $value): string {
+        $text = match (true) {
+            $value === null, $value === false => '',
+            $value === true                   => '1',
+            default                           => (string) $value,
+        };
+
+        if (!mb_check_encoding($text, 'UTF-8')) {
+            // ENT_SUBSTITUTE is the one core primitive that swaps each invalid sequence for U+FFFD.
+            $text = htmlspecialchars_decode(htmlspecialchars($text, ENT_NOQUOTES | ENT_SUBSTITUTE, 'UTF-8'), ENT_NOQUOTES);
+        }
+
+        return (string) preg_replace('/[^\x{9}\x{A}\x{D}\x{20}-\x{D7FF}\x{E000}-\x{FFFD}\x{10000}-\x{10FFFF}]/u', "\u{FFFD}", $text);
+    }
+
+    /**
+     * Whether $name is a legal XML 1.0 element name without a namespace prefix.
+     *
+     * @param string $name Candidate name.
+     * @return bool
+     */
+    private static function isXmlName(string $name): bool {
+        return preg_match('/^[' . self::XML_NAME_START_CHARS . '][' . self::XML_NAME_CHARS . ']*\z/u', $name) === 1;
     }
 
     /**
@@ -137,7 +266,8 @@ class Parser {
      * Converts an array into a PHP object.
      *
      * Performs a JSON round-trip, so only JSON-representable data survives: nested associative arrays
-     * become stdClass, nested LIST arrays stay PHP arrays, and resources/closures are lost.
+     * become stdClass, nested LIST arrays stay PHP arrays, and resources/closures are lost. A float
+     * stays a float (10.0 does not come back as int 10).
      *
      * A top-level list (e.g. [1, 2, 3] or a result set) JSON-encodes to an array, which cannot satisfy
      * the declared object return type, so it is cast to stdClass with the numeric keys as property
@@ -145,15 +275,15 @@ class Parser {
      *
      * @param array $array The array to convert. Any shape is accepted (list or associative).
      * @return object|null NULL when $array is empty, AND ALSO when the data cannot be JSON-encoded
-     *                     (e.g. malformed UTF-8 from a latin1/cp850 source). NULL is therefore
-     *                     "no object", not proof of emptiness. Never throws.
+     *                     (e.g. malformed UTF-8 from a latin1/cp850 source, NAN/INF, nesting deeper
+     *                     than 512). NULL is therefore "no object", not proof of emptiness. Never throws.
      *
      * @ref https://stackoverflow.com/questions/9169892/how-to-convert-multidimensional-array-to-object-in-php
      */
     public static function arrayToObject(array $array): object|null {
         if (empty($array)) return null;
 
-        $json = json_encode($array);
+        $json = json_encode($array, JSON_PRESERVE_ZERO_FRACTION);
         if ($json === false) return null;
 
         $decoded = json_decode($json);
@@ -169,21 +299,22 @@ class Parser {
      *
      * Performs a JSON round-trip, so this is a DEEP conversion that sees only what JSON sees: public
      * properties (private/protected are dropped, unlike a (array) cast), or whatever jsonSerialize()
-     * returns for a JsonSerializable object.
+     * returns for a JsonSerializable object. A float stays a float (10.0 does not become int 10).
      *
      * @param object|null $object The object to convert. NULL/property-less objects yield [].
      * @return array The resulting array. Returns [] — never null, never throws — when $object is
      *               empty, when it cannot be JSON-encoded (e.g. malformed UTF-8 from a latin1/cp850
-     *               source), or when its JSON form is not an object/array (e.g. a JsonSerializable
-     *               returning a scalar). [] therefore means "nothing convertible", NOT "was empty";
-     *               validate the input yourself if you must tell those apart.
+     *               source, a NAN/INF float anywhere inside, a reference cycle), or when its JSON form
+     *               is not an object/array (e.g. a JsonSerializable returning a scalar). [] therefore
+     *               means "nothing convertible", NOT "was empty"; validate the input yourself if you
+     *               must tell those apart. ONE bad value anywhere discards the WHOLE object.
      *
      * @ref https://stackoverflow.com/questions/9169892/how-to-convert-multidimensional-array-to-object-in-php
      */
     public static function objectToArray(object|null $object): array {
         if (empty($object)) return [];
 
-        $json = json_encode($object);
+        $json = json_encode($object, JSON_PRESERVE_ZERO_FRACTION);
         if ($json === false) return [];
 
         $decoded = json_decode($json, true);
@@ -191,49 +322,80 @@ class Parser {
     }
 
     /**
-     * Converts an XML string or file path into an associative array.
+     * Converts an XML STRING into an associative array.
      *
-     * @param string $xmlSource XML content, OR a path to an XML file (see the warning below).
+     * BEHAVIOUR CHANGE: this no longer accepts a file path. It used to treat any string naming an
+     * existing file as that file, so feeding it untrusted input — a webhook body, a form field —
+     * was an arbitrary local-file read: posting "/app/config/secrets.xml" parsed and returned that
+     * file. A path passed here is now just malformed XML (returns []). Use xmlFileToArray() for files.
+     *
+     * Hardening: external entities and DTDs are never loaded (a deny-all entity loader is installed
+     * for the duration of the parse, LIBXML_NONET forbids the network, and LIBXML_NOENT is NOT set,
+     * so no entity is expanded). The loader is RESTORED afterwards: it used to be left installed for
+     * the rest of the process, after which every simplexml_load_file() / DOMDocument::load() in the
+     * application failed with "failed to load external entity".
+     *
+     * Mapping (SimpleXML's JSON form): child elements become keys, repeated siblings become lists,
+     * attributes appear under '@attributes', CDATA is read as text (it used to be DROPPED). Known
+     * lossy spots, inherent to that form: an element with BOTH attributes and text keeps only the
+     * text; an empty element becomes [] rather than ''; elements in a non-default namespace are
+     * omitted; an unexpanded entity reference shows up as a nested key named after the entity.
+     *
+     * @param string $xmlSource XML content.
      * @return array The resulting array. Returns [] when the simplexml extension is missing, when
-     *               $xmlSource is empty or a directory, and when the XML is malformed — a malformed
-     *               document also emits a PHP warning unless you have called
-     *               libxml_use_internal_errors(true). [] is thus "nothing parsed", not "empty document".
-     *
-     * @ref https://www.php.net/manual/en/function.simplexml-load-file.php
+     *               $xmlSource is empty, and when the XML is malformed. No PHP warning is emitted for
+     *               malformed input (libxml's diagnostics are collected internally); if you had
+     *               libxml_use_internal_errors(true) on, they stay in libxml_get_errors() for you.
+     *               [] is thus "nothing parsed", not "empty document".
      */
     public static function xmlToArray(string $xmlSource): array {
-        $result = [];
-        if (!extension_loaded('simplexml')) {
-            return $result;
+        if (!extension_loaded('simplexml') || trim($xmlSource) === '') {
+            return [];
         }
 
-        if (empty($xmlSource) || is_dir($xmlSource)) return $result;
+        $previousLoader = \function_exists('libxml_get_external_entity_loader') ? libxml_get_external_entity_loader() : null;
+        $callerCollectsErrors = libxml_use_internal_errors(true);
+        libxml_set_external_entity_loader(static fn() => null);
 
-        // Harden against XXE: hard-block external entity resolution and forbid network access
-        // (LIBXML_NONET). No LIBXML_NOENT, so entities are never expanded. NOTE: a string that
-        // happens to be an existing path is loaded as a FILE — never pass untrusted input here
-        // without confirming it is XML content, not a local path (arbitrary-file read).
-        if (\function_exists('libxml_set_external_entity_loader')) {
-            libxml_set_external_entity_loader(static fn() => null);
-        }
-
-        if (is_file($xmlSource)) {
-            // Read the file and parse it as a STRING. simplexml_load_file() cannot be used while the
-            // XXE guard above is installed: libxml routes its request for the MAIN DOCUMENT through
-            // the same external-entity loader, which returns null for everything, so every file load
-            // failed with "Failed to load external entity" and this method silently returned [].
-            // Loading the bytes ourselves keeps the guard strictly intact — the loader still refuses
-            // every entity — while making the documented file-path input actually work.
-            $contents = file_get_contents($xmlSource);
-            if ($contents === false || $contents === '') {
-                return $result;
+        try {
+            $xml = simplexml_load_string($xmlSource, \SimpleXMLElement::class, LIBXML_NONET | LIBXML_NOCDATA);
+        } finally {
+            libxml_set_external_entity_loader($previousLoader);
+            if (!$callerCollectsErrors) {
+                libxml_clear_errors();
+                libxml_use_internal_errors(false);
             }
-            $xml = simplexml_load_string($contents, \SimpleXMLElement::class, LIBXML_NONET) ?: null;
-        } else {
-            $xml = simplexml_load_string($xmlSource, \SimpleXMLElement::class, LIBXML_NONET) ?: null;
         }
 
-        return self::objectToArray($xml);
+        return $xml === false ? [] : self::objectToArray($xml);
+    }
+
+    /**
+     * Reads an XML FILE and converts it into an associative array, exactly as xmlToArray() does.
+     *
+     * The file is read as bytes and parsed as a string, so the same entity hardening applies. Only
+     * local paths are accepted: a stream-wrapper URL (http://, ftp://, php://, phar://, …) returns
+     * [] without being opened; file:// is allowed.
+     *
+     * @param string $path Path to the XML file. Treat it like any path: never build it from
+     *                     untrusted input without confining it to a directory you control.
+     * @return array The resulting array, or [] when $path is empty, is not a readable regular file,
+     *               is empty, or holds malformed XML.
+     */
+    public static function xmlFileToArray(string $path): array {
+        if ($path === '' || str_contains($path, "\0")) {
+            return [];
+        }
+        if (preg_match('#^([a-z][a-z0-9+.\-]*)://#i', $path, $scheme) === 1 && strtolower($scheme[1]) !== 'file') {
+            return [];
+        }
+        if (!is_file($path) || !is_readable($path)) {
+            return [];
+        }
+
+        $contents = file_get_contents($path);
+
+        return ($contents === false || $contents === '') ? [] : self::xmlToArray($contents);
     }
 
     /**
@@ -340,39 +502,39 @@ class Parser {
     }
 
     /**
-     * Converts a space-separated binary string back to a normal string. Exact inverse of
+     * Converts whitespace-separated binary groups back to a string. Exact inverse of
      * stringToBinary(): binaryToString(stringToBinary($s)) === $s for every byte value, including
      * NUL, TAB and LF.
      *
-     * Groups wider than 8 bits are also accepted (leading zeros are numerically irrelevant), so
-     * output written by older, ragged-width versions still decodes correctly.
+     * Groups wider than 8 bits are accepted as long as the extra bits are leading zeros, so output
+     * written by older, ragged-width versions still decodes correctly. Any run of whitespace
+     * separates groups; leading/trailing whitespace is ignored.
      *
-     * @param string|null $binaryInput Space-separated groups of binary digits. MUST contain only
-     *                                 '0', '1' and spaces: any other character triggers a PHP
-     *                                 deprecation from base_convert() and is silently ignored,
-     *                                 yielding garbage. Validate untrusted input before calling.
-     * @return string The decoded string, or '' if $binaryInput is null or ''.
+     * @param string|null $binaryInput Whitespace-separated groups of binary digits.
+     * @return string The decoded string, or '' if $binaryInput is null, '' or only whitespace.
+     *
+     * @throws \InvalidArgumentException If a group contains anything but '0'/'1', or its value does
+     *                                   not fit in one byte. This used to be undetectable garbage: a
+     *                                   stray character raised a base_convert() deprecation and was
+     *                                   skipped, a double space inserted a NUL byte, and a 9-bit
+     *                                   group expanded into two bytes.
      *
      * @ref https://stackoverflow.com/questions/6382738/convert-string-to-binary-then/-back-again-using-php
      * @ref http://www.inanzzz.com/index.php/post/swf8/converting-string-to-binary-and-binary-to-string-with-php
      */
     public static function binaryToString(?string $binaryInput): string {
-        // '' must short-circuit: explode(' ', '') is [''], and base_convert('', 2, 16) is '0',
-        // which would emit a spurious NUL byte instead of an empty string.
         if ($binaryInput === null || $binaryInput === '') return "";
 
-        $binaries = explode(' ', $binaryInput);
         $output = "";
-
-        foreach ($binaries as $binary) {
-            $hex = base_convert($binary, 2, 16);
-            // base_convert() drops leading zeros, so any byte < 0x10 yields a single hex digit.
-            // pack('H*') pads an odd-length string on the RIGHT, turning 0x0A ('a') into 0xA0 —
-            // silently corrupting every byte 0x00-0x0F, i.e. LF and TAB. Pad left to even length.
-            if (strlen($hex) % 2 !== 0) {
-                $hex = '0' . $hex;
+        foreach (preg_split('/\s+/', trim($binaryInput), -1, PREG_SPLIT_NO_EMPTY) as $group) {
+            $bits = ltrim($group, '0');
+            if (strspn($group, '01') !== strlen($group) || strlen($bits) > 8) {
+                throw new \InvalidArgumentException(
+                    'binaryToString(): every group must be binary digits encoding one byte (0-255).'
+                );
             }
-            $output .= pack('H*', $hex);
+
+            $output .= chr($bits === '' ? 0 : bindec($bits));
         }
 
         return $output;
@@ -388,34 +550,32 @@ class Parser {
      */
     public static function strToHex(?string $string): string {
         if ($string === null) return "";
-        $hex = '';
 
-        for ($i = 0; $i < strlen($string); $i++) {
-            $ord = ord($string[$i]);
-            $hexCode = dechex($ord);
-            $hex .= substr('0' . $hexCode, -2);
-        }
-
-        return strtoupper($hex);
+        return strtoupper(bin2hex($string));
     }
 
     /**
-     * Converts a hexadecimal string back to a plain string.
+     * Converts a hexadecimal string back to a plain string. Case-insensitive.
+     *
+     * A trailing odd nibble is ignored ('616' decodes to 'a').
      *
      * @param string|null $hex The hexadecimal string to decode
-     * @return string Decoded plain string
+     * @return string Decoded plain string ('' for null or '').
+     *
+     * @throws \InvalidArgumentException If $hex contains a non-hexadecimal character. Such a
+     *                                   character used to raise a hexdec() deprecation and be dropped,
+     *                                   turning 'zz' into a NUL byte.
      *
      * @ref https://stackoverflow.com/questions/14674834/php-convert-string-to-hex-and-hex-to-string
      */
     public static function hexToStr(?string $hex): string {
-        if ($hex === null) return "";
-        $string = '';
+        if ($hex === null || $hex === '') return "";
 
-        for ($i = 0; $i < strlen($hex) - 1; $i += 2) {
-            $string .= chr(hexdec($hex[$i] . $hex[$i + 1]));
+        if (preg_match('/^[0-9a-fA-F]+\z/', $hex) !== 1) {
+            throw new \InvalidArgumentException('hexToStr(): $hex must contain only hexadecimal digits.');
         }
 
-        return $string;
+        return (string) hex2bin(substr($hex, 0, strlen($hex) - strlen($hex) % 2));
     }
 
     /**
@@ -440,7 +600,8 @@ class Parser {
      *    merely trimmed: 'false', 'null', 'undefined', 'no', 'n', 'tno', '{}', '[]'.
      *
      * TRUE is returned for everything else, including 'true', 'yes', any non-zero number, any
-     * non-empty array/object, and any other non-empty string.
+     * non-empty array/object, and any other non-empty string — NOTE: 'off' is TRUE (it is not in the
+     * list above), unlike filter_var(FILTER_VALIDATE_BOOLEAN).
      *
      * READ THAT WHITESPACE RULE LITERALLY, because it is surprising and it is not a typo: the
      * sentinel comparison strips INTERNAL whitespace too, so 'fa lse', 'n o', 'F A L S E' and
@@ -487,44 +648,72 @@ class Parser {
     /**
      * Extracts JSON-like blocks from a mixed string using bracket balancing.
      *
+     * A block starts at '{' or '[' and ends at the bracket that balances it. Brackets inside a
+     * double-quoted string (with backslash escapes) do not count — '{"a":"}"}' is ONE block; it used
+     * to be cut at the quoted '}'. A closing bracket of the wrong kind abandons the block in progress
+     * and scanning continues right after it, so a stray '{]' no longer swallows the valid blocks that
+     * follow. The scan is a single forward pass (linear time); the price is that a valid block NESTED
+     * inside an abandoned or never-closed one is not recovered.
+     *
+     * Blocks are returned as found; they are balanced, not validated — json_decode() them yourself.
+     *
      * @param string|null $input Input string possibly containing embedded JSON
-     * @return string[] Array of extracted JSON-like strings
+     * @return string[] Array of extracted JSON-like strings, in order of appearance
      */
     public static function extractJsonBlocks(?string $input): array {
-        $ret = array();
-        if (empty($input)) return $ret;
+        $blocks = [];
+        if ($input === null || $input === '') return $blocks;
 
-        $stacks = array();
-        $temp = "";
-        foreach (str_split($input) AS $char) {
-            if (empty($stacks) && ($char === "{" || $char === "[")) {
-                $stacks[] = $char;
-                $temp .= $char;
-            } elseif (!empty($stacks)) {
-                $temp .= $char;
-                if (
-                    (
-                        $stacks[(count($stacks) - 1)] === "{" && $char === "}"
-                    ) || (
-                        $stacks[(count($stacks) - 1)] === "[" && $char === "]"
-                    )
-                ) {
-                    array_pop($stacks);
-                    if (empty($stacks)) {
-                        $ret[] = $temp;
-                        $temp = "";
+        $length = strlen($input);
+        $expected = []; // stack of the closers still owed
+        $start = 0;
+        $i = 0;
+
+        while ($i < $length) {
+            if ($expected === []) {
+                $i += strcspn($input, '{[', $i);
+                if ($i >= $length) break;
+
+                $expected[] = $input[$i] === '{' ? '}' : ']';
+                $start = $i++;
+                continue;
+            }
+
+            $i += strcspn($input, '{}[]"', $i);
+            if ($i >= $length) break;
+
+            $char = $input[$i++];
+            if ($char === '"') {
+                // Skip the string body: to the next quote that is not escaped.
+                while ($i < $length) {
+                    $i += strcspn($input, '"\\', $i);
+                    if ($i >= $length) break;
+                    if ($input[$i] === '\\') {
+                        $i += 2;
+                        continue;
                     }
-                } elseif ($char === "{" || $char === "}" || $char === "[" || $char === "]") {
-                    $stacks[] = $char;
+                    $i++;
+                    break;
                 }
-            } elseif (strlen($temp) > 0) {
-                $ret[] = $temp;
-                $temp = "";
+                continue;
+            }
+
+            if ($char === '{' || $char === '[') {
+                $expected[] = $char === '{' ? '}' : ']';
+                continue;
+            }
+
+            if (array_pop($expected) !== $char) {
+                $expected = [];
+                continue;
+            }
+
+            if ($expected === []) {
+                $blocks[] = substr($input, $start, $i - $start);
             }
         }
-        $stacks = null;
 
-        return $ret;
+        return $blocks;
     }
 
     /**
@@ -569,6 +758,8 @@ class Parser {
     /**
      * Converts a time string (HH:mm:ss) into its total equivalent in seconds.
      *
+     * Delegates to DateTime::timeToSeconds(); see it for the authoritative contract.
+     *
      * @param string|null $timeString Time string in format "HH:mm:ss"
      * @return int Total seconds, or 0 if the format is invalid
      *
@@ -581,6 +772,8 @@ class Parser {
     /**
      * Converts a total number of seconds into a formatted time string (HH:mm:ss).
      *
+     * Delegates to DateTime::secondsToTime(); see it for the authoritative contract.
+     *
      * @param int|string|null $seconds Number of seconds to convert (may be numeric string)
      * @return string Time string in format "HH:mm:ss"
      */
@@ -591,7 +784,9 @@ class Parser {
     /**
      * Encodes a string into HTML entities to prevent it from affecting HTML structure.
      *
-     * Useful for displaying user-generated content safely inside HTML.
+     * Always treats $text as UTF-8 (whatever default_charset says) and encodes both quote styles,
+     * so the result is safe in HTML text and inside a QUOTED attribute value. It is NOT enough for
+     * an unquoted attribute, a <script>/<style> body, or a URL (javascript: survives it).
      *
      * @param string|null $text The string to encode
      * @return string|null Encoded HTML-safe string
@@ -601,7 +796,7 @@ class Parser {
             return $text;
         }
 
-        return htmlentities($text);
+        return htmlentities($text, ENT_QUOTES | ENT_SUBSTITUTE | ENT_HTML401, 'UTF-8');
     }
 
     /**
@@ -617,7 +812,7 @@ class Parser {
             return $text;
         }
 
-        return html_entity_decode($text);
+        return html_entity_decode($text, ENT_QUOTES | ENT_SUBSTITUTE | ENT_HTML401, 'UTF-8');
     }
 
     /**
@@ -650,14 +845,14 @@ class Parser {
      *
      * Example: "065066067" → "ABC"
      *
-     * @param string|null $numericText String composed of 3-digit ASCII codes, as produced by
+     * @param string|null $numericText String composed of 3-digit byte codes (000-255), as produced by
      *                                 stringToNumericSequence(). Returned unchanged if null or ''.
      * @return string|null Decoded original string
      *
-     * @throws \TypeError If $numericText contains anything but digits — chr() rejects a non-numeric
-     *                    string. Codes are taken in groups of 3 and reduced modulo 256, so a length
-     *                    that is not a multiple of 3 decodes the trailing group as a short number
-     *                    rather than failing. Validate untrusted input before calling.
+     * @throws \InvalidArgumentException If $numericText is not a whole number of 3-digit groups, or a
+     *                                   group exceeds 255. This used to decode garbage instead: a
+     *                                   short trailing group was read as a small number, a code above
+     *                                   255 wrapped modulo 256, and a non-digit escaped as a TypeError.
      *
      * @link https://stackoverflow.com/questions/8087432/convert-a-string-to-number-and-back-to-string
      */
@@ -666,13 +861,21 @@ class Parser {
             return $numericText;
         }
 
-        return implode(
-            '',
-            array_map(
-                'chr',
-                str_split($numericText, 3)
-            )
-        );
+        if (preg_match('/^(?:[0-9]{3})+\z/', $numericText) !== 1) {
+            throw new \InvalidArgumentException(
+                'numericSequenceToString(): $numericText must be a sequence of 3-digit byte codes.'
+            );
+        }
+
+        $output = '';
+        foreach (str_split($numericText, 3) as $code) {
+            if ((int) $code > 255) {
+                throw new \InvalidArgumentException("numericSequenceToString(): {$code} is not a byte code (000-255).");
+            }
+            $output .= chr((int) $code);
+        }
+
+        return $output;
     }
 
     /**
@@ -681,17 +884,19 @@ class Parser {
      * Useful for applying a default or fixed value to a field across all rows.
      *
      * @param array|null $input The array of arrays to modify. NULL and [] are legal and yield [].
-     *                          EVERY element must itself be an array — see @throws.
+     *                          EVERY element must itself be an array (or null) — see @throws.
      * @param string|null $key The key to set/overwrite in each sub-array. NULL and '' are legal and
      *                         make the call a no-op returning $input unchanged. Note '0' IS a valid
      *                         key here (emptyExceptZero, not empty()).
      * @param mixed $value The value to assign to the key.
      *
-     * @return array The modified array, outer keys preserved. Never null.
+     * @return array The modified array, outer keys preserved. Never null. A null element is promoted
+     *               to [$key => $value].
      *
-     * @throws \Error If any element of $input is not an array — a scalar element cannot take an array
-     *                offset and an object element cannot be used as an array. A null element is
-     *                silently promoted to [$key => $value].
+     * @throws \InvalidArgumentException If any element of $input is neither an array nor null. It is
+     *                                   checked for EVERY element before any is modified. (This used
+     *                                   to be an \Error thrown mid-walk — and a FALSE element was
+     *                                   silently promoted to an array with a deprecation notice.)
      */
     public static function setValueForKeyInArray(?array $input, ?string $key, mixed $value = null): array {
         if (empty($input) || Validator::emptyExceptZero($key)) {
@@ -700,9 +905,20 @@ class Parser {
             return $input ?? [];
         }
 
-        array_walk($input, function (&$item) use ($key, $value) {
-            $item[$key] = $value;
-        });
+        foreach ($input as $row) {
+            if ($row !== null && !is_array($row)) {
+                throw new \InvalidArgumentException(
+                    'setValueForKeyInArray(): every element must be an array or null, got ' . get_debug_type($row) . '.'
+                );
+            }
+        }
+
+        foreach ($input as &$row) {
+            $row ??= [];
+            $row[$key] = $value;
+        }
+        unset($row);
+
         return $input;
     }
 

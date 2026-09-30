@@ -48,16 +48,41 @@ class SQL {
      *  - null               -> "NULL"       (bare keyword, unquoted)
      *  - bool               -> "1" / "0"
      *  - int, finite float  -> the decimal literal, unquoted
-     *  - string             -> "'...'": control characters stripped, then backslash AND single
-     *                          quote escaped. Escaping both matters: doubling only the quote lets
-     *                          a trailing backslash (input "a\") escape the closing quote under
-     *                          MySQL's default sql_mode and break out of the literal.
+     *  - string             -> "'...'" with exactly three substitutions, and NO other change to
+     *                          the bytes: ' -> '' (doubled), \ -> \\ and NUL -> \0.
      *
-     * SECURITY — what this does NOT give you. Manual escaping is not multibyte-safe on a
-     * non-UTF-8 connection charset, and this function cannot see the live connection. Prefer
-     * PARAMETERIZED queries (PDO/mysqli prepared statements) for all untrusted input and use this
-     * only when a bound parameter is genuinely impossible. It escapes VALUES only — never
-     * identifiers (table/column names) and never SQL fragments.
+     * Why the quote is DOUBLED and not backslash-escaped: '' is the SQL-standard escape and is
+     * honoured by MySQL in every sql_mode, by PostgreSQL, SQLite and SQL Server. \' is honoured
+     * ONLY while backslash is an escape character — under MySQL's NO_BACKSLASH_ESCAPES (and in
+     * PostgreSQL with standard_conforming_strings, SQLite, SQL Server) "\'" is a literal backslash
+     * followed by the CLOSING quote, so the input "' OR 1=1 -- " broke straight out of the literal.
+     * The backslash must still be doubled: under MySQL's default sql_mode a lone trailing
+     * backslash (input "a\") would otherwise escape the closing quote.
+     *
+     * The result therefore NEVER lets a value escape its literal — under either MySQL sql_mode or
+     * in a standard-conforming engine. It round-trips EXACTLY under MySQL's default sql_mode. In a
+     * dialect where backslash is literal (NO_BACKSLASH_ESCAPES, standard-conforming PostgreSQL,
+     * SQLite) a value containing a backslash or NUL is stored with that byte doubled / as "\0":
+     * corrupted, never injected. Use bound parameters there.
+     *
+     * Control characters (other than NUL) are kept verbatim. They are inert inside a quoted literal
+     * and this used to strip them, which silently changed the stored value ("a\x1Bb" became "ab").
+     * NUL alone is escaped, because a raw NUL truncates the statement in anything that treats it as
+     * a C string (SQLite's tokenizer, logs, some drivers).
+     *
+     * SECURITY — what this does NOT give you:
+     *  - CHARSET: safe only on a connection whose charset never uses 0x5C (backslash) as the
+     *    trailing byte of a multibyte character — utf8mb4, utf8mb3, latin1, ascii, binary, and the
+     *    EUC charsets are fine. It is NOT safe on big5, cp932, gbk, gb18030 or sjis: there a lead
+     *    byte can swallow the escaping backslash (the classic "\xBF\x27" attack), and no escaper
+     *    that cannot see the live connection can prevent that.
+     *  - Prefer PARAMETERIZED queries (PDO/mysqli prepared statements) for all untrusted input
+     *    and use this only when a bound parameter is genuinely impossible.
+     *  - It escapes VALUES only — never identifiers (table/column names), never SQL fragments,
+     *    and it does not escape the LIKE wildcards % and _.
+     *
+     * BEHAVIOUR CHANGE: the quote used to be rendered as \' (injectable under NO_BACKSLASH_ESCAPES)
+     * and control characters used to be stripped; both are gone, see above.
      *
      * @param mixed $data Value to render. Accepts null, bool, int, finite float and string.
      *
@@ -92,8 +117,9 @@ class SQL {
             return var_export($data, true);
         }
         if (is_string($data)) {
-            $escaped = str_replace(['\\', "'"], ['\\\\', "\\'"], Str::removeInvisibleCharacters($data));
-            return "'" . $escaped . "'";
+            // strtr() with an array is a single left-to-right pass, so an inserted backslash is
+            // never itself re-escaped.
+            return "'" . strtr($data, ['\\' => '\\\\', "'" => "''", "\0" => '\\0']) . "'";
         }
 
         throw new \InvalidArgumentException(sprintf(
@@ -144,10 +170,21 @@ class SQL {
      * Builds ONE "INSERT INTO t (cols) VALUES (..),(..) ON DUPLICATE KEY UPDATE .." statement from
      * a dataset, and consumes the rows it wrote out of $data so the caller can loop until done.
      *
-     * Batching. Rows are appended until the memory grown since entry crosses a third of the free
-     * memory reported by {@see System::getMemoryUsage()}, then the statement is closed. That figure
-     * is PHP's own memory_limit headroom capped by the physical memory the OS still has free — the
-     * budget the script can actually spend, not merely the machine's free RAM. The OS probe behind
+     * Batching. Rows are appended until EITHER the statement reaches $maxStatementBytes OR the
+     * memory grown since entry crosses a third of the free memory reported by
+     * {@see System::getMemoryUsage()}; then the statement is closed.
+     *
+     * The byte cap is what keeps the statement deliverable: the server refuses any packet larger
+     * than its max_allowed_packet (4 MiB by default on MySQL 5.7, 16 MiB on MariaDB, 64 MiB on
+     * 8.0), and a memory budget knows nothing about that. Without the cap, a large dataset on a
+     * host with generous memory produced one statement of hundreds of MB that the server rejected
+     * ("packet too large" / "server has gone away") — after the rows had been consumed from $data.
+     * It is a SOFT cap: the row that crosses it is still included, so a statement can exceed the
+     * cap by at most one value group. Always at least one row per statement.
+     *
+     * The memory figure is PHP's own memory_limit headroom capped by the physical memory the OS
+     * still has free — the budget the script can actually spend, not merely the machine's free
+     * RAM. The OS probe behind
      * it costs milliseconds (it shells out), so it is read ONCE per call; the per-row check uses
      * memory_get_usage(true), the same number getMemoryUsage() reports as usageBytes.
      *
@@ -201,22 +238,31 @@ class SQL {
      *        in $insertFields (the library's own backticks when auto-derived) — so an explicit
      *        "`order`,`key`" yields "`order`=VALUES(`order`),`key`=VALUES(`key`)" and stays valid
      *        SQL for a column that needs quoting. Only surrounding whitespace is trimmed.
+     *        VALUES(col) is deprecated since MySQL 8.0.20 (still executed, with warning 1287) and
+     *        is the only form MariaDB accepts, so it is kept on purpose.
      * @param callable|null $rowFormatter fn(array $row, int|string $key, array &$global): string|false
      *        formatting a single row. Must return:
      *        - string: a complete value group, e.g. "(1,'abc')", holding exactly as many values as
      *          $insertFields has columns
      *        - empty string: skip this row (it is still consumed from $data)
      *        - false: abort now; the function returns false and $data is left untouched
+     *        Any other return (null, an int, ...) THROWS, leaving $data untouched: it used to be
+     *        concatenated as-is, so a formatter that fell off its end without a return produced
+     *        "VALUES ,,," and consumed the rows.
      *        Null installs the default formatter, which emits one escaped literal per column of
      *        $global['__insert'], reading a missing column as NULL.
      * @param array $global Passed BY VALUE into this method and BY REFERENCE into the formatter,
      *        which may use it as scratch space shared across rows. Mutations never reach the
      *        caller. This method ALWAYS sets $global['__insert'] to the resolved insert column
      *        list (string[]) before the first row, overwriting anything the caller put there.
+     * @param int $maxStatementBytes Soft cap on the statement's length in bytes (see Batching).
+     *        Default 1 MiB, which fits every MySQL/MariaDB default max_allowed_packet with room
+     *        for an oversized final row. Must be >= 1.
      *
      * @return string|bool The SQL statement; TRUE when there was nothing to write (empty $data, or
-     *         every remaining row skipped by the formatter); FALSE on error (empty $table, no
-     *         resolvable insert column, or a formatter that returned false).
+     *         every remaining row skipped by the formatter); FALSE on error (empty or
+     *         whitespace-only $table, no resolvable insert column, or a formatter that returned
+     *         false).
      *
      * @throws \InvalidArgumentException When an auto-derived column name (a key of the first row,
      *         used only when $insertFields is null) is not a valid identifier — see the SECURITY
@@ -224,8 +270,9 @@ class SQL {
      *         object row included: it has no columns to read, and passing it to the formatter
      *         raised an uncaught \Error), again leaving $data untouched. Also from the default
      *         formatter, through self::escapeString(), when a column of $insertFields holds a value
-     *         with no safe literal form (array/object/resource/NAN/INF). A custom formatter throws
-     *         whatever it throws.
+     *         with no safe literal form (array/object/resource/NAN/INF). Also when the formatter
+     *         returns something other than a string or false, and when $maxStatementBytes < 1.
+     *         A custom formatter throws whatever it throws.
      */
     public static function prepareInsertOrUpdateMySQL(
         array &$data,
@@ -233,13 +280,23 @@ class SQL {
         ?string $insertFields = null,
         ?string $updateFields = null,
         ?callable $rowFormatter = null,
-        array $global = []
+        array $global = [],
+        int $maxStatementBytes = 1048576
     ): string|bool {
+        if ($maxStatementBytes < 1) {
+            throw new \InvalidArgumentException(sprintf(
+                'SQL::prepareInsertOrUpdateMySQL(): $maxStatementBytes must be >= 1, %d given.',
+                $maxStatementBytes
+            ));
+        }
+
         if (empty($data)) {
             return true;
         }
 
-        if (empty($table)) {
+        // trim(), not empty(): empty() let "  " through (building "INSERT INTO    (...)") and
+        // refused a table literally named "0".
+        if (trim($table) === '') {
             return false;
         }
 
@@ -276,9 +333,11 @@ class SQL {
                 $renderedColumns[] = trim($column, " \t\n\r\0\x0B");
             }
         } else {
-            foreach ($data as $row) {
+            foreach ($data as $key => $row) {
+                // A scalar/object first row used to end derivation with no columns and return
+                // FALSE, while the same row anywhere else THROWS — one contract, one outcome.
                 if (!is_array($row)) {
-                    break;
+                    throw self::notARowException($key, $row);
                 }
 
                 foreach ($row as $column => $value) {
@@ -383,14 +442,7 @@ class SQL {
             // A row that is not an array is a contract violation ("each item must be an associative
             // array"), and the only safe answer is to say so before anything is consumed.
             if (!is_array($row)) {
-                throw new \InvalidArgumentException(sprintf(
-                    'SQL::prepareInsertOrUpdateMySQL(): row %s of $data is a %s, not an associative '
-                        . 'array. Convert the dataset at the call site (e.g. (array) $row, or '
-                        . 'json_decode($json, true)) — skipping the row would consume it out of '
-                        . '$data and report success while dropping its data.',
-                    var_export($key, true),
-                    get_debug_type($row)
-                ));
+                throw self::notARowException($key, $row);
             }
 
             $processedRows++;
@@ -400,6 +452,15 @@ class SQL {
 
             if ($values === false) {
                 return false;
+            }
+
+            if (!is_string($values)) {
+                throw new \InvalidArgumentException(sprintf(
+                    'SQL::prepareInsertOrUpdateMySQL(): the row formatter returned %s for row %s; '
+                        . 'it must return a value group string, \'\' to skip the row, or false to abort.',
+                    get_debug_type($values),
+                    var_export($key, true)
+                ));
             }
 
             if ($values === '') {
@@ -412,7 +473,8 @@ class SQL {
 
             $query .= $values;
 
-            if ($currentUsage >= $maxBytes) {
+            // +1 for the space before the clause; the trailing ',' about to be added is removed.
+            if ($currentUsage >= $maxBytes || strlen($query) + 1 + strlen($updateClause) >= $maxStatementBytes) {
                 break;
             }
 
@@ -437,5 +499,22 @@ class SQL {
         }
 
         return true;
+    }
+
+    /**
+     * The one exception for a $data entry that is not a row, wherever it is met.
+     *
+     * @param int|string $key Outer key of the offending entry.
+     * @param mixed      $row The entry.
+     */
+    private static function notARowException(int|string $key, mixed $row): \InvalidArgumentException {
+        return new \InvalidArgumentException(sprintf(
+            'SQL::prepareInsertOrUpdateMySQL(): row %s of $data is a %s, not an associative '
+                . 'array. Convert the dataset at the call site (e.g. (array) $row, or '
+                . 'json_decode($json, true)) — skipping the row would consume it out of '
+                . '$data and report success while dropping its data.',
+            var_export($key, true),
+            get_debug_type($row)
+        ));
     }
 }

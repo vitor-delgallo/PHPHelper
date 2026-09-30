@@ -910,7 +910,6 @@ final class S3StorageTest extends TestCase
     public function testCopyReturnsFalseWhenOverwriteIsBlockedByAnExistingDestination(): void
     {
         $this->installMockS3([
-            new Result([]),                                   // headBucket (destination exists)
             new Result(['ContentType' => 'application/pdf']), // headObject (source metadata)
             self::awsFailure(412, 'Precondition Failed'),     // copyObject refused
         ]);
@@ -926,7 +925,6 @@ final class S3StorageTest extends TestCase
     {
         $this->installMockS3([
             new Result([]),
-            new Result([]),
             self::awsFailure(412),
         ]);
         S3Storage::copy('a/x.pdf', 'a/y.pdf', false);
@@ -939,7 +937,6 @@ final class S3StorageTest extends TestCase
     {
         // The data-loss scenario, end to end: rename onto an existing destination.
         $this->installMockS3([
-            new Result([]),                                   // headBucket
             new Result(['ContentType' => 'application/pdf']), // headObject
             self::awsFailure(412, 'Precondition Failed'),     // copyObject refused
             new Result([]),                                   // deleteObject — must never be reached
@@ -956,7 +953,6 @@ final class S3StorageTest extends TestCase
     public function testRenameOntoAnExistingKeyFailsWithoutDestroyingTheSource(): void
     {
         $this->installMockS3([
-            new Result([]),
             new Result([]),
             self::awsFailure(412),
             new Result([]),
@@ -975,7 +971,6 @@ final class S3StorageTest extends TestCase
     public function testUploadReportsSuccessWhenOverwriteIsBlocked(): void
     {
         $this->installMockS3([
-            new Result([]),                // headBucket
             self::awsFailure(412),         // putObject refused: object already exists
         ]);
 
@@ -989,7 +984,6 @@ final class S3StorageTest extends TestCase
     public function testUploadReturnsTheObjectUrlOnSuccess(): void
     {
         $this->installMockS3([
-            new Result([]), // headBucket
             new Result([]), // putObject — the SDK's own middleware derives ObjectURL from the request URI
         ]);
 
@@ -1004,7 +998,7 @@ final class S3StorageTest extends TestCase
 
     public function testUploadSendsAChecksumAndDoesNotSendIfNoneMatchWhenOverwriting(): void
     {
-        $this->installMockS3([new Result([]), new Result([])]);
+        $this->installMockS3([new Result([])]);
 
         S3Storage::upload('a/b.txt', $this->tempFile(), true);
 
@@ -1017,7 +1011,6 @@ final class S3StorageTest extends TestCase
     public function testUploadReturnsFalseOnAGenuineAwsFailure(): void
     {
         $this->installMockS3([
-            new Result([]),
             self::awsFailure(500, 'Internal Error'),
         ]);
 
@@ -1170,23 +1163,16 @@ final class S3StorageTest extends TestCase
     public function testUploadRejectsAnOptionsBucketInsteadOfLettingItOverrideTheValidatedOne(): void
     {
         $this->installMockS3([
-            new Result([]), // headBucket — must never be reached
             new Result([]), // putObject — must never be reached
         ]);
 
-        // Uppercase: a name validateBucketName() rejects outright, which used to reach AWS
-        // anyway — while createBucket() had just ensured the *validated* bucket existed.
+        // Uppercase: a name validateBucketName() rejects outright, which used to reach AWS anyway.
         $this->assertFalse(
             S3Storage::upload('a/b.txt', $this->tempFile(), true, ['Bucket' => 'ATTACKER-BUCKET']),
             "an \$options['Bucket'] must not override the bucket requireBucket() validated"
         );
         $this->assertStringContainsString("may not contain 'Bucket'", (string)S3Storage::getLastError());
-        $this->assertSame(
-            [],
-            $this->awsCommands,
-            'a rejected call must not reach AWS at all — not even createBucket(), which would '
-            . 'otherwise leave a bucket behind for a call that never ran'
-        );
+        $this->assertSame([], $this->awsCommands, 'a rejected call must not reach AWS at all');
     }
 
     public function testUploadRejectsEveryOptionItDerivesFromItsOwnArguments(): void
@@ -1227,7 +1213,6 @@ final class S3StorageTest extends TestCase
     public function testUploadSendsTheValidatedBucketAndStillPassesGenuineExtraOptionsThrough(): void
     {
         $this->installMockS3([
-            new Result([]), // headBucket
             new Result([]), // putObject
         ]);
 
@@ -1289,12 +1274,12 @@ final class S3StorageTest extends TestCase
     public function testCopySendsTheValidatedBucketsAndStillPassesGenuineExtraOptionsThrough(): void
     {
         $this->installMockS3([
-            new Result([]),                                   // headBucket
             new Result(['ContentType' => 'application/pdf']), // headObject
             new Result([]),                                   // copyObject
         ]);
 
         $this->assertTrue(S3Storage::copy('a/x.pdf', 'b/y.pdf', true, true, ['StorageClass' => 'GLACIER']));
+        $this->assertSame(['HeadObject', 'CopyObject'], $this->awsCommands, 'no implicit HeadBucket/CreateBucket');
 
         $copy = $this->awsParams['CopyObject'][0];
         $this->assertSame(self::TEST_BUCKET, $copy['Bucket'] ?? null, 'the destination on the wire is the validated one');
@@ -1404,6 +1389,313 @@ final class S3StorageTest extends TestCase
                 "'{$endpoint}' is a legitimate endpoint and must be accepted"
             );
         }
+    }
+
+    // =====================================================================
+    // Regression pins for the logic fixes of this pass (offline, MockHandler).
+    // =====================================================================
+
+    /**
+     * FINDING (fixed): every upload first called createBucket() (a HeadBucket needing
+     * s3:ListBucket, and a CreateBucket for a typo'd name) and sent ACL=private, which buckets
+     * with ACLs disabled — the S3 default since 2023 — may refuse outright.
+     */
+    public function testUploadIssuesOnlyPutObjectAndSendsNoAclByDefault(): void
+    {
+        $this->installMockS3([new Result([])]);
+
+        $this->assertNotFalse(S3Storage::upload('a/b.txt', $this->tempFile()));
+
+        $this->assertSame(['PutObject'], $this->awsCommands, 'no implicit HeadBucket/CreateBucket');
+        $this->assertArrayNotHasKey('ACL', $this->awsParams['PutObject'][0]);
+    }
+
+    public function testAnExplicitAclIsStillSent(): void
+    {
+        $this->installMockS3([new Result([])]);
+
+        S3Storage::upload('a/b.txt', $this->tempFile(), true, ['ACL' => 'bucket-owner-full-control']);
+
+        $this->assertSame('bucket-owner-full-control', $this->awsParams['PutObject'][0]['ACL'] ?? null);
+    }
+
+    /**
+     * FINDING (fixed): copy() ltrim()-ed '/' off the source key for CopySource only, so copying
+     * "/a/x.pdf" HEAD-ed "/a/x.pdf" but copied the DIFFERENT object "a/x.pdf".
+     */
+    public function testCopyUsesTheSourceKeyVerbatimIncludingALeadingSlash(): void
+    {
+        $this->installMockS3([new Result([]), new Result([])]);
+
+        $this->assertTrue(S3Storage::copy('/a/x.pdf', 'b/y.pdf', true));
+
+        $this->assertSame('/a/x.pdf', $this->awsParams['HeadObject'][0]['Key']);
+        $this->assertSame(self::TEST_BUCKET . '//a/x.pdf', $this->awsParams['CopyObject'][0]['CopySource']);
+        $this->assertArrayNotHasKey('ACL', $this->awsParams['CopyObject'][0]);
+    }
+
+    private static function listPage(array $keys, ?string $nextToken): Result
+    {
+        $contents = [];
+        foreach ($keys as $key) {
+            $contents[] = ['Key' => $key, 'Size' => 1, 'LastModified' => new \DateTimeImmutable('2024-01-01')];
+        }
+
+        return new Result(array_filter([
+            'Contents' => $contents,
+            'IsTruncated' => $nextToken !== null,
+            'NextContinuationToken' => $nextToken,
+        ], static fn ($v) => $v !== null));
+    }
+
+    /**
+     * FINDING (fixed): the whole listing was sent as ONE DeleteObjects request, which S3 refuses
+     * above 1000 keys — a prefix with more than 1000 objects could never be deleted.
+     */
+    public function testRecursiveDeleteSendsAtMost1000KeysPerRequestAcrossPages(): void
+    {
+        $keys = array_map(static fn (int $i): string => sprintf('p/%04d.txt', $i), range(1, 2500));
+        $this->installMockS3([
+            self::listPage(array_slice($keys, 0, 1000), 't2'),
+            new Result([]),
+            // An S3-compatible server may ignore the 1000-key page ceiling.
+            self::listPage(array_slice($keys, 1000, 1500), null),
+            new Result([]),
+            new Result([]),
+        ]);
+
+        $this->assertTrue(S3Storage::delete('p/', true));
+
+        $this->assertSame(
+            ['ListObjectsV2', 'DeleteObjects', 'ListObjectsV2', 'DeleteObjects', 'DeleteObjects'],
+            $this->awsCommands
+        );
+        $sent = [];
+        foreach ($this->awsParams['DeleteObjects'] as $params) {
+            $this->assertLessThanOrEqual(1000, count($params['Delete']['Objects']));
+            $this->assertTrue($params['Delete']['Quiet'] ?? false);
+            $sent = array_merge($sent, array_column($params['Delete']['Objects'], 'Key'));
+        }
+        $this->assertSame($keys, $sent, 'every key exactly once');
+        $this->assertSame('t2', $this->awsParams['ListObjectsV2'][1]['ContinuationToken'] ?? null);
+    }
+
+    /**
+     * FINDING (fixed): DeleteObjects reports per-key failures in an HTTP 200 body; they were
+     * ignored and the call returned true with the objects still there.
+     */
+    public function testRecursiveDeleteReportsPerKeyFailuresInsteadOfClaimingSuccess(): void
+    {
+        $this->installMockS3([
+            self::listPage(['p/a.txt', 'p/b.txt', 'p/c.txt'], null),
+            new Result(['Errors' => [['Key' => 'p/b.txt', 'Code' => 'AccessDenied', 'Message' => 'Access Denied']]]),
+        ]);
+
+        $this->assertFalse(S3Storage::delete('p/', true));
+
+        $error = (string)S3Storage::getLastError();
+        $this->assertStringContainsString('1 object(s)', $error);
+        $this->assertStringContainsString('(2 were)', $error);
+        $this->assertStringContainsString("'p/b.txt' — AccessDenied", $error);
+    }
+
+    public function testATruncatedListingWithoutAContinuationTokenIsAnError(): void
+    {
+        $this->installMockS3([new Result(['Contents' => [], 'IsTruncated' => true])]);
+        $this->assertFalse(S3Storage::list('p/'), 'a partial listing must not be returned as complete');
+
+        S3Storage::reset();
+        $this->awsCommands = [];
+        $this->installMockS3([new Result(['Contents' => [], 'IsTruncated' => true])]);
+        $this->assertFalse(S3Storage::delete('p/', true));
+    }
+
+    /**
+     * FINDING (fixed): with $preserveMetadata = false a self-copy is legal for S3, and move()
+     * then deleted the "source" — the only copy.
+     */
+    public function testMoveOntoItselfIsRefusedBeforeAnyRequest(): void
+    {
+        $this->installMockS3([new Result([]), new Result([]), new Result([])]);
+
+        $this->assertFalse(S3Storage::move('a/x.pdf', 'a/x.pdf', true, false));
+        $this->assertFalse(S3Storage::rename('a/x.pdf', 'a/x.pdf', true));
+
+        $this->assertSame([], $this->awsCommands);
+        $this->assertStringContainsString('same object', (string)S3Storage::getLastError());
+    }
+
+    public function testMoveToTheSameKeyInAnotherBucketIsAllowed(): void
+    {
+        $this->installMockS3([new Result([]), new Result([]), new Result([])]);
+
+        $this->assertTrue(S3Storage::move('a/x.pdf', 'a/x.pdf', true, true, [], self::TEST_BUCKET, 'other-bucket'));
+        $this->assertSame(['HeadObject', 'CopyObject', 'DeleteObject'], $this->awsCommands);
+    }
+
+    /** It used to copy first and only then discover that delete() would refuse the source. */
+    public function testMoveRejectsAnExtensionlessSourceBeforeCopying(): void
+    {
+        $this->installMockS3([new Result([]), new Result([]), new Result([])]);
+
+        $this->assertFalse(S3Storage::move('uploads/9f2c1a3e', 'uploads/9f2c1a3e.pdf'));
+
+        $this->assertSame([], $this->awsCommands, 'nothing may be copied');
+        $this->assertStringContainsString('must end with an extension', (string)S3Storage::getLastError());
+    }
+
+    public function testDownloadStreamChunkSizeMustBeAnIntegerFrom1To64(): void
+    {
+        S3Storage::setNoOperation(true);
+
+        foreach (['DOWNLOAD_STREAM:0', 'DOWNLOAD_STREAM:65', 'DOWNLOAD_STREAM:1.5', 'DOWNLOAD_STREAM:abc', 'DOWNLOAD_STREAM:99999'] as $mode) {
+            $this->assertFalse(S3Storage::download('a/b.txt', $mode), $mode);
+            $this->assertStringContainsString('chunk size in MiB', (string)S3Storage::getLastError());
+        }
+
+        foreach (['DOWNLOAD_STREAM', 'DOWNLOAD_STREAM:', 'DOWNLOAD_STREAM:1', 'DOWNLOAD_STREAM:64'] as $mode) {
+            $this->assertTrue(S3Storage::download('a/b.txt', $mode), $mode);
+        }
+    }
+
+    /** Collects the '.part' siblings download() may have left in a directory. */
+    private static function partialFilesIn(string $dir): array
+    {
+        return glob($dir . DIRECTORY_SEPARATOR . '*.part') ?: [];
+    }
+
+    /**
+     * FINDING (fixed): the SDK was handed the destination itself as its HTTP sink, and the HTTP
+     * layer writes whatever body comes back into the sink — so a failed download replaced the
+     * caller's existing file with S3's XML error document. The mock reproduces exactly that
+     * write before failing.
+     */
+    public function testAFailedSaveLeavesTheExistingFileUntouchedAndNoPartialFileBehind(): void
+    {
+        $destination = $this->tempFile('.pdf');
+        file_put_contents($destination, 'precious previous version');
+
+        $this->installMockS3([
+            static function ($cmd, $req) {
+                file_put_contents($cmd['@http']['sink'], '<Error><Code>NoSuchKey</Code></Error>');
+
+                return new S3Exception('Not Found', $cmd, ['response' => new Response(404)]);
+            },
+        ]);
+
+        $this->assertFalse(S3Storage::download('reports/x.pdf', 'SAVE:[' . $destination . ']'));
+
+        $this->assertSame('precious previous version', file_get_contents($destination));
+        $this->assertSame([], self::partialFilesIn(dirname($destination)));
+        $this->assertStringContainsString('Error downloading', (string)S3Storage::getLastError());
+    }
+
+    public function testASuccessfulSaveMovesTheCompleteObjectIntoPlace(): void
+    {
+        $destination = $this->tempFile('.pdf');
+        file_put_contents($destination, 'old');
+
+        $this->installMockS3([
+            static function ($cmd, $req) {
+                file_put_contents($cmd['@http']['sink'], 'new object bytes');
+
+                return new Result([]);
+            },
+        ]);
+
+        $this->assertTrue(S3Storage::download('reports/x.pdf', 'SAVE:[' . $destination . ']'));
+
+        $this->assertSame('new object bytes', file_get_contents($destination));
+        $this->assertSame([], self::partialFilesIn(dirname($destination)));
+    }
+
+    public function testASaveOntoADirectoryFailsCleanly(): void
+    {
+        $dir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 's3storage_dir_' . bin2hex(random_bytes(6)) . '.pdf';
+        mkdir($dir);
+        try {
+            $this->installMockS3([
+                static function ($cmd, $req) {
+                    file_put_contents($cmd['@http']['sink'], 'bytes');
+
+                    return new Result([]);
+                },
+            ]);
+
+            $this->assertFalse(S3Storage::download('reports/x.pdf', 'SAVE:[' . $dir . ']'));
+            $this->assertStringContainsString('could not be moved into place', (string)S3Storage::getLastError());
+            $this->assertDirectoryExists($dir);
+            $this->assertSame([], self::partialFilesIn(dirname($dir)));
+        } finally {
+            @rmdir($dir);
+        }
+    }
+
+    /**
+     * FINDING (fixed): the key's last segment was interpolated raw into filename="…", so a '"' in
+     * a key (legal in S3) closed the quoted value and let the key append parameters.
+     */
+    public function testTheAttachmentDispositionCannotBeBrokenOutOfByAKey(): void
+    {
+        $build = new \ReflectionMethod(S3Storage::class, 'attachmentDisposition');
+
+        $header = $build->invoke(null, "evil\"; filename=\"x.exe\\\r\n.pdf");
+        $this->assertSame(
+            // ';' and '=' are inert INSIDE the quoted string; '"', '\', CR and LF are what escaped it.
+            'attachment; filename="evil_; filename=_x.exe___.pdf"; filename*=UTF-8\'\''
+                . rawurlencode("evil\"; filename=\"x.exe\\\r\n.pdf"),
+            $header
+        );
+        $this->assertSame(2, substr_count($header, '"'), 'only the two quotes that delimit the value');
+
+        $this->assertSame(
+            'attachment; filename="relat__rio.pdf"; filename*=UTF-8\'\'relat%C3%B3rio.pdf',
+            $build->invoke(null, 'relatório.pdf')
+        );
+        $this->assertStringStartsWith('attachment; filename="download"', $build->invoke(null, ''));
+    }
+
+    /** basename() split on '\' on Windows only, so an item's 'name' depended on the host OS. */
+    public function testTheItemNameSplitsOnlyOnForwardSlashes(): void
+    {
+        $this->installMockS3([new Result(['ContentLength' => 1])]);
+
+        $item = S3Storage::find('dir/sub\\file.txt');
+
+        $this->assertSame('sub\\file.txt', $item['name']);
+    }
+
+    public function testSetEndpointRejectsUserinfoWithoutEchoingTheSecret(): void
+    {
+        foreach (['https://AKIDEXAMPLE:s3cr3t-value@minio.example.com:9000', 'ftp://user:s3cr3t-value@host'] as $endpoint) {
+            S3Storage::reset();
+
+            $this->assertFalse(S3Storage::setEndpoint($endpoint));
+            $this->assertStringContainsString('must not carry credentials', (string)S3Storage::getLastError());
+            $this->assertStringNotContainsString('s3cr3t-value', (string)S3Storage::getLastError());
+            $this->assertNull(S3Storage::getEndpoint());
+        }
+    }
+
+    public function testSetBucketEnforcesTheEdgeAndAdjacentPeriodRules(): void
+    {
+        foreach (['-abc', 'abc-', '.abc', 'abc.', 'ab..cd'] as $bad) {
+            $this->assertFalse(S3Storage::setBucket($bad), $bad);
+        }
+        $this->assertTrue(S3Storage::setBucket('a.b-c'));
+    }
+
+    public function testCreateBucketTreatsBucketAlreadyOwnedByYouAsSuccess(): void
+    {
+        $this->installMockS3([
+            self::awsFailure(404),
+            static fn ($cmd, $req) => new S3Exception('exists', $cmd, [
+                'code' => 'BucketAlreadyOwnedByYou',
+                'response' => new Response(409),
+            ]),
+        ]);
+
+        $this->assertTrue(S3Storage::createBucket());
     }
 
     public function testARejectedControlCharacterEndpointLeavesTheWorkingOneAndTheClientIntact(): void

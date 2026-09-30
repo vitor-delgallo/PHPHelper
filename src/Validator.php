@@ -27,7 +27,7 @@ class Validator {
      * Accepts only the characters 0-9 a-f A-F. There is no "0x" prefix handling, no sign and
      * no whitespace tolerance: "0xFF", "+FF" and " FF" are all rejected.
      *
-     * @param string $value The string to test.
+     * @param string|null $value The string to test.
      * @return bool TRUE only if every character is a hex digit. FALSE for null, for the empty
      *              string, and — because this check cannot be answered without it — FALSE if
      *              ext-ctype is not loaded. ctype ships with PHP and is enabled by default, so
@@ -73,7 +73,9 @@ class Validator {
      *
      * The date must match the format EXACTLY: the parsed date is re-formatted and compared
      * against the input, so "2024-1-5" is NOT valid for "Y-m-d" and overflow dates such as
-     * "2024-02-30" are rejected rather than rolled over into March.
+     * "2024-02-30" are rejected rather than rolled over into March. Fields the format lacks are
+     * never taken from the clock, so the answer does not depend on the day it is asked; the full
+     * rules (DST gaps, yearless formats) are on DateTime::validateDate().
      *
      * @param string|null $date The date string to validate. Null or "" returns FALSE.
      * @param string|null $format The expected format (see date()). When null or "", the
@@ -96,10 +98,20 @@ class Validator {
      * record exists, or that the mailbox can receive mail — a syntactically valid address may
      * still be undeliverable. Do not treat a TRUE here as proof the address is real.
      *
+     * Any whitespace or control character (CR, LF, TAB, NUL, DEL...) makes the address invalid,
+     * whatever the delegate's pattern says. "user@example.com\n" used to validate (a pattern
+     * ending in a bare '$' also matches before a trailing "\n") — a header-injection vector the
+     * moment the address is written into a To:/Reply-To: header — so this is checked here rather
+     * than left to the delegate's anchoring.
+     *
      * @param string|null $email The email address to validate. Null or "" returns FALSE.
      * @return bool TRUE if the address is syntactically valid, FALSE otherwise.
      */
     public static function validateMail(?string $email): bool {
+        if ($email === null || $email === '' || preg_match('/[\x00-\x20\x7F]/', $email) === 1) {
+            return false;
+        }
+
         return Mailer::validateMail($email);
     }
 
@@ -136,8 +148,15 @@ class Validator {
      *     ONLY — they are neither letters, digits nor special characters here. "É" does not
      *     satisfy 'minUppercase'.
      *
-     * Lengths are counted in CHARACTERS, not bytes (the pattern is UTF-8 aware). A password that
-     * is not valid UTF-8, or that contains a line break, returns FALSE.
+     * Digits are the ASCII 0-9 only: an Arabic-Indic or fullwidth digit counts toward the length
+     * ONLY, like any other non-ASCII character.
+     *
+     * Lengths are counted in CHARACTERS, not bytes. A password that is not valid UTF-8, or that
+     * contains a line break (CR or LF), returns FALSE.
+     *
+     * The check counts each class directly (linear time). It used to build one regex of nested
+     * lookaheads, which hit PCRE's backtrack limit on long passwords with large min/max rules
+     * and then returned FALSE for passwords that satisfied every rule.
      *
      * @param string|null $password The password to test. Null or "" returns FALSE.
      * @param array $rules Rule overrides; see above. Defaults to the rule set above.
@@ -211,42 +230,35 @@ class Validator {
             }
         }
 
-        if ($password === null || $password === '') {
+        if (
+            $password === null ||
+            $password === '' ||
+            !mb_check_encoding($password, 'UTF-8') ||
+            strpbrk($password, "\r\n") !== false
+        ) {
             return false;
         }
 
-        $characterClasses = [
-            'Uppercase'    => '[A-Z]',
-            'Lowercase'    => '[a-z]',
-            'Digits'       => '\\d',
-            'SpecialChars' => '[' . preg_quote(self::PASSWORD_SPECIAL_CHARS, '/') . ']',
+        // Byte-level counts are exact here: in valid UTF-8 no byte of a multi-byte character
+        // falls in the ASCII range, so an accented letter can never be counted as [A-Za-z0-9].
+        $counts = [
+            'Length'       => mb_strlen($password, 'UTF-8'),
+            'Uppercase'    => preg_match_all('/[A-Z]/', $password),
+            'Lowercase'    => preg_match_all('/[a-z]/', $password),
+            'Digits'       => preg_match_all('/[0-9]/', $password),
+            'SpecialChars' => preg_match_all('/[' . preg_quote(self::PASSWORD_SPECIAL_CHARS, '/') . ']/', $password),
         ];
 
-        $regex = '/^';
-        foreach ($characterClasses as $suffix => $characterClass) {
-            $min = $rules['min' . $suffix];
-            $max = $rules['max' . $suffix];
-
-            // "At least $min": each repetition consumes up to one more member of the class.
-            if ($min > 0) {
-                $regex .= '(?=(?:.*' . $characterClass . '){' . $min . ',})';
+        foreach ($counts as $suffix => $count) {
+            if ($count < $rules['min' . $suffix]) {
+                return false;
             }
-
-            // "At most $max" must be a NEGATIVE lookahead for $max + 1 occurrences. The upper
-            // bound of a {min,max} quantifier inside a POSITIVE lookahead enforces nothing at
-            // all: (?=(?:.*[A-Z]){1,2}) succeeds on a password with 50 uppercase letters,
-            // because matching exactly 1 repetition already satisfies the lookahead. Every
-            // max* rule except maxLength (which is anchored by ^...$ below) was a no-op.
-            if ($max !== "") {
-                $regex .= '(?!(?:.*' . $characterClass . '){' . ($max + 1) . '})';
+            if ($rules['max' . $suffix] !== "" && $count > $rules['max' . $suffix]) {
+                return false;
             }
         }
-        $regex .= '(.{' . $rules['minLength'] . ',' . $rules['maxLength'] . '})$/uD';
 
-        // /u counts characters instead of bytes (a byte count lets a 7-character accented
-        // password satisfy minLength 8). /D anchors $ at the very end (without it a trailing
-        // newline is tolerated and slips past maxLength).
-        return preg_match($regex, $password) === 1;
+        return true;
     }
 
     /**
@@ -255,6 +267,9 @@ class Validator {
      * Any JSON value is accepted, not just objects and arrays: "0", "false", "null" and a bare
      * quoted string are all valid JSON documents and return TRUE. The empty string is NOT valid
      * JSON and returns FALSE.
+     *
+     * Nesting deeper than 512 levels (json_decode()'s default depth) is reported as FALSE, even
+     * when otherwise well-formed. A UTF-8 BOM is not JSON whitespace and makes the input invalid.
      *
      * @param string|null $jsonString The string to test. Null or "" returns FALSE.
      * @return bool TRUE if the string parses as JSON, FALSE otherwise.
@@ -267,7 +282,12 @@ class Validator {
             return false;
         }
 
-        @json_decode($jsonString);
+        // json_validate() (PHP 8.3+) checks without building the decoded value in memory.
+        if (function_exists('json_validate')) {
+            return json_validate($jsonString);
+        }
+
+        json_decode($jsonString);
         return json_last_error() === JSON_ERROR_NONE;
     }
 
@@ -327,8 +347,14 @@ class Validator {
      * That property belongs to this method only — it says nothing about what a caller's own
      * parser will do with the same string afterwards.
      *
-     * The libxml internal-error state is saved and restored, so calling this does not silently
-     * change libxml error handling for the rest of the request.
+     * Only ERROR/FATAL diagnostics count: a libxml WARNING (e.g. a relative namespace URI such as
+     * xmlns="foo") does not make well-formed XML invalid.
+     *
+     * The libxml internal-error flag is saved and restored. Errors a caller had already buffered
+     * (with libxml_use_internal_errors(true)) are neither mistaken for this parse's errors nor
+     * wiped — both used to happen: valid XML was reported invalid because of the caller's stale
+     * errors, which were then cleared. With that flag on, this parse's own errors are appended to
+     * the caller's buffer, as for any other libxml call.
      *
      * @param string|null $xmlContent The string to test. Null, "" or whitespace-only returns
      *                                FALSE.
@@ -345,42 +371,61 @@ class Validator {
         if (
             !extension_loaded('simplexml') ||
             !extension_loaded('libxml') ||
-            empty($xmlContent) ||
+            $xmlContent === '' ||
             stripos($xmlContent, '<!DOCTYPE html>') !== false
         ) {
             return false;
         }
 
         $previousUseInternalErrors = libxml_use_internal_errors(true);
-        simplexml_load_string($xmlContent);
-        $errors = libxml_get_errors();
-        libxml_clear_errors();
+        $alreadyBuffered = count(libxml_get_errors());
+
+        $document = simplexml_load_string($xmlContent);
+
+        $isWellFormed = $document !== false;
+        foreach (array_slice(libxml_get_errors(), $alreadyBuffered) as $error) {
+            if ($error->level >= LIBXML_ERR_ERROR) {
+                $isWellFormed = false;
+                break;
+            }
+        }
+
+        if (!$previousUseInternalErrors) {
+            // The buffer only exists because it was switched on above: everything in it is ours.
+            libxml_clear_errors();
+        }
         libxml_use_internal_errors($previousUseInternalErrors);
 
-        return empty($errors);
+        return $isWellFormed;
     }
 
     /**
      * Checks whether a value is ABSENT, as opposed to merely falsy.
      *
      * This is deliberately NOT PHP's empty(). A value counts as empty here only when it is one
-     * of: null, "", "\0", an empty array, or an object with no properties.
+     * of: null, "", "\0", an empty array, or an object with no properties — except that an object
+     * implementing __toString() is judged by its string form (a property-less value object that
+     * renders as "yes" is present).
      *
      * Every other value is reported as PRESENT (FALSE) — including the falsy scalars 0, 0.0,
-     * "0" and false. That is the whole point of the method: it is meant to back required-field
-     * guards, and empty() would wrongly reject a legitimately submitted 0 or false. Note that
-     * boolean false is present here, not just numeric zero; a submitted `false` is a value, not
-     * an absence.
+     * "0" and false, and a whitespace-only string such as " ". That is the whole point of the
+     * method: it is meant to back required-field guards, and empty() would wrongly reject a
+     * legitimately submitted 0 or false. Note that boolean false is present here, not just
+     * numeric zero; a submitted `false` is a value, not an absence.
      *
-     * Contrast isCompletelyEmpty(), the lenient sibling, which DOES report 0, "0" and false as
-     * empty.
+     * Contrast isCompletelyEmpty(), the lenient sibling, which DOES report 0, "0", false and
+     * whitespace-only strings as empty.
      *
-     * @param mixed $value Value to check. Every type is accepted; no string cast is performed,
-     *                     so arrays and objects are safe to pass.
+     * @param mixed $value Value to check. Every type is accepted; arrays and non-Stringable
+     *                     objects are never cast to string, so they are safe to pass.
      * @return bool TRUE only if the value is absent (per the list above); FALSE for every
      *              present value, falsy scalars included.
      */
-    public static function emptyExceptZero($value): bool {
+    public static function emptyExceptZero(mixed $value): bool {
+        if ($value instanceof \Stringable) {
+            $value = (string) $value;
+        }
+
         return
             $value === null ||
             $value === "" ||
@@ -396,28 +441,45 @@ class Validator {
     }
 
     /**
-     * Checks whether a property/key exists on an object, or on an array (cast to an object).
+     * Checks whether a property/key exists on an array, an ArrayAccess object, or any object.
      *
-     * VISIBILITY IS IGNORED: this reports declared private and protected properties as existing,
-     * because it is built on property_exists(). `hasProperty('secret', $obj)` returning TRUE
-     * does NOT mean `$obj->secret` is readable from the caller's scope — that would raise an
-     * Error. Use it to test for a property's existence, not its accessibility.
+     *  - array: the key exists (array_key_exists() semantics — a key holding null EXISTS). Integer
+     *    keys are matched by their string form: hasProperty('0', [0 => 'a']) is TRUE.
+     *  - ArrayAccess (ArrayObject, collections...): offsetExists() is asked first, so the
+     *    object's offsets count; its declared properties count too.
+     *  - any other object: property_exists().
+     *  - anything else (null, scalars, resources): FALSE, never a TypeError.
      *
-     * For an array, the key is matched after a cast to object, so integer keys are matched by
-     * their string form: hasProperty('0', [0 => 'a']) is TRUE.
+     * VISIBILITY IS IGNORED for objects: this reports declared private and protected properties
+     * as existing, because it is built on property_exists(). `hasProperty('secret', $obj)`
+     * returning TRUE does NOT mean `$obj->secret` is readable from the caller's scope. Properties
+     * served only through __get()/__isset() are NOT seen.
      *
      * @param string $property Property/key name to look for.
-     * @param array|object $target The array or object to inspect. An empty array returns FALSE.
+     * @param mixed $target The value to inspect.
      * @return bool TRUE if the property/key exists, FALSE otherwise.
      */
-    public static function hasProperty(string $property, array|object $target): bool {
-        if (empty($target)) {
+    public static function hasProperty(string $property, mixed $target): bool {
+        if (is_array($target)) {
+            // A lookup, not a cast: `(object) $target` copied the whole array on every call.
+            return array_key_exists($property, $target);
+        }
+
+        if (!is_object($target)) {
             return false;
         }
 
-        if (is_array($target)) {
-            $target = (object) $target;
+        if ($target instanceof \ArrayAccess) {
+            try {
+                if ($target->offsetExists($property)) {
+                    return true;
+                }
+            } catch (\Throwable) {
+                // Some implementations reject a string offset outright (SplFixedArray throws a
+                // TypeError): such an object has no offset of that name.
+            }
         }
+
         return property_exists($target, $property);
     }
 
@@ -438,8 +500,6 @@ class Validator {
     public static function isNumericArray(array $array): bool {
         if (empty($array)) return false;
 
-        // Previously this read only the FIRST key (reset()+key()), so [0 => 'a', 'name' => 'b']
-        // reported TRUE and the answer flipped with insertion order.
         foreach ($array as $key => $ignored) {
             if (!is_int($key)) {
                 return false;
@@ -456,14 +516,15 @@ class Validator {
      * TRUE for all of:
      *   - everything emptyExceptZero() calls absent (null, "", "\0", empty array/object);
      *   - boolean false;
-     *   - numeric zero in any notation: 0, 0.0, "0", "0.0", "00", " 0 ";
-     *   - these placeholders, ignoring case and ALL whitespace: "undefined", "null", "false",
-     *     "{}", "[]", "n", "no", "tno".
+     *   - a string made only of ASCII whitespace (" ", "\t\n");
+     *   - numeric zero in any notation: 0, 0.0, "0", "0.0", "00", "-0", " 0 ";
+     *   - these placeholders, ignoring case and ALL ASCII whitespace (internal too, so "n o" is
+     *     "no"): "undefined", "null", "false", "{}", "[]", "n", "no", "tno".
      *
-     * FALSE for every other value, including a NON-EMPTY array or object — such a value holds
-     * content, so it is not empty. (Previously any non-empty array raised E_WARNING "Array to
-     * string conversion" here and any object threw an Error, because the `mixed` value was cast
-     * to string with no guard. An object with __toString is still evaluated by its string form.)
+     * FALSE for every other value, including a NON-EMPTY array or a non-Stringable object — such
+     * a value holds content, so it is not empty. An object with __toString() is judged ONLY by
+     * its string form (it used to be reported empty whenever it had no properties, whatever it
+     * rendered as).
      *
      * Numeric zero is what separates this from emptyExceptZero(), which reports zero as PRESENT.
      * Pick deliberately: this method backs Parser::getBool() and Security's `asBoolean` sanitize
@@ -476,33 +537,33 @@ class Validator {
      * @return bool TRUE if considered completely empty, FALSE otherwise.
      */
     public static function isCompletelyEmpty(mixed $value): bool {
+        if ($value instanceof \Stringable) {
+            $value = (string) $value;
+        }
+
         if (self::emptyExceptZero($value) || $value === false) {
             return true;
         }
 
         // A non-empty array/object/resource is content. Guard BEFORE any string cast: casting
         // an array warns, and casting an object without __toString throws.
-        if (
-            is_array($value) ||
-            is_resource($value) ||
-            (is_object($value) && !$value instanceof \Stringable)
-        ) {
+        if (is_array($value) || is_object($value) || is_resource($value)) {
             return false;
         }
 
         $stringValue = (string) $value;
 
         // Numeric zero, whatever the notation. This has to test `!== false` explicitly:
-        // filter_var() returns a falsy int(0)/float(0) for exactly the zero we are looking for,
-        // so the old truthiness test could never fire and no zero was ever detected.
-        $asFloat = filter_var($stringValue, FILTER_VALIDATE_FLOAT);
-        if ($asFloat !== false && $asFloat === 0.0) {
+        // filter_var() returns a falsy int(0)/float(0) for exactly the zero we are looking for.
+        if (filter_var($stringValue, FILTER_VALIDATE_FLOAT) === 0.0) {
             return true;
         }
 
-        $normalized = Str::strToUpper(Str::removeExcessSpaces($stringValue, false));
+        // Whitespace-only collapses to "" here — it used to stay "not empty" even though the
+        // same stripping already made "  n o  " empty.
+        $normalized = strtoupper(preg_replace('/\s+/', '', $stringValue));
 
-        return in_array($normalized, self::COMPLETELY_EMPTY_SENTINELS, true);
+        return $normalized === '' || in_array($normalized, self::COMPLETELY_EMPTY_SENTINELS, true);
     }
 
     /**
@@ -510,13 +571,16 @@ class Validator {
      *
      * This is a LEADING-SIGN test, not a numeric test: it does not check that the value is a
      * number, so isNegativeNumber("-abc") is TRUE and isNegativeNumber("1-2") is FALSE. All
-     * whitespace is stripped before the test, so " - 5" is TRUE.
+     * ASCII whitespace is stripped before the test, so " - 5" is TRUE.
+     *
+     * Both the ASCII hyphen-minus "-" and the Unicode MINUS SIGN "−" (U+2212, what typeset
+     * documents and some locales' number formatters emit) count as a minus.
      *
      * @param mixed $value The value to check. Every type is accepted and none of them throws;
      *                     arrays and objects without __toString are simply FALSE (they have no
      *                     meaningful string form, and casting them used to raise E_WARNING /
      *                     throw an Error). Any value PHP considers empty is FALSE.
-     * @return bool TRUE if the string form starts with "-", FALSE otherwise.
+     * @return bool TRUE if the string form starts with a minus sign, FALSE otherwise.
      *
      * @see https://stackoverflow.com/questions/15814592/how-do-i-include-negative-decimal-numbers-in-this-regular-expression
      */
@@ -533,17 +597,21 @@ class Validator {
             return false;
         }
 
-        return Str::subStr(Str::removeExcessSpaces((string) $value, false), 0, 1) === "-";
+        $compact = preg_replace('/\s+/', '', (string) $value);
+
+        return str_starts_with($compact, '-') || str_starts_with($compact, "\u{2212}");
     }
 
     /**
      * Validates a Brazilian CPF number, including its two check digits.
      *
-     * Punctuation and separators are ignored, so both "529.982.247-25" and "52998224725" are
-     * accepted. After stripping non-digits the value must be EXACTLY 11 digits: a shorter
-     * string is rejected, NOT zero-padded. (It used to be left-padded to 11, which made
-     * validateCpf("191") return TRUE — "191" padded to "00000000191", a checksum-valid CPF.
-     * That is a validator failing open on the very field it exists to protect.)
+     * Only digits and the mask separators "." "-" "/" and ASCII whitespace are accepted, so both
+     * "529.982.247-25" and "52998224725" are valid. ANY other character makes the value invalid:
+     * "52998224725abc" and "CPF: 529.982.247-25" used to validate because every non-digit was
+     * silently discarded — a caller storing the raw input persisted the garbage too.
+     *
+     * After dropping the separators the value must be EXACTLY 11 digits: a shorter string is
+     * rejected, NOT zero-padded ("191" padded to "00000000191" is checksum-valid).
      *
      * CPFs whose digits are all the same ("111.111.111-11") are rejected: they satisfy the
      * checksum but are not valid CPFs.
@@ -557,37 +625,40 @@ class Validator {
      * @see https://www.geradorcpf.com/script-validar-cpf-php.htm
      */
     public static function validateCpf(string $cpf): bool {
-        $cpf = Str::onlyNumbers($cpf);
-        if (Str::strLen($cpf) !== 11 || preg_match('/^(\d)\1{10}$/', $cpf)) {
+        $cpf = self::stripDocumentMask($cpf);
+        if ($cpf === null || preg_match('/^\d{11}$/D', $cpf) !== 1 || preg_match('/^(\d)\1{10}$/', $cpf)) {
             return false;
         }
 
         for ($t = 9; $t < 11; $t++) {
             $d = 0;
             for ($c = 0; $c < $t; $c++) {
-                $d += $cpf[$c] * (($t + 1) - $c);
+                $d += (int) $cpf[$c] * (($t + 1) - $c);
             }
             $d = ((10 * $d) % 11) % 10;
-            if ($cpf[$c] != $d) return false;
+            if ((int) $cpf[$c] !== $d) return false;
         }
 
         return true;
     }
 
     /**
-     * Validates a Brazilian CNPJ number, including its two check digits.
+     * Validates a Brazilian CNPJ number, including its two check digits — in both the classic
+     * all-numeric format and the ALPHANUMERIC format the Receita Federal issues from July 2026
+     * (IN RFB 2.229/2024).
      *
-     * Punctuation and separators are ignored, so both "11.222.333/0001-81" and "11222333000181"
-     * are accepted. (The computed digits used to be compared against the caller's RAW argument
-     * while the digits were derived from the normalized one, so every correctly MASKED CNPJ —
-     * the form humans actually type — was rejected, even though validateCpf accepted masks.)
+     * Only the mask separators "." "-" "/" and ASCII whitespace are dropped, so
+     * "11.222.333/0001-81", "11222333000181" and "12.ABC.345/01DE-35" are all valid. Any other
+     * character makes the value invalid (it used to be silently discarded).
      *
-     * After stripping non-digits the value must be EXACTLY 14 digits. CNPJs whose digits are all
-     * the same are rejected: "00000000000000" satisfies the checksum but is not a valid CNPJ,
-     * and it used to return TRUE.
+     * After dropping the separators the value must be exactly 14 characters: 12 of [0-9A-Z]
+     * (root + branch) followed by 2 check DIGITS. Letters must be UPPERCASE, as issued — pass the
+     * value through strtoupper() first if your input may be lowercase. Each character weighs its
+     * ASCII code minus 48 ('0' = 0 ... '9' = 9, 'A' = 17 ... 'Z' = 42), which leaves the classic
+     * numeric CNPJ computation unchanged. (Alphanumeric CNPJs used to be rejected outright.)
      *
-     * Only the classic all-numeric CNPJ is supported. The alphanumeric CNPJ format is NOT
-     * handled — its letters are stripped by normalization, so such a value is rejected.
+     * CNPJs whose characters are all the same are rejected: "00000000000000" satisfies the
+     * checksum but is not a valid CNPJ.
      *
      * Validates STRUCTURE only — a true here means the number is well-formed, not that it is
      * registered or active.
@@ -595,56 +666,69 @@ class Validator {
      * @param string $cnpj CNPJ number, masked or bare.
      * @return bool TRUE if the CNPJ is structurally valid, FALSE otherwise.
      *
-     * @see https://www.todoespacoonline.com/w/2014/08/validar-cnpj-com-php/
+     * @see https://www.gov.br/receitafederal/pt-br/acesso-a-informacao/acoes-e-programas/programas-e-atividades/cnpj-alfanumerico
      */
     public static function validateCnpj(string $cnpj): bool {
-        $digits = Str::onlyNumbers($cnpj);
-        if (Str::strLen($digits) !== 14 || preg_match('/^(\d)\1{13}$/', $digits)) {
+        $cnpj = self::stripDocumentMask($cnpj);
+        if ($cnpj === null || preg_match('/^[0-9A-Z]{12}\d{2}$/D', $cnpj) !== 1 || preg_match('/^(.)\1{13}$/', $cnpj)) {
             return false;
         }
 
-        $base = Str::subStr($digits, 0, 12);
-        $calculate = function (string $number, int $position = 5): int {
+        $checkDigit = function (string $base): int {
             $sum = 0;
-            for ($i = 0; $i < Str::strLen($number); $i++) {
-                $sum += $number[$i] * $position;
-                $position = ($position - 1 < 2) ? 9 : $position - 1;
+            $weight = 2;
+            for ($i = strlen($base) - 1; $i >= 0; $i--) {
+                $sum += (ord($base[$i]) - 48) * $weight;
+                $weight = $weight === 9 ? 2 : $weight + 1;
             }
-            return $sum;
+            $remainder = $sum % 11;
+            return $remainder < 2 ? 0 : 11 - $remainder;
         };
 
-        $firstCheck = $calculate($base);
-        $firstDigit = ($firstCheck % 11) < 2 ? 0 : 11 - ($firstCheck % 11);
+        $base = substr($cnpj, 0, 12);
+        $base .= $checkDigit($base);
+        $base .= $checkDigit($base);
 
-        $base .= $firstDigit;
-
-        $secondCheck = $calculate($base, 6);
-        $secondDigit = ($secondCheck % 11) < 2 ? 0 : 11 - ($secondCheck % 11);
-
-        return ($base . $secondDigit) === $digits;
+        return $base === $cnpj;
     }
 
     /**
-     * Checks whether a given string contains HTML/XML TAGS.
+     * Checks whether a given string contains HTML/XML markup: an opening or closing TAG
+     * ("<p>", "</p>", "<br/>", '<a href="x">'), a comment or declaration ("<!--", "<!DOCTYPE",
+     * "<![CDATA["), or a processing instruction ("<?xml", "<?php").
      *
-     * Heuristic: the string is compared with its strip_tags() output; if they differ, a tag was
-     * removed. It therefore detects TAGS only. HTML entities are not tags, so "&amp;" is FALSE,
-     * and a bare comparison such as "5 < 6" is FALSE too.
+     * A tag must start with a letter after "<" (or "</") and be closed by ">". So a bare
+     * comparison is not markup whether or not it is spaced ("5 < 6", "1<2", "a<b", "I <3 you"),
+     * and neither is an entity ("&amp;", "&lt;script&gt;"). (The old strip_tags() comparison
+     * reported "1<2" and "<3" as HTML, and any string containing a NUL byte — strip_tags() drops
+     * NUL — as HTML too.)
      *
      * NOT a security check. A FALSE here does not mean the string is safe to render, and a TRUE
      * does not mean it is dangerous — use Security::xssClean() to sanitize output. Do not build
      * an XSS guard on this method.
      *
      * @param string|null $text The string to test. Null or "" returns FALSE.
-     * @return bool TRUE if the string contains at least one tag, FALSE otherwise.
+     * @return bool TRUE if the string contains markup, FALSE otherwise.
      *
      * @link https://subinsb.com/php-check-if-string-is-html/
      */
     public static function validateHtml(?string $text): bool {
-        if (empty($text)) {
+        if ($text === null || $text === '') {
             return false;
         }
 
-        return $text !== strip_tags($text);
+        // Linear: every alternative is anchored on a literal and [^<>]* cannot backtrack into
+        // another '<'.
+        return preg_match('/<(?:\/?[a-zA-Z][^<>]*>|!--|![a-zA-Z\[]|\?[a-zA-Z])/', $text) === 1;
+    }
+
+    /**
+     * Drops the separators a CPF/CNPJ mask may carry ("." "-" "/" and ASCII whitespace).
+     *
+     * @return string|null The remaining characters, or null when nothing is left.
+     */
+    private static function stripDocumentMask(string $document): ?string {
+        $stripped = preg_replace('/[.\-\/\s]+/', '', $document);
+        return ($stripped === null || $stripped === '') ? null : $stripped;
     }
 }

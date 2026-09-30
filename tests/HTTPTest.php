@@ -17,6 +17,10 @@ use VD\PHPHelper\HTTP;
  *
  * resolveAndExit() and sendStatusHeader() can terminate the process, so they are exercised in a
  * child process (proc_open) or through the fixture server, never inline.
+ *
+ * The built-in server is SINGLE-THREADED on Windows: a request that stalls it stalls every test
+ * queued behind it, which is why the /slow endpoint watches for the client hanging up instead of
+ * sleeping blindly.
  */
 final class HTTPTest extends TestCase
 {
@@ -127,6 +131,9 @@ final class HTTPTest extends TestCase
     /**
      * The fixture endpoint source. Kept as a string so the whole fixture lives in this one file
      * and is written to a temp dir at run time; nothing is ever added to the repository.
+     *
+     * Every endpoint that calls into the library records PHP diagnostics in the body as
+     * "[WARN:...]", so a test can prove a code path is warning-free under a real web SAPI.
      */
     private static function routerSource(): string
     {
@@ -137,6 +144,11 @@ final class HTTPTest extends TestCase
         require {$autoload};
 
         use VD\\PHPHelper\\HTTP;
+
+        set_error_handler(static function (int \$no, string \$str): bool {
+            echo '[WARN:' . \$str . ']';
+            return true;
+        });
 
         \$path = (string) parse_url(\$_SERVER['REQUEST_URI'], PHP_URL_PATH);
 
@@ -151,18 +163,47 @@ final class HTTPTest extends TestCase
 
         if (\$path === '/redirect') {
             header('X-Hop: first', true, 302);
+            header('X-Only-On-Redirect: yes');
             header('Location: /headers');
+            exit;
+        }
+
+        if (\$path === '/redirect-ftp') {
+            header('Location: ftp://127.0.0.1:' . (int) (\$_GET['port'] ?? 1) . '/x', true, 302);
+            exit;
+        }
+
+        if (\$path === '/head') {
+            // The Content-Length a GET would carry, and a body only for a non-HEAD request.
+            header('Content-Type: text/plain');
+            header('Content-Length: 50');
+            header('X-Method: ' . \$_SERVER['REQUEST_METHOD']);
+            if (\$_SERVER['REQUEST_METHOD'] !== 'HEAD') {
+                echo str_repeat('x', 50);
+            }
             exit;
         }
 
         if (\$path === '/slow') {
             // Announce a body far larger than what is sent, then stall: the status line is
-            // already parsed as 200 by the time the transfer dies.
+            // already parsed as 200 by the time the transfer dies. Trickle a byte at a time so the
+            // client hanging up is NOTICED and this worker is freed at once.
             header('Content-Type: text/plain');
             header('Content-Length: 100');
             echo 'x';
             flush();
-            sleep(5);
+            for (\$i = 0; \$i < 50 && !connection_aborted(); \$i++) {
+                usleep(100000);
+                echo ' ';
+                flush();
+            }
+            exit;
+        }
+
+        if (\$path === '/json-error') {
+            http_response_code(422);
+            header('Content-Type: application/json');
+            echo '{"id":12345678901234567890123,"errors":["bad"]}';
             exit;
         }
 
@@ -172,7 +213,28 @@ final class HTTPTest extends TestCase
             exit;
         }
 
+        if (\$path === '/status-after-output') {
+            echo 'early-output;';
+            flush();
+            \$sent = HTTP::sendStatusHeader(404);
+            echo 'returned=' . var_export(\$sent, true);
+            exit;
+        }
+
         if (\$path === '/resolve') {
+            \$case = \$_GET['case'] ?? '';
+            if (\$case === 'invalid-utf8') {
+                HTTP::resolveAndExit(['s' => "caf\\xE9"]);
+            }
+            if (\$case === 'after-output') {
+                echo 'early;';
+                flush();
+                HTTP::resolveAndExit(['a' => 1]);
+            }
+            if (\$case === 'content-type-preset') {
+                header('Content-Type: text/plain');
+                HTTP::resolveAndExit(['a' => 1]);
+            }
             HTTP::resolveAndExit(['name' => 'x'], isset(\$_GET['xml']));
         }
 
@@ -184,6 +246,8 @@ final class HTTPTest extends TestCase
             'files' => array_map(
                 static fn(array \$f): array => [
                     'name' => \$f['name'],
+                    'full_path' => \$f['full_path'] ?? null,
+                    'type' => \$f['type'],
                     'size' => \$f['size'],
                     'sha' => is_readable(\$f['tmp_name']) ? hash_file('sha256', \$f['tmp_name']) : null,
                 ],
@@ -192,7 +256,8 @@ final class HTTPTest extends TestCase
             'raw' => file_get_contents('php://input'),
             'ctype' => \$_SERVER['CONTENT_TYPE'] ?? '',
             'custom' => \$_SERVER['HTTP_X_CUSTOM'] ?? '',
-        ]);
+            'headers' => getallheaders(),
+        ], JSON_INVALID_UTF8_SUBSTITUTE);
         PHP;
     }
 
@@ -233,6 +298,17 @@ final class HTTPTest extends TestCase
     {
         $decoded = json_decode($raw, true);
         self::assertIsArray($decoded, 'Fixture did not return a JSON object. Raw: ' . $raw);
+        self::assertArrayNotHasKey('cError', $decoded, 'The request failed: ' . $raw);
+
+        return $decoded;
+    }
+
+    /** @return array<string, mixed> The decoded error envelope. */
+    private function decodeEnvelope(string $raw): array
+    {
+        $decoded = json_decode($raw, true);
+        self::assertIsArray($decoded, 'Not a JSON envelope. Raw: ' . $raw);
+        self::assertArrayHasKey('cError', $decoded, 'Expected the error envelope. Raw: ' . $raw);
 
         return $decoded;
     }
@@ -290,6 +366,27 @@ final class HTTPTest extends TestCase
         self::assertSame('POST', $echo['method']);
     }
 
+    /** Any RFC 9110 token is a method, not just the well-known ones. */
+    public function testCallWebServiceAcceptsAnyTokenMethod(): void
+    {
+        $echo = $this->decodeEcho($this->http()->callWebService(self::$baseUrl . '/echo', ' patch '));
+
+        self::assertSame('PATCH', $echo['method']);
+    }
+
+    /**
+     * Pins the fix for: CURLOPT_CUSTOMREQUEST 'HEAD' without CURLOPT_NOBODY makes cURL wait for
+     * the body the Content-Length announces — which a HEAD response never carries. Every HEAD
+     * came back as the error envelope ("end of response with 50 bytes missing"); older libcurl
+     * hung until the timeout instead.
+     */
+    public function testCallWebServiceSendsARealHeadRequest(): void
+    {
+        $raw = $this->http()->callWebService(self::$baseUrl . '/head', 'head', [], [], [], false, [], 5);
+
+        self::assertSame('', $raw, 'A successful HEAD has an empty body, not an error envelope.');
+    }
+
     public function testCallWebServiceFormEncodesArrayBodyByDefault(): void
     {
         $echo = $this->decodeEcho(
@@ -300,13 +397,48 @@ final class HTTPTest extends TestCase
         self::assertStringStartsWith('application/x-www-form-urlencoded', (string) $echo['ctype']);
     }
 
-    public function testCallWebServiceSendsRawJsonBodyWhenUseRawIsTrue(): void
+    /**
+     * Pins the fix for: a raw JSON body went out labelled application/x-www-form-urlencoded
+     * (cURL's default for CURLOPT_POSTFIELDS), which most JSON APIs reject or misparse.
+     */
+    public function testCallWebServiceSendsRawJsonBodyWithJsonContentType(): void
     {
         $echo = $this->decodeEcho(
             $this->http()->callWebService(self::$baseUrl . '/echo', 'POST', [], ['a' => 1], [], true)
         );
 
         self::assertSame('{"a":1}', $echo['raw']);
+        self::assertSame('application/json', $echo['ctype']);
+    }
+
+    /** ...and a Content-Type the caller chose is never overridden. */
+    public function testCallWebServiceKeepsCallerContentTypeForRawJson(): void
+    {
+        $echo = $this->decodeEcho(
+            $this->http()->callWebService(
+                self::$baseUrl . '/echo',
+                'POST',
+                [],
+                ['a' => 1],
+                [],
+                true,
+                ['content-type' => 'application/vnd.api+json']
+            )
+        );
+
+        self::assertSame('application/vnd.api+json', $echo['ctype']);
+    }
+
+    /**
+     * Pins the fix for: json_encode() returned false on invalid UTF-8, the `!empty($postData)`
+     * check read false as "no body", and the POST went out EMPTY while the caller got a 2xx.
+     */
+    public function testCallWebServiceRejectsAnUnencodableRawJsonBodyInsteadOfSendingItEmpty(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('could not be JSON-encoded');
+
+        $this->http()->callWebService(self::$baseUrl . '/echo', 'POST', [], ['s' => "caf\xE9"], [], true);
     }
 
     public function testCallWebServiceSendsStringBodyVerbatim(): void
@@ -316,6 +448,16 @@ final class HTTPTest extends TestCase
         );
 
         self::assertSame('{"raw":true}', $echo['raw']);
+    }
+
+    /** Pins the fix for: `!empty($postData)` dropped the legitimate raw body "0". */
+    public function testCallWebServiceSendsTheStringBodyZero(): void
+    {
+        $echo = $this->decodeEcho(
+            $this->http()->callWebService(self::$baseUrl . '/echo', 'POST', [], '0')
+        );
+
+        self::assertSame('0', $echo['raw']);
     }
 
     public function testCallWebServiceSendsCustomHeaders(): void
@@ -335,14 +477,221 @@ final class HTTPTest extends TestCase
         self::assertSame('custom-value', $echo['custom']);
     }
 
+    // ------------------------------------------- callWebService: request building
+
+    /**
+     * Pins the fix for: libcurl sends CURLOPT_HTTPHEADER lines verbatim, so a CR/LF inside a
+     * header value arrived at the server as a SECOND, attacker-chosen header.
+     *
+     * @return array<string, array{0: array<int|string, mixed>}>
+     */
+    public static function injectedHeaderProvider(): array
+    {
+        return [
+            'CRLF in a value'          => [['X-A' => "v\r\nX-Injected: yes"]],
+            'bare LF in a value'       => [['X-A' => "v\nX-Injected: yes"]],
+            'CRLF in a raw line'       => [["X-A: v\r\nX-Injected: yes"]],
+            'NUL in a value'           => [['X-A' => "v\0w"]],
+            'non-string raw line'      => [[['nested']]],
+        ];
+    }
+
+    #[DataProvider('injectedHeaderProvider')]
+    public function testCallWebServiceRefusesHeadersThatWouldSplitIntoSeveral(array $headers): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+
+        $this->http()->callWebService(self::$baseUrl . '/echo', 'GET', [], [], [], false, $headers);
+    }
+
+    /**
+     * Pins the fix for: the method is written into the request line verbatim, so
+     * "GET /x HTTP/1.1\r\nX-Inj: 1\r\nFoo:" rewrote the request path and injected headers.
+     *
+     * @return array<string, array{0: string}>
+     */
+    public static function invalidMethodProvider(): array
+    {
+        return [
+            'CRLF request smuggling' => ["GET /x HTTP/1.1\r\nX-Inj: 1\r\nFoo:"],
+            'embedded space'         => ['GET /admin'],
+            'embedded LF'            => ["GET\nX: 1"],
+            'separator'              => ['GE(T)'],
+        ];
+    }
+
+    #[DataProvider('invalidMethodProvider')]
+    public function testCallWebServiceRefusesAMethodThatIsNotAToken(string $method): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('method token');
+
+        $this->http()->callWebService(self::$baseUrl . '/echo', $method);
+    }
+
+    /**
+     * Pins the fix for: no CURLOPT_PROTOCOLS, so libcurl honoured file:// — and because a file://
+     * transfer has no HTTP status, the envelope handed the LOCAL FILE back in 'response'.
+     */
+    public function testCallWebServiceRefusesFileUrlsAndLeaksNoLocalContent(): void
+    {
+        $secret = $this->makeTempFile('LOCAL-SECRET-CONTENT');
+
+        $raw = $this->http()->callWebService('file:///' . str_replace('\\', '/', $secret), 'GET', [], [], [], false, [], 5);
+
+        self::assertStringNotContainsString('LOCAL-SECRET-CONTENT', $raw);
+        $envelope = $this->decodeEnvelope($raw);
+        self::assertSame(0, $envelope['cError']['code']);
+        self::assertNull($envelope['response']);
+        self::assertStringContainsStringIgnoringCase('file', $envelope['cError']['msg']);
+    }
+
+    /**
+     * ...and a redirect cannot switch protocols either (CURLOPT_REDIR_PROTOCOLS). Before the fix
+     * cURL followed the Location to ftp:// and reported a connection failure on port 1.
+     */
+    public function testCallWebServiceRefusesToFollowARedirectToANonHttpScheme(): void
+    {
+        $envelope = $this->decodeEnvelope(
+            $this->http()->callWebService(self::$baseUrl . '/redirect-ftp', 'GET', [], [], [], false, [], 5)
+        );
+
+        self::assertSame(302, $envelope['cError']['code']);
+        self::assertStringContainsStringIgnoringCase('ftp', $envelope['cError']['msg']);
+    }
+
+    /**
+     * Pins the fix for: CURLOPT_MAXREDIRS reads -1 as "unlimited" (libcurl 8.16 actually bails
+     * with "Maximum (0) redirects followed"). Negative is now plain "do not follow": the 302
+     * comes back as the envelope with no cURL error.
+     */
+    public function testCallWebServiceTreatsNegativeMaxRedirectsAsDoNotFollow(): void
+    {
+        $envelope = $this->decodeEnvelope(
+            $this->http()->callWebService(self::$baseUrl . '/redirect', 'GET', [], [], [], false, [], 5, null, null, CURL_HTTP_VERSION_NONE, '', -1)
+        );
+
+        self::assertSame(302, $envelope['cError']['code']);
+        self::assertSame('', $envelope['cError']['msg']);
+    }
+
+    /**
+     * TLS certificate verification is ON unless the caller explicitly turns it off. Proven against a
+     * loopback HTTPS server presenting a SELF-SIGNED certificate: the default call must refuse it,
+     * and only the explicit $sslHost = 0 / $sslPeer = 0 opt-out may reach it.
+     */
+    public function testCallWebServiceVerifiesTlsCertificatesByDefault(): void
+    {
+        [$process, $pipes, $port] = $this->startSelfSignedTlsServer();
+
+        try {
+            $default = $this->decodeEnvelope(
+                $this->http()->callWebService('https://127.0.0.1:' . $port . '/', 'GET', [], [], [], false, [], 5)
+            );
+            $optedOut = $this->http()->callWebService('https://127.0.0.1:' . $port . '/', 'GET', [], [], [], false, [], 5, 0, 0);
+        } finally {
+            proc_terminate($process);
+            foreach ($pipes as $pipe) {
+                fclose($pipe);
+            }
+            proc_close($process);
+        }
+
+        self::assertSame(0, $default['cError']['code']);
+        self::assertStringContainsStringIgnoringCase('certificate', $default['cError']['msg']);
+        self::assertNull($default['response']);
+        self::assertSame('TLS-HELLO', $optedOut, 'The explicit opt-out is the only way through.');
+    }
+
+    /**
+     * Spawns a one-shot HTTPS server with a freshly generated self-signed certificate. It serves
+     * two connections (a handshake the client aborts counts as one) or gives up after 10s.
+     *
+     * @return array{0: resource, 1: array<int, resource>, 2: int}
+     */
+    private function startSelfSignedTlsServer(): array
+    {
+        if (!extension_loaded('openssl')) {
+            self::markTestSkipped('ext-openssl is needed to build the TLS fixture.');
+        }
+
+        $conf = self::$fixtureDir . DIRECTORY_SEPARATOR . 'tls-openssl.cnf';
+        file_put_contents($conf, "[req]\ndistinguished_name = dn\n[dn]\n");
+        // An explicit config: Windows PHP builds ship without a default openssl.cnf.
+        $options = ['private_key_bits' => 2048, 'private_key_type' => OPENSSL_KEYTYPE_RSA, 'digest_alg' => 'sha256', 'config' => $conf];
+
+        $key = openssl_pkey_new($options);
+        $csr = $key === false ? false : openssl_csr_new(['commonName' => '127.0.0.1'], $key, $options);
+        $cert = $csr === false ? false : openssl_csr_sign($csr, null, $key, 1, $options);
+        if ($cert === false || !openssl_x509_export($cert, $certPem) || !openssl_pkey_export($key, $keyPem, null, $options)) {
+            while (openssl_error_string() !== false) {
+            }
+            self::markTestSkipped('Could not generate a self-signed certificate here.');
+        }
+        while (openssl_error_string() !== false) {
+        }
+
+        $pem = self::$fixtureDir . DIRECTORY_SEPARATOR . 'tls-server.pem';
+        $script = self::$fixtureDir . DIRECTORY_SEPARATOR . 'tls-server.php';
+        $portFile = self::$fixtureDir . DIRECTORY_SEPARATOR . 'tls-port-' . bin2hex(random_bytes(4));
+        file_put_contents($pem, $certPem . $keyPem);
+        file_put_contents($script, <<<'SRV'
+        <?php
+        [, $pem, $portFile] = $argv;
+        $context = stream_context_create(['ssl' => ['local_cert' => $pem, 'verify_peer' => false]]);
+        $server = stream_socket_server('ssl://127.0.0.1:0', $errno, $errstr, STREAM_SERVER_BIND | STREAM_SERVER_LISTEN, $context);
+        $name = (string) stream_socket_get_name($server, false);
+        file_put_contents($portFile, (string) (int) substr($name, (int) strrpos($name, ':') + 1));
+        $deadline = microtime(true) + 10;
+        for ($served = 0; $served < 2 && microtime(true) < $deadline; $served++) {
+            $connection = @stream_socket_accept($server, 2);
+            if ($connection === false) {
+                continue;
+            }
+            stream_set_timeout($connection, 2);
+            while (($line = fgets($connection)) !== false && rtrim($line) !== '') {
+            }
+            fwrite($connection, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: close\r\n\r\nTLS-HELLO");
+            fclose($connection);
+        }
+        SRV);
+
+        $process = proc_open([PHP_BINARY, $script, $pem, $portFile], [['pipe', 'r'], ['pipe', 'w'], ['pipe', 'w']], $pipes);
+        self::assertIsResource($process, 'Could not spawn the TLS fixture.');
+
+        $port = 0;
+        for ($deadline = microtime(true) + 5; $port === 0 && microtime(true) < $deadline; usleep(20_000)) {
+            $port = (int) @file_get_contents($portFile);
+        }
+        if ($port === 0) {
+            proc_terminate($process);
+            proc_close($process);
+            self::markTestSkipped('The TLS fixture never reported a port.');
+        }
+
+        return [$process, $pipes, $port];
+    }
+
+    public function testCallWebServiceFollowsRedirectsByDefault(): void
+    {
+        $raw = $this->http()->callWebService(self::$baseUrl . '/redirect');
+
+        self::assertSame('{"ok":true}', $raw);
+    }
+
     // -------------------------------------------------- callWebService: uploads
 
     /**
-     * Pins the fix for: the legacy "@/path" CURLOPT_POSTFIELDS syntax has been inert since
-     * CURLOPT_SAFE_UPLOAD defaulted to true (PHP 5.6). The old code uploaded NOTHING while
-     * leaking the server's absolute filesystem path into the request body.
+     * Pins TWO path leaks. The legacy "@/path" CURLOPT_POSTFIELDS syntax (inert since
+     * CURLOPT_SAFE_UPLOAD defaulted to true) uploaded nothing and put the path in the body; its
+     * CURLFile replacement then announced the file under its ABSOLUTE LOCAL PATH, because
+     * CURLFile's postname defaults to the path it was built from.
+     *
+     * The old version of this test asserted the path was absent from php://input — which PHP
+     * leaves EMPTY for every multipart/form-data request, so that assertion could never fail.
+     * $_FILES[...]['full_path'] is where a PHP receiver actually sees the announced filename.
      */
-    public function testCallWebServiceUploadsFileAsMultipartInsteadOfLeakingLocalPath(): void
+    public function testCallWebServiceUploadsFileAsMultipartUnderItsBasenameOnly(): void
     {
         $file = $this->makeTempFile('FILECONTENT-1234', '.pdf');
 
@@ -356,7 +705,8 @@ final class HTTPTest extends TestCase
         self::assertStringStartsWith('multipart/form-data', (string) $echo['ctype']);
 
         // The local absolute path must never be disclosed to the remote endpoint.
-        self::assertStringNotContainsString(basename($file), (string) $echo['raw']);
+        self::assertSame(basename($file), $echo['files']['avatar']['full_path']);
+        self::assertStringNotContainsString(dirname($file), (string) $echo['files']['avatar']['full_path']);
         self::assertSame([], $echo['post']);
     }
 
@@ -378,6 +728,71 @@ final class HTTPTest extends TestCase
         self::assertArrayHasKey('doc', $echo['files']);
     }
 
+    /**
+     * Pins the fix for: cURL cannot express a nested array in multipart, and PHP's binding
+     * silently dropped the inner key — ['meta' => ['id' => 7]] arrived as meta=7.
+     */
+    public function testCallWebServiceKeepsNestedFieldNamesInAMultipartBody(): void
+    {
+        $file = $this->makeTempFile('x', '.txt');
+
+        $echo = $this->decodeEcho(
+            $this->http()->callWebService(
+                self::$baseUrl . '/echo',
+                'POST',
+                [],
+                ['meta' => ['id' => 7, 'tags' => ['a', 'b']], 'flag' => true, 'skip' => null],
+                ['doc' => $file]
+            )
+        );
+
+        self::assertSame(['meta' => ['id' => '7', 'tags' => ['a', 'b']], 'flag' => '1'], $echo['post']);
+    }
+
+    /**
+     * Pins the fix for: a \CURLFile placed in $postData (the idiomatic cURL way) was run through
+     * http_build_query(), which serialises its public properties — the request body carried the
+     * file's ABSOLUTE LOCAL PATH and nothing was uploaded.
+     */
+    public function testCallWebServiceUploadsACurlFileGivenInPostData(): void
+    {
+        $file = $this->makeTempFile('VIA-POSTDATA', '.bin');
+
+        $echo = $this->decodeEcho(
+            $this->http()->callWebService(
+                self::$baseUrl . '/echo',
+                'POST',
+                [],
+                ['doc' => new \CURLFile($file, 'text/plain', 'report.txt'), 'x' => '1']
+            )
+        );
+
+        self::assertSame(['x' => '1'], $echo['post']);
+        self::assertSame('report.txt', $echo['files']['doc']['name']);
+        self::assertSame('text/plain', $echo['files']['doc']['type']);
+        self::assertSame(hash('sha256', 'VIA-POSTDATA'), $echo['files']['doc']['sha']);
+        self::assertStringNotContainsString(dirname($file), json_encode($echo));
+    }
+
+    /** A \CURLFile in $files is used as-is, so the caller can choose the announced name and type. */
+    public function testCallWebServiceAcceptsACurlFileInFiles(): void
+    {
+        $file = $this->makeTempFile('X', '.tmp');
+
+        $echo = $this->decodeEcho(
+            $this->http()->callWebService(
+                self::$baseUrl . '/echo',
+                'POST',
+                [],
+                [],
+                ['doc' => new \CURLFile($file, 'application/pdf', 'invoice.pdf')]
+            )
+        );
+
+        self::assertSame('invoice.pdf', $echo['files']['doc']['name']);
+        self::assertSame('application/pdf', $echo['files']['doc']['type']);
+    }
+
     /** The 'f_' prefix on numerically-keyed $files arrays is documented; pin it. */
     public function testCallWebServicePrefixesNumericallyKeyedFilesWithFUnderscore(): void
     {
@@ -390,21 +805,56 @@ final class HTTPTest extends TestCase
         self::assertArrayHasKey('f_0', $echo['files']);
     }
 
-    /** Documented behaviour: a path that resolves to nothing is silently skipped. */
-    public function testCallWebServiceSilentlySkipsUnresolvableFilePaths(): void
+    /**
+     * A quote or line break in a multipart FIELD NAME cannot break out of the Content-Disposition
+     * header: libcurl percent-encodes them. Pinned so a libcurl or binding change that stops doing
+     * so is noticed.
+     */
+    public function testCallWebServiceMultipartFieldNamesCannotInjectPartHeaders(): void
     {
+        $file = $this->makeTempFile('DATA', '.txt');
+
         $echo = $this->decodeEcho(
             $this->http()->callWebService(
                 self::$baseUrl . '/echo',
                 'POST',
                 [],
-                ['a' => '1'],
-                ['ghost' => sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'does-not-exist-' . bin2hex(random_bytes(6))]
+                ["k\"ey\r\nX-Evil: 1" => 'v'],
+                ["fi\"le\r\nX-Evil: 1" => $file]
             )
         );
 
-        self::assertSame([], $echo['files']);
-        self::assertSame(['a' => '1'], $echo['post'], 'With no resolvable upload the body must stay form-encoded.');
+        self::assertSame(['k%22ey%0D%0AX-Evil:_1' => 'v'], $echo['post']);
+        self::assertSame(['fi%22le%0D%0AX-Evil:_1'], array_keys($echo['files']));
+    }
+
+    /**
+     * Pins the fix for: a path that resolved to nothing was SILENTLY SKIPPED, so the request went
+     * out without the upload and the caller got a 2xx. '' resolved to the working DIRECTORY, a
+     * directory made cURL abort with "operation aborted by callback", null raised a deprecation
+     * and a NUL byte or an array escaped as a ValueError/TypeError.
+     *
+     * @return array<string, array{0: mixed}>
+     */
+    public static function unusableUploadProvider(): array
+    {
+        return [
+            'missing file'  => [sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'does-not-exist-' . bin2hex(random_bytes(6))],
+            'empty string'  => [''],
+            'a directory'   => [sys_get_temp_dir()],
+            'null'          => [null],
+            'NUL byte'      => ["a\0b"],
+            'an array'      => [['x']],
+        ];
+    }
+
+    #[DataProvider('unusableUploadProvider')]
+    public function testCallWebServiceRejectsAnUploadThatIsNotAReadableFile(mixed $file): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage("\$files['ghost']");
+
+        $this->http()->callWebService(self::$baseUrl . '/echo', 'POST', [], ['a' => '1'], ['ghost' => $file]);
     }
 
     /**
@@ -432,13 +882,11 @@ final class HTTPTest extends TestCase
      */
     public function testCallWebServiceReturnsErrorEnvelopeWhenTransferDiesAfterSuccessfulStatusLine(): void
     {
-        $raw = $this->http()->callWebService(self::$baseUrl . '/slow', 'GET', [], [], [], false, [], 2);
+        $raw = $this->http()->callWebService(self::$baseUrl . '/slow', 'GET', [], [], [], false, [], 1);
 
         self::assertNotSame('', $raw, 'A failed transfer must never return an empty string.');
 
-        $decoded = json_decode($raw, true);
-        self::assertIsArray($decoded);
-        self::assertArrayHasKey('cError', $decoded);
+        $decoded = $this->decodeEnvelope($raw);
         self::assertSame(200, $decoded['cError']['code'], 'The status line was parsed before the transfer died.');
         self::assertNotSame('', $decoded['cError']['msg'], 'The cURL error message must be reported.');
         self::assertNull($decoded['response']);
@@ -446,32 +894,38 @@ final class HTTPTest extends TestCase
 
     public function testCallWebServiceReturnsErrorEnvelopeOnNon2xxStatus(): void
     {
-        $raw = $this->http()->callWebService(self::$baseUrl . '/status?code=404');
+        $decoded = $this->decodeEnvelope($this->http()->callWebService(self::$baseUrl . '/status?code=404'));
 
-        $decoded = json_decode($raw, true);
-        self::assertIsArray($decoded);
         self::assertSame(404, $decoded['cError']['code']);
         self::assertSame('', $decoded['cError']['msg'], 'The transfer itself succeeded, so there is no cURL error.');
-        self::assertSame('status-body', $decoded['response'], 'The body received must still be handed back.');
+        self::assertSame('status-body', $decoded['response'], 'A non-JSON body is handed back as a string.');
     }
 
-    public function testCallWebServiceErrorEnvelopeDecodesJsonBody(): void
+    /**
+     * A JSON error body is embedded as JSON, not as a string — and VERBATIM. The old version of
+     * this test was titled "DecodesJsonBody" but hit an endpoint whose body is the plain text
+     * "status-body", so it never exercised the JSON branch at all. That branch decoded and
+     * re-encoded the body, which turned 12345678901234567890123 into 1.2345678901234568e+22.
+     */
+    public function testCallWebServiceErrorEnvelopeEmbedsAJsonBodyLosslessly(): void
     {
-        $raw = $this->http()->callWebService(self::$baseUrl . '/status?code=500');
-        $decoded = json_decode($raw, true);
+        $raw = $this->http()->callWebService(self::$baseUrl . '/json-error');
 
-        self::assertSame(500, $decoded['cError']['code']);
-        self::assertSame('status-body', $decoded['response']);
+        self::assertStringContainsString('"response":{"id":12345678901234567890123,"errors":["bad"]}', $raw);
+
+        $decoded = json_decode($raw, true, 512, JSON_BIGINT_AS_STRING);
+        self::assertSame(422, $decoded['cError']['code']);
+        self::assertSame(['id' => '12345678901234567890123', 'errors' => ['bad']], $decoded['response']);
     }
 
     public function testCallWebServiceReturnsZeroCodeEnvelopeWhenConnectionIsRefused(): void
     {
         $deadPort = self::findFreePort(); // free == nothing is listening on it
 
-        $raw = $this->http()->callWebService('http://127.0.0.1:' . $deadPort . '/nope', 'GET', [], [], [], false, [], 5);
-        $decoded = json_decode($raw, true);
+        $decoded = $this->decodeEnvelope(
+            $this->http()->callWebService('http://127.0.0.1:' . $deadPort . '/nope', 'GET', [], [], [], false, [], 5)
+        );
 
-        self::assertIsArray($decoded);
         self::assertSame(0, $decoded['cError']['code'], 'No status line was ever received.');
         self::assertNotSame('', $decoded['cError']['msg']);
         self::assertNull($decoded['response']);
@@ -482,6 +936,7 @@ final class HTTPTest extends TestCase
         $raw = $this->http()->callWebService(self::$baseUrl . '/echo');
 
         self::assertStringNotContainsString('cError', $raw);
+        self::assertSame('/echo', json_decode($raw, true)['uri']);
     }
 
     // ------------------------------------------------------------ isHeaderPresent
@@ -543,10 +998,19 @@ final class HTTPTest extends TestCase
         self::assertFalse(HTTP::isHeaderPresent('X-Not-Sent', self::$baseUrl . '/headers'));
     }
 
-    /** Documented: across a redirect chain the FIRST hop's header wins. */
-    public function testIsHeaderPresentReturnsFirstHopHeaderOnRedirectChain(): void
+    /**
+     * BEHAVIOUR CHANGE: across a redirect chain the FINAL response is inspected. The first hop's
+     * header used to win, so asking a redirecting URL for its Content-Type described the 302, not
+     * the resource the chain delivered.
+     */
+    public function testIsHeaderPresentInspectsTheFinalResponseOfARedirectChain(): void
     {
-        self::assertSame('first', HTTP::isHeaderPresent('X-Hop', self::$baseUrl . '/redirect'));
+        self::assertSame('second', HTTP::isHeaderPresent('X-Hop', self::$baseUrl . '/redirect'));
+        self::assertSame('application/json; charset=utf-8', HTTP::isHeaderPresent('Content-Type', self::$baseUrl . '/redirect'));
+        self::assertFalse(
+            HTTP::isHeaderPresent('X-Only-On-Redirect', self::$baseUrl . '/redirect'),
+            'A header only the intermediate 302 carried is not a header of the final response.'
+        );
     }
 
     /**
@@ -566,16 +1030,61 @@ final class HTTPTest extends TestCase
         self::assertFalse(HTTP::isHeaderPresent('Content-Type', 'http://irrelevant.test/x'));
     }
 
+    /**
+     * Only http(s) is fetched. A dead ftp:// port would otherwise cost a connect attempt (seconds
+     * on Windows) and warn; now nothing is attempted.
+     *
+     * @return array<string, array{0: string}>
+     */
+    public static function nonHttpUrlProvider(): array
+    {
+        return [
+            'ftp'        => ['ftp://127.0.0.1:1/x'],
+            'file'       => ['file:///C:/Windows/win.ini'],
+            'php filter' => ['php://filter/resource=' . __FILE__],
+            'no scheme'  => ['127.0.0.1/headers'],
+        ];
+    }
+
+    #[DataProvider('nonHttpUrlProvider')]
+    public function testIsHeaderPresentIgnoresNonHttpUrls(string $url): void
+    {
+        $started = hrtime(true);
+
+        self::assertFalse(HTTP::isHeaderPresent('Content-Type', $url));
+        self::assertLessThan(0.5, (hrtime(true) - $started) / 1e9, 'No connection may be attempted.');
+    }
+
     // ----------------------------------------------------------- sendStatusHeader
 
     /** Documented: a no-op under the CLI SAPI, where there is no response to write to. */
     public function testSendStatusHeaderIsNoOpUnderCli(): void
     {
         $before = headers_list();
-        HTTP::sendStatusHeader(404);
 
+        self::assertFalse(HTTP::sendStatusHeader(404));
         self::assertSame($before, headers_list());
         self::assertTrue(PHP_SAPI === 'cli' || defined('STDIN'), 'This test asserts the CLI guard.');
+    }
+
+    /**
+     * Pins the fix for: 0 sent a 500 and TERMINATED the script with exit(0) — from a helper that
+     * is supposed to set a header — and every other out-of-range code (-1, 42, 1000) produced a
+     * malformed status line. Validation runs before the CLI guard, so it is reachable here.
+     *
+     * @return array<string, array{0: int}>
+     */
+    public static function outOfRangeStatusProvider(): array
+    {
+        return ['zero' => [0], 'negative' => [-1], 'below 100' => [99], 'above 599' => [600], 'huge' => [100000]];
+    }
+
+    #[DataProvider('outOfRangeStatusProvider')]
+    public function testSendStatusHeaderRejectsCodesOutsideTheHttpRange(int $code): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+
+        HTTP::sendStatusHeader($code);
     }
 
     public function testSendStatusHeaderSendsKnownStatusCode(): void
@@ -586,12 +1095,41 @@ final class HTTPTest extends TestCase
         self::assertStringContainsString('404 Not Found', $headers[0]);
     }
 
+    /** 429 and 308 were missing from the table and went out as "Unknown". */
+    public function testSendStatusHeaderKnowsModernStatusCodes(): void
+    {
+        $headers = @get_headers(self::$baseUrl . '/status?code=429');
+
+        self::assertIsArray($headers);
+        self::assertStringContainsString('429 Too Many Requests', $headers[0]);
+    }
+
     public function testSendStatusHeaderSendsCustomReasonPhrase(): void
     {
         $headers = @get_headers(self::$baseUrl . '/status?code=404&msg=' . rawurlencode('Nope Nope'));
 
         self::assertIsArray($headers);
         self::assertStringContainsString('404 Nope Nope', $headers[0]);
+    }
+
+    /**
+     * Pins the fix for: header() REFUSES a line containing a line break ("Header may not contain
+     * more than a single header"), so a custom message with CR/LF sent NO status at all — the
+     * response went out as 200 OK — while also raising a warning.
+     */
+    public function testSendStatusHeaderNeutralisesLineBreaksInTheReasonPhrase(): void
+    {
+        $url = self::$baseUrl . '/status?code=404&msg=' . rawurlencode("Nope\r\nX-Injected: 1");
+        // ignore_errors: the http wrapper otherwise refuses to hand back the body of a 404.
+        $body = @file_get_contents($url, false, stream_context_create(['http' => ['ignore_errors' => true]]));
+        $headers = @get_headers($url);
+
+        self::assertIsArray($headers);
+        self::assertStringContainsString('404 Nope X-Injected: 1', $headers[0]);
+        foreach ($headers as $header) {
+            self::assertStringStartsNotWith('X-Injected', $header);
+        }
+        self::assertSame('status-body', $body, 'No warning may be raised either.');
     }
 
     /** Documented: an unrecognised-but-valid code still goes out, with the phrase "Unknown". */
@@ -601,6 +1139,17 @@ final class HTTPTest extends TestCase
 
         self::assertIsArray($headers);
         self::assertStringContainsString('299 Unknown', $headers[0]);
+    }
+
+    /**
+     * Pins the fix for: once output had started, header() only warned "headers already sent" —
+     * an exception under a strict handler. It now reports FALSE and stays silent.
+     */
+    public function testSendStatusHeaderReturnsFalseSilentlyOnceHeadersAreSent(): void
+    {
+        $body = @file_get_contents(self::$baseUrl . '/status-after-output');
+
+        self::assertSame('early-output;returned=false', $body);
     }
 
     // ---------------------------------------------------------- isXmlHttpRequest
@@ -633,18 +1182,29 @@ final class HTTPTest extends TestCase
         self::assertFalse(HTTP::isXmlHttpRequest());
     }
 
+    /** A non-string $_SERVER entry (set by other code, never by a SAPI) used to be a TypeError. */
+    public function testIsXmlHttpRequestFalseForNonStringValue(): void
+    {
+        $_SERVER['HTTP_X_REQUESTED_WITH'] = ['XMLHttpRequest'];
+
+        self::assertFalse(HTTP::isXmlHttpRequest());
+    }
+
     // ------------------------------------------------------ getClientIpAddresses
 
     /**
      * Pins the fix for: X-Forwarded-For carries a comma-separated proxy chain, and the old code
      * pushed the whole raw header as ONE element while documenting "List of IP addresses" — so
      * filter_var($ips[0], FILTER_VALIDATE_IP) returned false and an INET column write blew up.
+     *
+     * The chain is read nearest-hop first (right to left): the rightmost entry was appended by
+     * the proxy closest to us, the leftmost is whatever the client claimed.
      */
-    public function testGetClientIpAddressesSplitsForwardedForChainIntoIndividualAddresses(): void
+    public function testGetClientIpAddressesSplitsForwardedForChainNearestHopFirst(): void
     {
         $_SERVER = ['HTTP_X_FORWARDED_FOR' => '203.0.113.7, 198.51.100.2, 10.0.0.1'];
 
-        self::assertSame(['203.0.113.7', '198.51.100.2', '10.0.0.1'], HTTP::getClientIpAddresses());
+        self::assertSame(['10.0.0.1', '198.51.100.2', '203.0.113.7'], HTTP::getClientIpAddresses());
     }
 
     public function testGetClientIpAddressesReturnsOnlyValidatableIpAddresses(): void
@@ -659,15 +1219,23 @@ final class HTTPTest extends TestCase
         }
     }
 
-    public function testGetClientIpAddressesOrdersClientControlledHeadersFirstAndDeduplicates(): void
+    /**
+     * BEHAVIOUR CHANGE, security: the client-controlled headers used to come FIRST, so the
+     * natural `$ips[0]` was whatever an attacker put in Client-IP / X-Forwarded-For. The socket
+     * peer — the one value the client cannot forge — is now element 0.
+     */
+    public function testGetClientIpAddressesPutsTheSocketPeerFirstAndSpoofableHeadersLast(): void
     {
         $_SERVER = [
-            'HTTP_CLIENT_IP' => '203.0.113.7',
-            'HTTP_X_FORWARDED_FOR' => '203.0.113.7, 198.51.100.2',
+            'HTTP_CLIENT_IP' => '6.6.6.6',
+            'HTTP_X_FORWARDED_FOR' => '6.6.6.6, 198.51.100.2',
             'REMOTE_ADDR' => '10.0.0.1',
         ];
 
-        self::assertSame(['203.0.113.7', '198.51.100.2', '10.0.0.1'], HTTP::getClientIpAddresses());
+        $ips = HTTP::getClientIpAddresses();
+
+        self::assertSame('10.0.0.1', $ips[0], 'A forged header must never become element 0.');
+        self::assertSame(['10.0.0.1', '198.51.100.2', '6.6.6.6'], $ips, 'De-duplicated, first occurrence wins.');
     }
 
     public function testGetClientIpAddressesAcceptsIpv6(): void
@@ -682,7 +1250,7 @@ final class HTTPTest extends TestCase
         $_SERVER = [];
         self::assertSame([], HTTP::getClientIpAddresses());
 
-        $_SERVER = ['REMOTE_ADDR' => '', 'HTTP_X_FORWARDED_FOR' => ' , , '];
+        $_SERVER = ['REMOTE_ADDR' => '', 'HTTP_X_FORWARDED_FOR' => ' , , ', 'HTTP_CLIENT_IP' => ['1.1.1.1']];
         self::assertSame([], HTTP::getClientIpAddresses());
     }
 
@@ -728,6 +1296,34 @@ final class HTTPTest extends TestCase
         $_SERVER['HTTP_ACCEPT_LANGUAGE'] = 'en;q=0,pt-BR;q=0.5';
 
         self::assertSame('pt-br', HTTP::getBrowserLanguage());
+    }
+
+    /**
+     * Pins the fix for: is_numeric() accepted "1e999" (INF) and "9", both of which outranked a
+     * genuine q=1 entry, and "abc" silently meant q=1. A q above 1 is clamped; an unreadable q
+     * disqualifies its entry.
+     *
+     * @return array<string, array{0: string, 1: string}>
+     */
+    public static function malformedQualityProvider(): array
+    {
+        return [
+            'q above 1 is clamped, header order breaks the tie' => ['en,fr;q=9', 'en'],
+            'exponent'                                           => ['fr;q=1e999,en', 'en'],
+            'not a number'                                       => ['fr;q=abc,en;q=0.1', 'en'],
+            'NAN'                                                => ['fr;q=NAN,en;q=0.5', 'en'],
+            'negative'                                           => ['fr;q=-1,en;q=0.5', 'en'],
+            'empty q'                                            => ['fr;q=,en;q=0.5', 'en'],
+            'three decimals are fine'                            => ['en;q=0.001,fr;q=0.002', 'fr'],
+        ];
+    }
+
+    #[DataProvider('malformedQualityProvider')]
+    public function testGetBrowserLanguageRejectsMalformedQualityValues(string $header, string $expected): void
+    {
+        $_SERVER['HTTP_ACCEPT_LANGUAGE'] = $header;
+
+        self::assertSame($expected, HTTP::getBrowserLanguage());
     }
 
     public function testGetBrowserLanguageFallsBackToEnWhenHeaderAbsent(): void
@@ -789,13 +1385,29 @@ final class HTTPTest extends TestCase
         self::assertSame('{"status":"ok"}', $result['stdout']);
     }
 
-    /** Objects go through Parser::objectToArray() and hit the same previously-dead array branch. */
     public function testResolveAndExitEncodesObjectAsJson(): void
     {
         $result = $this->runIsolated("HTTP::resolveAndExit((object) ['a' => 1]);");
 
         self::assertSame('', $result['stderr']);
         self::assertSame('{"a":1}', $result['stdout']);
+    }
+
+    /** An object is rendered the way json_encode() sees it: public properties only. */
+    public function testResolveAndExitNeverOutputsNonPublicProperties(): void
+    {
+        $code = <<<'CODE'
+        $user = new class { public $name = 'ana'; private $passwordHash = 'HASH-SECRET'; protected $token = 'TOKEN-SECRET'; };
+        HTTP::resolveAndExit(['user' => $user], (bool) ($argv[1] ?? false));
+        CODE;
+
+        $json = $this->runIsolated($code);
+        $xml = $this->runIsolated(str_replace("(\$argv[1] ?? false)", 'true', $code));
+
+        self::assertSame('{"user":{"name":"ana"}}', $json['stdout']);
+        self::assertSame('', $xml['stderr']);
+        self::assertStringContainsString('<user><name>ana</name></user>', $xml['stdout']);
+        self::assertStringNotContainsString('SECRET', $xml['stdout'], 'The XML branch leaked a private property.');
     }
 
     /**
@@ -812,11 +1424,25 @@ final class HTTPTest extends TestCase
         self::assertStringContainsString('<root><name>x</name></root>', $result['stdout']);
     }
 
-    public function testResolveAndExitDecodesJsonStringBeforeOutput(): void
+    /**
+     * BEHAVIOUR CHANGE: a JSON object/array string is echoed VERBATIM. It used to be decoded and
+     * re-encoded, which is lossy — an integer beyond PHP_INT_MAX came back as a float.
+     */
+    public function testResolveAndExitEchoesAJsonStringVerbatim(): void
     {
-        $result = $this->runIsolated('HTTP::resolveAndExit(\'{"a":  1}\');');
+        $result = $this->runIsolated('HTTP::resolveAndExit(\'{"a":  1, "id": 12345678901234567890123}\');');
 
-        self::assertSame('{"a":1}', $result['stdout'], 'A JSON string is decoded, then re-encoded.');
+        self::assertSame('', $result['stderr']);
+        self::assertSame('{"a":  1, "id": 12345678901234567890123}', $result['stdout']);
+    }
+
+    /** ...while the XML branch still decodes it, keeping a big integer's digits as text. */
+    public function testResolveAndExitDecodesAJsonStringForXml(): void
+    {
+        $result = $this->runIsolated('HTTP::resolveAndExit(\'{"id": 12345678901234567890123}\', true);');
+
+        self::assertSame('', $result['stderr']);
+        self::assertStringContainsString('<root><id>12345678901234567890123</id></root>', $result['stdout']);
     }
 
     public function testResolveAndExitPreservesUnicodeUnescaped(): void
@@ -824,6 +1450,30 @@ final class HTTPTest extends TestCase
         $result = $this->runIsolated("HTTP::resolveAndExit(['msg' => 'ação']);");
 
         self::assertSame('{"msg":"ação"}', $result['stdout']);
+    }
+
+    /**
+     * Pins the fix for: json_encode() returned false on invalid UTF-8 and `echo false` printed
+     * nothing, so the client got an EMPTY 200 under application/json.
+     */
+    public function testResolveAndExitSubstitutesInvalidUtf8InsteadOfSendingAnEmptyBody(): void
+    {
+        $result = $this->runIsolated('HTTP::resolveAndExit([\'s\' => "caf\xE9"]);');
+
+        self::assertSame('', $result['stderr']);
+        self::assertSame('{"s":"caf' . "\u{FFFD}" . '"}', $result['stdout']);
+    }
+
+    /** Data JSON cannot express at all is an exception with NOTHING written — not an empty 200. */
+    public function testResolveAndExitThrowsBeforeAnyOutputOnUnencodableData(): void
+    {
+        $result = $this->runIsolated(
+            "try { HTTP::resolveAndExit(['n' => NAN]); } catch (\\JsonException \$e) { fwrite(STDERR, 'caught'); exit(3); }"
+        );
+
+        self::assertSame('', $result['stdout']);
+        self::assertSame('caught', $result['stderr']);
+        self::assertSame(3, $result['exit']);
     }
 
     #[DataProvider('scalarResolveProvider')]
@@ -845,6 +1495,8 @@ final class HTTPTest extends TestCase
             'empty string outputs nothing' => ["''", ''],
             'non-json string is echoed' => ["'hello'", 'hello'],
             'int is echoed' => ['42', '42'],
+            'json scalar string is decoded' => ["'\"quoted\"'", 'quoted'],
+            'json true string becomes 1' => ["'true'", '1'],
         ];
     }
 
@@ -866,6 +1518,87 @@ final class HTTPTest extends TestCase
         self::assertStringContainsString('<root><name>x</name></root>', $body);
         self::assertIsArray($headers);
         self::assertContains('Content-Type: application/xml; charset=utf-8', $headers);
+    }
+
+    /** Documented: a Content-Type the script already chose is left alone. */
+    public function testResolveAndExitKeepsAContentTypeTheScriptAlreadySet(): void
+    {
+        $headers = @get_headers(self::$baseUrl . '/resolve?case=content-type-preset');
+
+        self::assertIsArray($headers);
+        $contentTypes = array_values(array_filter(
+            $headers,
+            static fn(string $h): bool => stripos($h, 'Content-Type:') === 0
+        ));
+        self::assertCount(1, $contentTypes);
+        // Header names are case-insensitive, and PHP re-emits a script's Content-Type as
+        // "Content-type: text/plain;charset=UTF-8".
+        self::assertMatchesRegularExpression('#^content-type:\s*text/plain#i', $contentTypes[0]);
+    }
+
+    /**
+     * Regression pin, not a fix pin: once output has started, headers_list() already carries
+     * PHP's default Content-Type, so even the old code never reached header() here. The explicit
+     * headers_sent() guard now makes that independent of the Content-Type check.
+     */
+    public function testResolveAndExitDoesNotWarnWhenOutputHasAlreadyStarted(): void
+    {
+        $body = @file_get_contents(self::$baseUrl . '/resolve?case=after-output');
+
+        self::assertSame('early;{"a":1}', $body);
+    }
+
+    public function testResolveAndExitSubstitutesInvalidUtf8OverRealSapi(): void
+    {
+        $body = @file_get_contents(self::$baseUrl . '/resolve?case=invalid-utf8');
+
+        self::assertSame('{"s":"caf' . "\u{FFFD}" . '"}', $body);
+    }
+
+    // ---------------------------------------------------------------- downloadFile
+
+    /** Thin delegation: the file is streamed through File::downloadFile(). */
+    public function testDownloadFileDelegatesToFileAndStreamsTheContent(): void
+    {
+        $file = $this->makeTempFile('DOWNLOAD-PAYLOAD', '.bin');
+
+        $result = $this->runIsolated(
+            'HTTP::downloadFile(' . var_export($file, true) . ", 'report.bin', false, false); echo '|done';"
+        );
+
+        self::assertSame('', $result['stderr']);
+        self::assertSame('DOWNLOAD-PAYLOAD|done', $result['stdout']);
+        self::assertFileExists($file, '$deleteAfterDownload was false.');
+    }
+
+    public function testDownloadFileThrowsForAMissingFile(): void
+    {
+        $this->expectException(\Exception::class);
+        $this->expectExceptionMessage('does not exist or is not readable');
+
+        HTTP::downloadFile(sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'missing-' . bin2hex(random_bytes(6)), 'x.bin', false, false);
+    }
+
+    /**
+     * File::downloadFile() used to return SILENTLY — no headers, no body, no exception — when the
+     * download name was missing, so the client got an empty 200. It now throws, before any output.
+     *
+     * @return array<string, array{0: string|null}>
+     */
+    public static function missingDownloadNameProvider(): array
+    {
+        return ['null' => [null], 'empty' => [''], 'whitespace' => ['   ']];
+    }
+
+    #[DataProvider('missingDownloadNameProvider')]
+    public function testDownloadFileRequiresADownloadName(?string $name): void
+    {
+        $file = $this->makeTempFile('PAYLOAD', '.bin');
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectOutputString('');
+
+        HTTP::downloadFile($file, $name, false, false);
     }
 }
 

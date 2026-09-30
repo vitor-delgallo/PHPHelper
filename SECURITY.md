@@ -1,10 +1,11 @@
 # Security notes — `VD\PHPHelper\Security` and related helpers
 
-This document records the cryptographic contract of the library and the results of a security
-review. Tests live in `tests/SecurityCryptoTest.php` (run: `php tests/SecurityCryptoTest.php`).
+This document records the cryptographic contract of the library and the security-relevant behavior
+of the other helpers. Tests are the PHPUnit suite (`composer test`); the crypto tests live in
+`tests/SecurityTest.php` and `tests/SecurityFileEncryptionTest.php`.
 
-> **Breaking changes** were made deliberately — the library was not yet consumed by any project,
-> so on-disk / on-column formats and some signatures changed to close real weaknesses.
+> **Breaking changes** were made deliberately — the library is not consumed by any production
+> project, so signatures and behavior changed wherever that closed a real weakness.
 
 ## Cryptographic contract
 
@@ -14,7 +15,10 @@ review. Tests live in `tests/SecurityCryptoTest.php` (run: `php tests/SecurityCr
 - **Randomness fails closed.** Nonces come from `random_bytes()` with no weak fallback; if no strong
   RNG is available the call throws instead of encrypting with a predictable nonce.
 - **Decryption of a tampered/relocated value THROWS.** It never returns a falsy value a caller could
-  mistake for success.
+  mistake for success. This includes `decryptCrossPlatform` (aes-bridge itself returns `""` on an
+  authentication failure; the library parses the format itself and throws instead).
+- **Non-scalar input is refused.** Arrays and plain objects throw `InvalidArgumentException` instead
+  of being encrypted (or blind-indexed) as the literal text `"Array"`.
 
 ### Field encryption — `encryptDataDB` / `decryptDataDB`
 
@@ -44,42 +48,75 @@ $hash = Security::generateSearchHash($normalizedEmail, $blindIndexKey); // salt 
 
 Streaming AES-256-GCM. Each block's AAD binds `fileId | version | "D" | index`, and an authenticated
 end marker binds the total block count. This defeats **truncation, reordering, duplication, and
-cross-file splicing** — all rejected on decrypt. The legacy unauthenticated
-`encryptFileV1`/`decryptFileV1` (AES-128-CBC) were **removed**; only the authenticated V2 remains.
+cross-file splicing** — all rejected on decrypt. The container encoding (`{len}-{base64}` blocks) is
+parsed strictly, so non-canonical encodings (leading zeros, `+`, whitespace, bad padding) are
+rejected too.
+
+Two process-global settings (reset with `null`):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `setFileEncryptBlocksBytes()` | 3,200,000 | Plaintext bytes per encrypted block (min 1). |
+| `setFileMaxEncodedBlockBytes()` | 268,435,456 (256 MiB) | Largest encoded block accepted, on **both** encrypt and decrypt (min 44 — the size of the file-id block every file contains). |
+
+`encryptFileV2` refuses, before creating anything, a block size or salt whose encoded block would
+exceed the limit — it never writes a file that `decryptFileV2` could not read back. With the default
+limit the largest usable block size is 201,326,592 bytes. A file encrypted under a raised limit
+needs that limit on the decrypting side as well; the error message names the size required.
+
+Output is written to a hidden staging file next to the destination and renamed into place only on
+success, so a failure (wrong key, tamper, full disk, crash) never destroys an existing destination
+and never leaves unauthenticated plaintext behind. In-place operation (destination == source, by
+any spelling, symlink or hard link) is refused.
 
 ### Local strings — `encryptLocal` / `decryptLocal`
 
-AES-256-CTR with encrypt-then-HMAC-SHA256 (verified with `hash_equals` before decrypt). Sound.
+AES-256-CTR with encrypt-then-HMAC-SHA256 (verified with `hash_equals` before decrypt).
+
+### Cross-platform — `encryptCrossPlatform` / `decryptCrossPlatform`
+
+aes-bridge GCM format. The passphrase handed to aes-bridge is **not** the master key but the raw
+32 bytes of `HKDF-SHA256(master key, salt, info "derived-key")`; a peer must derive the same bytes.
+See the method docblock for the exact recipe.
 
 ### Passwords — `encryptPassword` / `verifyPassword`
 
 Argon2id via `password_hash`/`password_verify`. Never use the encryption helpers for passwords.
 
-## Non-crypto fixes in this review
+## Security-relevant behavior of the other helpers
 
-- `SQL::escapeString` now escapes the backslash (a trailing `\` previously broke out of the quoted
-  literal → SQL injection). **Prefer parameterized queries; this helper is a last resort.**
-- `File::unzipFile` rejects Zip-Slip entries (`..` / absolute paths escaping the destination).
-- `File::deleteFiles` reduces each name to `basename()` (no path traversal).
-- `Str::truncateWithTooltip` HTML-encodes with `htmlspecialchars` (was attribute-breakout XSS).
-- `Str::removeStringSuffix` fixed (`str_ends_with`; the bug produced malformed SQL upstream).
-- `Parser::xmlToArray` blocks external entities + `LIBXML_NONET` (XXE).
-- `Security::readLengthEncodedBlock` bounds the declared length (decrypt-time memory-DoS).
+- **SQL** — `SQL::escapeString` doubles the quote (`''`) and the backslash, and writes NUL as `\0`.
+  That is safe under MySQL in both `sql_mode`s, standard-conforming PostgreSQL and SQLite; it is
+  **not** safe on big5/cp932/gbk/gb18030/sjis connections. Prefer prepared statements.
+- **XSS** — `Security::xssCleanRecursive` is a DOM-based **allowlist** sanitizer (elements,
+  attributes and URL schemes). Array keys and private/protected object state are not walked;
+  escape them on output.
+- **Files** — `File::unzipFile` rejects zip-slip entries, refuses to write through links inside the
+  destination and verifies each entry's CRC. `File::deleteFoldersRecursively`/`resetFolder` never
+  follow links and refuse blank paths (a blank path used to resolve to the working directory).
+  `File::deleteFiles` accepts only plain leaf names. `File::downloadFile` builds a safe
+  `Content-Disposition` (quotes escaped, RFC 5987 `filename*`).
+- **HTTP** — `HTTP::callWebService` allows only `http`/`https`, for the request and for redirects;
+  CR/LF in the method or header values is rejected; TLS verification is on unless the caller turns
+  it off. `HTTP::getClientIpAddresses` lists `REMOTE_ADDR` first; forwarded headers follow.
+- **Headers/mail** — `URL::buildHttpHeaderArray` rejects CR/LF/NUL; `Validator::validateMail` and
+  `Mailer` reject addresses carrying whitespace or control characters; Mailer debug output goes to
+  `error_log`, never to stdout, with the SMTP password masked.
+- **XML** — `Parser::xmlToArray` parses **content only** (files go through `xmlFileToArray`),
+  blocks external entities with `LIBXML_NONET`, and restores the previous entity loader afterwards.
+  `Parser::arrayToXml` serializes only public object state, validates the root name, and writes a
+  key that is not a valid element name as `<item key="…">` instead of pasting it into markup.
+- **Spreadsheets** — CSV/HTML cells are returned verbatim; formulas in them are never evaluated.
+- **Randomness** — `Str::generateGuid` and `Str::generateUniqueKey` use `random_bytes()`;
+  `File::renameUploadFile` uses `random_int()`.
 
-## Deferred — caller responsibilities / recommended follow-ups (NOT changed here)
+## Caller responsibilities (not enforced by the library)
 
-These need a policy/API decision by the maintainer:
-
-- **`HTTP::callWebService` — SSRF.** No private-IP/allowlist guard and TLS verification can be
-  disabled. Do not pass user-controlled URLs without an egress allowlist; never disable peer
-  verification in production.
-- **`HTTP::getClientIpAddresses`** trusts `X-Forwarded-For`/`Client-IP`. For any security decision
-  (audit, rate-limit) use `REMOTE_ADDR`; trust XFF only behind a known proxy.
-- **`Security::xssCleanRecursive` / `filterValue(xssClean:...)`** is a best-effort blacklist, **not
-  an XSS boundary** (e.g. `<svg/onload=…>` bypasses it). Defend by output-encoding
-  (`htmlspecialchars`) or a maintained sanitizer.
-- **`filterValue(addSlashes/escapeDB)`** are not safe SQL escaping — use prepared statements.
-- **`System::makeSeed`, `Str::generateUniqueKey`, `Str::generateGuid` fallback** use `rand()`/
-  `uniqid()` — not cryptographic. Use `random_bytes()`/`random_int()` for any token/secret.
-- **`Validator::isBase64UrlEncoded`, `System::isMemoryGreaterThan`** call undefined functions
-  (latent fatals) — fix or remove.
+- **SSRF** — `HTTP::callWebService` has no private-IP/allowlist guard. Do not pass user-controlled
+  URLs without an egress allowlist; never disable peer verification in production.
+- **Forwarded client IPs** — only `REMOTE_ADDR` is trustworthy; trust `X-Forwarded-For` only behind
+  a known proxy.
+- **`filterValue(addSlashes/escapeDB)`** is not safe SQL escaping — use prepared statements.
+- **S3 uploads** — `S3Storage::upload` detects the content type from the file's bytes; pass an
+  explicit `ContentType` for user uploads if the bucket is served from a trusted domain.
+- **Seeds** — `System::makeSeed` produces a seed for `mt_rand`-style generators, not a secret.

@@ -443,6 +443,242 @@ final class SpreadsheetTest extends TestCase {
         Spreadsheet::excelToArray($path, true, 'Typo');
     }
 
+    // ------------------------------------- finding: a damaged part inside a valid .xlsx returned []
+
+    /** Copies a real .xlsx, truncating one of its parts. */
+    private function corruptXlsx(string $part = 'xl/worksheets/sheet1.xml'): string {
+        $source = $this->makeXlsx(['Data' => [['Name'], ['Ann'], ['Bob']]]);
+        $target = $this->tempPath();
+
+        $in = new \ZipArchive();
+        self::assertTrue($in->open($source));
+        $out = new \ZipArchive();
+        self::assertTrue($out->open($target, \ZipArchive::CREATE));
+        for ($i = 0; $i < $in->numFiles; $i++) {
+            $name = (string) $in->getNameIndex($i);
+            $bytes = (string) $in->getFromIndex($i);
+            $out->addFromString($name, $name === $part ? substr($bytes, 0, 200) : $bytes);
+        }
+        $in->close();
+        $out->close();
+
+        return $target;
+    }
+
+    /** The error handler currently installed, read without disturbing it. */
+    private static function currentErrorHandler(): mixed {
+        $current = set_error_handler(static fn (): bool => false);
+        restore_error_handler();
+
+        return $current;
+    }
+
+    /**
+     * FINDING (fixed): an intact zip whose sheet XML is truncated made the vendor parser emit
+     * simplexml warnings and carry on with an EMPTY sheet, so excelToArray() returned [] — the one
+     * value documented to mean "the sheet has no rows". A bulk import committed zero rows.
+     */
+    public function testCorruptPartInsideAValidXlsxThrowsInsteadOfReturningAnEmptyArray(): void {
+        $path = $this->corruptXlsx();
+
+        $this->expectException(\PhpOffice\PhpSpreadsheet\Exception::class);
+        $this->expectExceptionMessage('Unable to read');
+
+        Spreadsheet::excelToArray($path);
+    }
+
+    /**
+     * Detection must not depend on process-wide libxml state: with the internal error buffer
+     * already ENABLED (as PHPUnit and many frameworks leave it) the vendor parser's XML errors
+     * produce no PHP warning at all, and a warning-only check silently returned [] again.
+     */
+    public function testCorruptPartIsDetectedWhateverTheCallersLibxmlErrorModeIs(): void {
+        $path = $this->corruptXlsx();
+
+        foreach ([true, false] as $internal) {
+            $original = libxml_use_internal_errors($internal);
+            try {
+                Spreadsheet::excelToArray($path);
+                self::fail('a corrupt workbook must throw with libxml_use_internal_errors(' . var_export($internal, true) . ')');
+            } catch (\PhpOffice\PhpSpreadsheet\Exception $e) {
+                self::assertStringContainsString('Unable to read', $e->getMessage());
+                self::assertSame($internal, libxml_use_internal_errors(), 'the caller\'s libxml mode is restored');
+            } finally {
+                libxml_use_internal_errors($original);
+            }
+        }
+    }
+
+    public function testTheParserErrorHandlerIsRemovedAfterSuccessAndAfterFailure(): void {
+        $before = self::currentErrorHandler();
+        $libxmlBefore = libxml_use_internal_errors();
+
+        Spreadsheet::excelToArray($this->makeXlsx(['Data' => [['Name'], ['Ann']]]));
+        self::assertSame($before, self::currentErrorHandler(), 'after a successful read');
+        self::assertSame($libxmlBefore, libxml_use_internal_errors());
+
+        try {
+            Spreadsheet::excelToArray($this->corruptXlsx());
+            self::fail('a corrupt workbook must throw');
+        } catch (\PhpOffice\PhpSpreadsheet\Exception) {
+            // expected
+        }
+        self::assertSame($before, self::currentErrorHandler(), 'after a failed read');
+        self::assertSame($libxmlBefore, libxml_use_internal_errors());
+    }
+
+    /** HTML is recovered, not validated: tags libxml's HTML4 parser does not know must not fail it. */
+    public function testSloppyHtml5IsStillReadable(): void {
+        $path = $this->tempPath('html');
+        file_put_contents(
+            $path,
+            '<!doctype html><html><body><main><section><table><tr><td>H</td></tr><tr><td>v</td></tr></table></section></main></body></html>'
+        );
+
+        self::assertSame([['H' => 'v']], Spreadsheet::excelToArray($path));
+    }
+
+    // ------------------------------------- finding: text formats were re-typed / evaluated
+
+    /**
+     * FINDING (fixed): CSV cells went through the default value binder, which types text the way
+     * Excel types keyboard input: "=A2&B2" was EVALUATED (reading other cells), a phone number
+     * lost its '+', "1e3" became 1000, "1.50" lost its zero. A CSV cell IS its text.
+     */
+    public function testCsvCellsAreReturnedVerbatimAndNeverEvaluatedOrRetyped(): void {
+        $path = $this->tempPath('csv');
+        file_put_contents($path, implode("\n", [
+            'Name,Value',
+            'formula,=1+1',
+            'reference,=A2&B2',
+            'unknown fn,=NOSUCHFUNC(1)',
+            'phone,+5511987654321',
+            'exponent,1e3',
+            'decimal,1.50',
+            'neg zero,-0',
+            'leading zero,007',
+            'at,@SUM(1)',
+            'bool,true',
+        ]) . "\n");
+
+        $rows = Spreadsheet::excelToArray($path);
+
+        self::assertSame(
+            ['=1+1', '=A2&B2', '=NOSUCHFUNC(1)', '+5511987654321', '1e3', '1.50', '-0', '007', '@SUM(1)', 'true'],
+            array_column($rows, 'Value')
+        );
+    }
+
+    public function testHtmlTableCellsAreReturnedVerbatimToo(): void {
+        $path = $this->tempPath('html');
+        file_put_contents(
+            $path,
+            '<html><body><table><tr><td>H</td></tr><tr><td>=1+1</td></tr><tr><td>+55 11 9</td></tr></table></body></html>'
+        );
+
+        self::assertSame([['H' => '=1+1'], ['H' => '+55 11 9']], Spreadsheet::excelToArray($path));
+    }
+
+    /**
+     * FINDING (fixed): the Csv reader assumed UTF-8, so a Windows-1252 file — what Excel's "CSV"
+     * export writes on Western-European Windows — came back with every accented letter replaced by
+     * U+FFFD. Unrecoverably: the original bytes were gone.
+     */
+    public function testWindows1252CsvIsDecodedToUtf8(): void {
+        $path = $this->tempPath('csv');
+        file_put_contents($path, mb_convert_encoding("Nome;Cidade\nJoão;São Paulo\n", 'CP1252', 'UTF-8'));
+
+        self::assertSame([['Nome' => 'João', 'Cidade' => 'São Paulo']], Spreadsheet::excelToArray($path));
+    }
+
+    public function testUtf8CsvWithOrWithoutBomIsReadAsUtf8(): void {
+        foreach (['' => 'no BOM', "\xEF\xBB\xBF" => 'BOM'] as $bom => $label) {
+            $path = $this->tempPath('csv');
+            file_put_contents($path, $bom . "Nome,Cidade\nJoão,東京 🙂\n");
+
+            self::assertSame(
+                [['Nome' => 'João', 'Cidade' => '東京 🙂']],
+                Spreadsheet::excelToArray($path),
+                $label
+            );
+        }
+    }
+
+    public function testUtf16CsvWithBomIsDecoded(): void {
+        $path = $this->tempPath('txt');
+        file_put_contents($path, "\xFF\xFE" . mb_convert_encoding("Nome\tCidade\r\nJoão\tSão Paulo\r\n", 'UTF-16LE', 'UTF-8'));
+
+        self::assertSame([['Nome' => 'João', 'Cidade' => 'São Paulo']], Spreadsheet::excelToArray($path));
+    }
+
+    // ------------------------------------- finding: styled-but-empty cells were materialised
+
+    /**
+     * FINDING (fixed): borders over an empty range made the reader create a cell object for every
+     * formatted cell, pushed getHighestRow() to the bottom of the range and made the extractor walk
+     * it — ~5 s and hundreds of MB for one row of data under a 20000-row border. With
+     * $removeEmptyRows = false those phantom rows were even RETURNED, as rows of nulls.
+     */
+    public function testFormattedButEmptyCellsAreNotTreatedAsRows(): void {
+        $book = new \PhpOffice\PhpSpreadsheet\Spreadsheet();
+        $sheet = $book->getActiveSheet();
+        $sheet->fromArray([['Name', 'Age'], ['Ann', 30]], null, 'A1', true);
+        $sheet->getStyle('A3:D3000')->getBorders()->getAllBorders()
+            ->setBorderStyle(\PhpOffice\PhpSpreadsheet\Style\Border::BORDER_THIN);
+        $path = $this->tempPath();
+        (new \PhpOffice\PhpSpreadsheet\Writer\Xlsx($book))->save($path);
+        $book->disconnectWorksheets();
+
+        self::assertSame([['Name' => 'Ann', 'Age' => '30']], Spreadsheet::excelToArray($path, true, null, false));
+        self::assertSame(
+            [['A' => 'Name', 'B' => 'Age'], ['A' => 'Ann', 'B' => '30']],
+            Spreadsheet::excelToArray($path, false, null, false)
+        );
+    }
+
+    // ------------------------------------- documented value shapes (were claimed "formatted")
+
+    /**
+     * The docblock used to promise "FORMATTED strings". A data-only load reads no number formats,
+     * so a date is its serial number and a percentage its fraction. Pinned so the documented
+     * shape cannot drift from reality again.
+     */
+    public function testDataOnlyValuesAreRawGeneralRenderingsNotDisplayFormats(): void {
+        $book = new \PhpOffice\PhpSpreadsheet\Spreadsheet();
+        $sheet = $book->getActiveSheet();
+        $sheet->fromArray([['Date', 'Pct', 'Bool', 'Formula', 'Text']], null, 'A1', true);
+        $sheet->setCellValue('A2', \PhpOffice\PhpSpreadsheet\Shared\Date::PHPToExcel(new \DateTimeImmutable('2024-01-31')));
+        $sheet->getStyle('A2')->getNumberFormat()->setFormatCode('dd/mm/yyyy');
+        $sheet->setCellValue('B2', 0.125);
+        $sheet->getStyle('B2')->getNumberFormat()->setFormatCode('0.00%');
+        $sheet->setCellValue('C2', true);
+        $sheet->setCellValue('D2', '=B2*4');
+        $sheet->setCellValueExplicit('E2', '007', \PhpOffice\PhpSpreadsheet\Cell\DataType::TYPE_STRING);
+        $path = $this->tempPath();
+        (new \PhpOffice\PhpSpreadsheet\Writer\Xlsx($book))->save($path);
+        $book->disconnectWorksheets();
+
+        $row = Spreadsheet::excelToArray($path)[0];
+
+        self::assertSame('45322', $row['Date'], 'a date is its Excel serial number');
+        self::assertSame(
+            '2024-01-31',
+            \PhpOffice\PhpSpreadsheet\Shared\Date::excelToDateTimeObject((float) $row['Date'])->format('Y-m-d'),
+            'and the documented conversion recovers it'
+        );
+        self::assertSame('0.125', $row['Pct']);
+        self::assertSame('TRUE', $row['Bool']);
+        self::assertSame('0.5', $row['Formula'], 'formulas are calculated');
+        self::assertSame('007', $row['Text'], 'a text cell keeps its leading zeros');
+    }
+
+    public function testSheetNameLookupIsCaseInsensitiveAndIgnoresSurroundingQuotes(): void {
+        $path = $this->makeXlsx(['Main' => [['Name'], ['main']], 'Data' => [['Name'], ['data']]]);
+
+        self::assertSame([['Name' => 'data']], Spreadsheet::excelToArray($path, true, 'data'));
+        self::assertSame([['Name' => 'data']], Spreadsheet::excelToArray($path, true, "'DATA'"));
+    }
+
     /**
      * The documented single-catch contract: every failure this method declares is a
      * \RuntimeException, so a caller can catch that one type without depending on the vendor class.
@@ -454,6 +690,7 @@ final class SpreadsheetTest extends TestCase {
         file_put_contents($garbage, "\x00\x01\x02\xFF\xFE\x7F\x00\x99\x88"); // binary: no reader claims it
         $duplicate = $this->makeXlsx(['Data' => [['Name', 'Name'], ['left', 'right']]]);
         $unnamed = $this->makeXlsx(['Data' => [['Name', null], ['Ann', 'orphan']]]);
+        $corrupt = $this->corruptXlsx();
 
         $cases = [
             'missing file'       => fn() => Spreadsheet::excelToArray($missing),
@@ -461,6 +698,7 @@ final class SpreadsheetTest extends TestCase {
             'unknown sheet name' => fn() => Spreadsheet::excelToArray($book, true, 'Nope'),
             'duplicate header'   => fn() => Spreadsheet::excelToArray($duplicate),
             'unnamed column'     => fn() => Spreadsheet::excelToArray($unnamed),
+            'corrupt part'       => fn() => Spreadsheet::excelToArray($corrupt),
         ];
 
         foreach ($cases as $label => $call) {

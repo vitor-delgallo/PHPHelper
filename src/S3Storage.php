@@ -43,6 +43,24 @@ use Aws\Exception\AwsException;
  *   a default is therefore optional as long as every call names its own bucket. A call that
  *   resolves to no bucket at all fails locally with "missing AWS_S3_BUCKET" and never
  *   reaches AWS.
+ * - Buckets are NEVER created implicitly: upload() and copy() write to the bucket you name
+ *   and fail (NoSuchBucket) if it does not exist. Call createBucket() explicitly. (They used
+ *   to call createBucket() first, which cost a HeadBucket round-trip per call, made every
+ *   upload need s3:ListBucket — a least-privilege PutObject-only key could not upload at
+ *   all — and turned a typo'd bucket name into a new bucket holding your data.)
+ *
+ * Object keys are used VERBATIM, byte for byte, by every method: no leading '/' is stripped,
+ * no '//' collapsed, no '\' converted and no '..' resolved — S3 treats all of them as
+ * ordinary key characters, so "/a.pdf", "a.pdf" and "a//b/../c.pdf" are distinct objects.
+ * (copy() used to strip a leading '/' from the source key only, so copying "/a.pdf" read the
+ * DIFFERENT object "a.pdf" — and move() then deleted "/a.pdf".) A key never becomes a local
+ * path: download()'s SAVE mode writes only to the path the caller spells out.
+ *
+ * Objects are written with NO ACL unless $options['ACL'] asks for one, i.e. they are private
+ * (S3's default object ACL, and the only option once a bucket has ACLs disabled). Sending
+ * 'ACL' => 'private' explicitly, as upload()/copy() used to, is redundant at best and, on a
+ * bucket with Object Ownership = BucketOwnerEnforced (the default for new buckets since
+ * April 2023), can be refused outright with AccessControlListNotSupported.
  */
 class S3Storage
 {
@@ -242,6 +260,9 @@ class S3Storage
      *   legal DNS, but "http://minio_1:9000" is exactly what a Docker-hosted MinIO answers
      *   to, which is this option's main use case. Non-ASCII is rejected: the SDK does not
      *   punycode an IDN host, so pass it already encoded ("xn--mnchen-3ya.de").
+     * - Userinfo ("https://user:pass@host") is rejected, and the rejection does not echo the
+     *   value: S3 never authenticates that way, and the endpoint is quoted in error messages
+     *   that end up in logs.
      * - A trailing slash is stripped for stable comparison; the path, if any, is preserved
      *   (some gateways expose S3 under a prefix).
      * - Discards any cached S3 client, so the new endpoint takes effect on the next
@@ -271,13 +292,26 @@ class S3Storage
         }
 
         $parts = parse_url($endpoint);
+
+        // First, and without echoing the value: userinfo is the one part of an endpoint that
+        // can hold a secret, and every other rejection message quotes the endpoint. S3
+        // authenticates with the SigV4 key pair, so "user:pass@" is never meaningful here.
+        if (is_array($parts) && (isset($parts['user']) || isset($parts['pass']))) {
+            self::$lastError = "[AWS S3] setEndpoint(): The endpoint must not carry credentials (user:password@host); set them with setKey()/setSecret().";
+            return false;
+        }
+
+        // Every message below quotes the value escaped: a raw CRLF would be a log injection in
+        // whatever writes getLastError() out.
+        $shown = addcslashes($endpoint, "\0..\37\177");
+
         if ($parts === false || empty($parts['host']) || !in_array(strtolower($parts['scheme'] ?? ''), ['http', 'https'], true)) {
-            self::$lastError = "[AWS S3] setEndpoint(): The endpoint '{$endpoint}' must be an absolute http(s) URL including a host (e.g. https://minio.example.com:9000).";
+            self::$lastError = "[AWS S3] setEndpoint(): The endpoint '{$shown}' must be an absolute http(s) URL including a host (e.g. https://minio.example.com:9000).";
             return false;
         }
 
         if (!empty($parts['query']) || !empty($parts['fragment'])) {
-            self::$lastError = "[AWS S3] setEndpoint(): The endpoint '{$endpoint}' must not carry a query string or fragment.";
+            self::$lastError = "[AWS S3] setEndpoint(): The endpoint '{$shown}' must not carry a query string or fragment.";
             return false;
         }
 
@@ -285,10 +319,7 @@ class S3Storage
         // stored, not parse_url()'s cleaned-up view of it. Deliberately checked AFTER the
         // scheme/host and query/fragment rules, so a plain "not a url" still reports the
         // specific complaint it always has rather than this generic one.
-        // The offending value is escaped into the message: a raw CRLF here would be a log
-        // injection in whatever writes getLastError() out.
         if (preg_match('/[\x00-\x20\x7F]/', $endpoint) === 1) {
-            $shown = addcslashes($endpoint, "\0..\37\177");
             self::$lastError = "[AWS S3] setEndpoint(): The endpoint '{$shown}' must not contain spaces or control characters.";
             return false;
         }
@@ -565,6 +596,7 @@ class S3Storage
      * - Automatically converted to lowercase (strtolower).
      * - Length must be between 3 and 63 characters.
      * - Only lowercase letters, numbers, dot (.) and hyphen (-).
+     * - Must begin and end with a letter or number, and must not contain "..".
      * - Must not be in IPv4 format (e.g. 192.168.0.1).
      *
      * @param string|null $bucket Bucket name to be configured as default.
@@ -614,14 +646,27 @@ class S3Storage
             return "The bucket name '{$bucket}' cannot be empty.";
         }
 
+        // Escaped for the message: a rejected name may hold a CR/LF, and getLastError() is
+        // written to logs.
+        $shown = addcslashes($bucket, "\0..\37\177");
+
         $len = strlen($bucket);
         if ($len < 3 || $len > 63) {
-            return "The bucket name '{$bucket}' must be between 3 and 63 characters.";
+            return "The bucket name '{$shown}' must be between 3 and 63 characters.";
         }
 
         // Only a–z, 0–9, dot and hyphen
-        if (!preg_match('/^[a-z0-9.\-]+$/', $bucket)) {
-            return "The bucket name '{$bucket}' may contain only lowercase letters, numbers, dot (.) and hyphen (-).";
+        if (strspn($bucket, 'abcdefghijklmnopqrstuvwxyz0123456789.-') !== $len) {
+            return "The bucket name '{$shown}' may contain only lowercase letters, numbers, dot (.) and hyphen (-).";
+        }
+
+        // Both rules are S3's own; a name breaking them used to pass here and fail at AWS.
+        if (!ctype_alnum($bucket[0]) || !ctype_alnum($bucket[$len - 1])) {
+            return "The bucket name '{$shown}' must begin and end with a letter or number.";
+        }
+
+        if (str_contains($bucket, '..')) {
+            return "The bucket name '{$shown}' must not contain two adjacent periods.";
         }
 
         // Must not be an IPv4 address (e.g. 192.168.0.1)
@@ -681,8 +726,7 @@ class S3Storage
      * wins over the validated value. That was not hypothetical:
      * - $options['Bucket'] overrode the name requireBucket() had just validated, so the guard
      *   checked one bucket while the request went to another — including names like
-     *   'ATTACKER-BUCKET' that validateBucketName() rejects outright, and after createBucket()
-     *   had already ensured the *validated* bucket existed.
+     *   'ATTACKER-BUCKET' that validateBucketName() rejects outright.
      * - $options['CopySource'] re-opened the exact cross-bucket redirect requireBucket() was
      *   written to close, pointing a copy at an arbitrary bucket and key.
      * - $options['IfNoneMatch'] contradicted $overwrite, making upload() answer true with
@@ -691,8 +735,7 @@ class S3Storage
      * Rejecting, rather than "validate the merged result", is the deliberate choice: for
      * CopySource, SourceFile and Key there is no equivalent validation to re-run, and the
      * method's error messages would still name the argument instead of the value actually
-     * used. A colliding call is a caller bug and fails here — locally, before any AWS request
-     * and before createBucket() can have a side effect.
+     * used. A colliding call is a caller bug and fails here — locally, before any AWS request.
      *
      * Matching is case-insensitive: S3 parameter names are unique PascalCase, so a lowercase
      * 'bucket' is never some other legitimate parameter — it is the same mistake, silently
@@ -828,7 +871,12 @@ class S3Storage
      */
     private static function extractName(string $key): string
     {
-        return basename(rtrim($key, '/'));
+        // Not basename(): it also splits on '\' on Windows only (so a key's 'name' depended on the
+        // host OS — "a\b.pdf" is ONE S3 name) and is locale-sensitive with multibyte names.
+        $key = rtrim($key, '/');
+        $slash = strrpos($key, '/');
+
+        return $slash === false ? $key : substr($key, $slash + 1);
     }
 
     /**
@@ -989,6 +1037,11 @@ class S3Storage
 
             return true;
         } catch (AwsException $e) {
+            // Created by a concurrent caller between our HeadBucket and CreateBucket: the bucket
+            // this method promises exists, and it is ours.
+            if ($e->getAwsErrorCode() === 'BucketAlreadyOwnedByYou') {
+                return true;
+            }
             self::$lastError = "[AWS S3] createBucket(): Error creating bucket '{$bucket}': " . $e->getAwsErrorMessage();
             return false;
         } catch (\Throwable $e) {
@@ -1010,8 +1063,13 @@ class S3Storage
      *   IfNoneMatch. Such a call is REJECTED (returns false, nothing is uploaded, no AWS
      *   request is made). $options is merged over upload()'s own arguments, so these used to
      *   win silently: an $options['Bucket'] sent the object to a bucket requireBucket() never
-     *   validated, while createBucket() had ensured the validated one. See
-     *   requireNoReservedOptions().
+     *   validated. See requireNoReservedOptions().
+     * - The bucket must already exist (see the class doc: nothing is created implicitly).
+     * - No ACL is sent unless $options['ACL'] sets one; the object is private by default.
+     * - The file is sent as ONE PutObject request, streamed from disk (not loaded into
+     *   memory). S3 caps a single PutObject at 5 GiB: a larger file fails with EntityTooLarge
+     *   and returns false — this method does not do multipart uploads.
+     * - The key is used verbatim (see the class doc).
      *
      * Behaviour of the $overwrite parameter:
      * - If true (default), the object will be overwritten if it already exists in the bucket.
@@ -1052,7 +1110,7 @@ class S3Storage
             return false;
         }
 
-        // Before createBucket(), so a colliding call costs no AWS request and creates nothing.
+        // Before any AWS request, so a colliding call costs nothing and changes nothing.
         if (!self::requireNoReservedOptions('upload', $options, self::UPLOAD_RESERVED_OPTIONS)) {
             return false;
         }
@@ -1069,16 +1127,11 @@ class S3Storage
             return false;
         }
 
-        if (!self::createBucket($bucket)) {
-            return false;
-        }
-
         $contentType = self::detectMimeFromPath($filePath) ?? 'application/octet-stream';
         try {
             $args = array_merge([
                 'Bucket'           => $bucket,
                 'Key'              => $key,
-                'ACL'              => 'private',
                 'SourceFile'       => $filePath,
                 'ChecksumAlgorithm' => 'SHA256',
                 'ContentType'      => $contentType,
@@ -1087,7 +1140,11 @@ class S3Storage
                 $args['ChecksumAlgorithm'] === 'SHA256' &&
                 empty($args['ChecksumSHA256'])
             ) {
-                $args['ChecksumSHA256'] = base64_encode(hash_file('sha256', $filePath, true));
+                $hash = hash_file('sha256', $filePath, true);
+                if ($hash === false) {
+                    throw new \RuntimeException("could not read '{$filePath}' to checksum it");
+                }
+                $args['ChecksumSHA256'] = base64_encode($hash);
             }
             if (!$overwrite) {
                 $args['IfNoneMatch'] = '*';
@@ -1121,6 +1178,12 @@ class S3Storage
      *   copied, no AWS request is made). $options is merged over copy()'s own arguments, so
      *   these used to win silently, and $options['CopySource'] in particular re-opened the very
      *   cross-bucket redirect requireBucket() exists to close. See requireNoReservedOptions().
+     * - The destination bucket must already exist (nothing is created implicitly), and no ACL
+     *   is sent unless $options['ACL'] sets one — see the class doc.
+     * - Both keys are used verbatim. The source key used to lose a leading '/' in CopySource
+     *   (while its HeadObject used it intact), so "/a.pdf" was copied from "a.pdf".
+     * - One CopyObject request: S3 refuses a source larger than 5 GiB this way (InvalidRequest),
+     *   and this method returns false for it.
      *
      * @param string $fromKey          Source key (exact).
      * @param string $toKey            Destination key (exact).
@@ -1161,34 +1224,25 @@ class S3Storage
             return false;
         }
 
-        // Before createBucket(), so a colliding call costs no AWS request and creates nothing.
+        // Before any AWS request, so a colliding call costs nothing and changes nothing.
         if (!self::requireNoReservedOptions('copy', $options, self::COPY_RESERVED_OPTIONS)) {
-            return false;
-        }
-
-        // Ensure destination bucket
-        if (!self::createBucket($toBucket)) {
             return false;
         }
 
         try {
             $head = self::getHead($fromKey, $fromBucket);
 
+            // The source key goes in whole, leading '/' included: CopySource is "bucket/key" and
+            // S3 splits it at the FIRST slash, so "bucket//a.pdf" names the key "/a.pdf". (A
+            // ChecksumSHA256 copied from the HEAD used to be added here too; CopyObject has no
+            // such parameter, so the SDK silently dropped it and it verified nothing.)
             $args = array_merge([
                 'Bucket'           => $toBucket,
                 'Key'              => $toKey,
-                'ACL'              => 'private',
-                'CopySource'       => $fromBucket . '/' . str_replace('%2F', '/', rawurlencode(ltrim($fromKey, '/'))),
+                'CopySource'       => $fromBucket . '/' . str_replace('%2F', '/', rawurlencode($fromKey)),
                 'MetadataDirective' => $preserveMetadata ? 'COPY' : 'REPLACE',
                 'ChecksumAlgorithm' => 'SHA256',
             ], $options);
-            if (
-                $args['ChecksumAlgorithm'] === 'SHA256' &&
-                !empty($head['ChecksumSHA256']) &&
-                empty($args['ChecksumSHA256'])
-            ) {
-                $args['ChecksumSHA256'] = $head['ChecksumSHA256'];
-            }
             if (!empty($head['ContentType']) && empty($args['ContentType'])) {
                 $args['ContentType'] = $head['ContentType'];
             }
@@ -1235,15 +1289,24 @@ class S3Storage
      *     "uploads/report" also deletes "uploads/report-2024-draft.pdf". Always end a
      *     prefix with "/" unless you mean that. Do NOT reach for $recursive = true just to
      *     delete one extensionless key — you may take its siblings with it.
+     *   - Works page by page: each listed page (at most 1000 keys) is removed with one
+     *     DeleteObjects request, so memory stays flat however many objects match. The whole
+     *     listing used to be collected first and sent as ONE DeleteObjects request, which S3
+     *     refuses above 1000 keys (MalformedXML) — any prefix holding more than 1000 objects
+     *     could never be deleted.
+     *   - A per-key failure inside DeleteObjects (e.g. AccessDenied on some keys) arrives in an
+     *     HTTP 200 response. Those are now counted: the remaining pages are still processed,
+     *     then the call returns false and getLastError() gives the number of keys left behind
+     *     and the first failure. It used to return true with those objects still in place.
+     *   - Not atomic: on false, some objects may already be gone.
      *
      * Rules:
      * - In no‑op mode, returns true without calling S3.
      * - On success, returns true.
      * - On error, returns false and populates getLastError().
      *
-     * Inherited by move() and rename(): both delete the SOURCE with $recursive = false, so
-     * an extensionless $fromKey makes them fail AFTER the copy has already succeeded. They
-     * then roll the destination back and return false, and getLastError() names delete().
+     * move() and rename() delete the SOURCE with $recursive = false, so they check the
+     * source key's extension BEFORE copying anything.
      *
      * @param string $key       Exact object key (must have an extension) when $recursive is
      *                          false; a folder prefix when $recursive is true.
@@ -1266,7 +1329,8 @@ class S3Storage
             return false;
         }
 
-        if (empty($key)) {
+        // '' only: an empty PREFIX would match the whole bucket. empty() also refused "0".
+        if ($key === '') {
             self::$lastError = "[AWS S3] delete(): Error deleting object(s): The key in bucket '{$bucket}' cannot be empty!";
             return false;
         }
@@ -1279,19 +1343,62 @@ class S3Storage
 
         try {
             if ($recursive) {
-                // list all objects with this prefix
-                $objects = self::list($key, false, $bucket);
-                if ($objects === false) {
+                $deleted = 0;
+                $failed = 0;
+                $firstFailure = null;
+                $continuation = null;
+
+                do {
+                    $listArgs = ['Bucket' => $bucket, 'Prefix' => $key];
+                    if ($continuation !== null) {
+                        $listArgs['ContinuationToken'] = $continuation;
+                    }
+                    $page = $client->listObjectsV2($listArgs);
+
+                    $keys = [];
+                    foreach ($page['Contents'] ?? [] as $object) {
+                        $keys[] = ['Key' => $object['Key']];
+                    }
+
+                    // S3 pages hold at most 1000 keys, which is also DeleteObjects' limit; the
+                    // chunking covers S3-compatible servers that return larger pages.
+                    foreach (array_chunk($keys, 1000) as $batch) {
+                        // Quiet: the response lists only the keys that FAILED.
+                        $result = $client->deleteObjects([
+                            'Bucket' => $bucket,
+                            'Delete' => ['Objects' => $batch, 'Quiet' => true],
+                        ]);
+
+                        $errors = $result['Errors'] ?? [];
+                        $failed += count($errors);
+                        $deleted += count($batch) - count($errors);
+                        if ($firstFailure === null && $errors !== []) {
+                            $firstFailure = $errors[0];
+                        }
+                    }
+
+                    $continuation = null;
+                    if (!empty($page['IsTruncated'])) {
+                        $continuation = $page['NextContinuationToken'] ?? null;
+                        if (empty($continuation)) {
+                            self::$lastError = "[AWS S3] delete(): Listing of prefix '{$key}' in bucket '{$bucket}' is truncated but carries no continuation token; stopped after deleting {$deleted} object(s).";
+                            return false;
+                        }
+                    }
+                } while ($continuation !== null);
+
+                if ($failed > 0) {
+                    self::$lastError = sprintf(
+                        "[AWS S3] delete(): %d object(s) under prefix '%s' in bucket '%s' could NOT be deleted (%d were); first failure: '%s' — %s: %s",
+                        $failed,
+                        $key,
+                        $bucket,
+                        $deleted,
+                        (string) ($firstFailure['Key'] ?? '?'),
+                        (string) ($firstFailure['Code'] ?? '?'),
+                        (string) ($firstFailure['Message'] ?? '')
+                    );
                     return false;
-                }
-
-                if (!empty($objects)) {
-                    $toDelete = array_map(fn($obj) => ['Key' => $obj['key']], $objects);
-
-                    $client->deleteObjects([
-                        'Bucket' => $bucket,
-                        'Delete' => ['Objects' => $toDelete],
-                    ]);
                 }
             } else {
                 // delete only a single exact object
@@ -1316,11 +1423,15 @@ class S3Storage
      *
      * Implements copy() + delete() of the source object. The source is deleted only after
      * the copy reports success; if the delete then fails, the destination is rolled back and
-     * false is returned.
+     * false is returned (getLastError() says whether that rollback succeeded).
      *
-     * Preconditions inherited from delete(): $fromKey MUST end with a file extension (the
-     * source is removed with $recursive = false). An extensionless $fromKey fails after the
-     * copy, triggering the rollback, with a getLastError() that names delete().
+     * Checked BEFORE anything is copied, returning false with nothing changed:
+     * - $fromKey MUST end with a file extension, because the source is removed with
+     *   delete($recursive = false), which requires one. This used to be discovered only AFTER
+     *   the copy, costing a copy plus a rollback.
+     * - Source and destination must not be the SAME object (same resolved bucket, same key).
+     *   Moving an object onto itself with $preserveMetadata = false is a legal self-copy for
+     *   S3 — after which the "source" delete removed the only copy there was.
      *
      * With $overwrite = false, an existing destination makes copy() return false, so the
      * source is NOT deleted and nothing is lost.
@@ -1349,6 +1460,21 @@ class S3Storage
         string $fromBucket = '',
         string $toBucket   = ''
     ): bool {
+        if (!self::isNoOperation()) {
+            if (!self::hasExtension($fromKey)) {
+                self::$lastError = "[AWS S3] move(): The source key '{$fromKey}' must end with an extension: it is removed with delete(), which requires one. Nothing was copied.";
+                return false;
+            }
+
+            // Only when both resolve: an unresolvable bucket is reported by copy() as usual.
+            $resolvedFrom = self::requireBucket('move', $fromBucket);
+            $resolvedTo = self::requireBucket('move', $toBucket);
+            if ($resolvedFrom !== false && $resolvedFrom === $resolvedTo && $fromKey === $toKey) {
+                self::$lastError = "[AWS S3] move(): The source and destination are the same object ('{$fromKey}' in bucket '{$resolvedFrom}'); moving it would delete it. Nothing was changed.";
+                return false;
+            }
+        }
+
         // copy first
         if (!self::copy($fromKey, $toKey, $overwrite, $preserveMetadata, $options, $fromBucket, $toBucket)) {
             return false;
@@ -1356,13 +1482,13 @@ class S3Storage
 
         // delete source only after successful copy
         if (!self::delete($fromKey, false, $fromBucket)) {
-            $err = self::getLastError();
+            $err = (string) self::getLastError();
 
             // attempt to rollback the destination
-            self::delete($toKey, false, $toBucket);
-            if (!empty($err)) {
-                self::$lastError = $err;
-            }
+            $rolledBack = self::delete($toKey, false, $toBucket);
+            self::$lastError = $err . ($rolledBack
+                ? ' The copy at the destination was rolled back.'
+                : " The copy at the destination could NOT be rolled back and still exists: '{$toKey}'.");
 
             return false;
         }
@@ -1398,15 +1524,33 @@ class S3Storage
      * Downloads an object from S3.
      *
      * Operation modes:
-     * - If $mode begins with "TEXT": returns the file contents as a string.
-     * - If $mode begins with "STREAM": returns the file contents as a stream.
+     * - If $mode begins with "TEXT": returns the file contents as a string (the whole object
+     *   in memory).
+     * - If $mode begins with "STREAM": returns the body as a Psr\Http\Message\StreamInterface
+     *   (an object, NOT a PHP stream resource). The SDK has already downloaded the whole object
+     *   into php://temp, which spills to disk past 2 MiB, so memory stays bounded.
      * - If $mode begins with "DOWNLOAD_TEXT": sends HTTP headers and echoes the contents (forcing a browser download as text).
-     * - If $mode begins with "DOWNLOAD_STREAM:[MiB]": sends HTTP headers and streams the contents in chunks of the specified MiB (default 8 MiB).
+     * - If $mode begins with "DOWNLOAD_STREAM:[MiB]": sends HTTP headers and relays the object
+     *   from S3 to the client as it arrives, in chunks of the given MiB — an integer from 1 to
+     *   64, default 8 when omitted. Anything else ("0", "-5", "1.5", "99999") is rejected: a
+     *   huge chunk makes fread() allocate the whole chunk up front and exhaust memory, and the
+     *   old parser read "1.5" as 15 and "0" as the default.
      * - If $mode begins with "SAVE:/path/to/file": saves the requested file locally. The
      *   destination extension is REQUIRED to match the key's (see Notes). The path may be
      *   wrapped in square brackets — "SAVE:[/path/to/file]" — and MUST be when it contains
      *   a colon: the path is taken as everything after the FIRST colon, so an unwrapped
      *   Windows path ("SAVE:C:\dir\f.txt") is truncated to "C". Use "SAVE:[C:\dir\f.txt]".
+     *   The object is written to a sibling temporary file and RENAMED over the destination
+     *   only once the download succeeded, so a failure leaves an existing file untouched and
+     *   leaves no partial file behind. (The SDK was handed the destination itself, and the HTTP
+     *   layer writes whatever body comes back into it — a failed download replaced the
+     *   caller's existing file with a truncated one or with S3's XML error document.) The
+     *   destination's directory must exist and be writable.
+     *
+     * The DOWNLOAD_* modes send "Content-Disposition: attachment" with the key's last path
+     * segment as the file name, sanitised for the header (quotes, backslashes and control
+     * characters cannot break out of the quoted value; non-ASCII names travel in filename*),
+     * plus "X-Content-Type-Options: nosniff" so a stored Content-Type is not second-guessed.
      *
      * No‑op behaviour:
      * - When S3 is disabled, returns true (if saving to file or sending to output) or an empty string (if returning in memory).
@@ -1426,7 +1570,8 @@ class S3Storage
      *                      Case-insensitive for the mode name itself; the SAVE path is not.
      * @param string $bucket Bucket name (optional; uses the class default bucket if empty).
      *
-     * @return mixed File content as string, stream resource, true/false when operating on a file or direct output.
+     * @return mixed File content as string (TEXT), a StreamInterface (STREAM), true when saved
+     *               or sent (SAVE / DOWNLOAD_*), false on error.
      */
     public static function download(string $key, string $mode = 'TEXT', string $bucket = ''): mixed
     {
@@ -1458,11 +1603,11 @@ class S3Storage
                 return false;
             }
         } elseif ($realMode === 'DOWNLOAD_STREAM') {
-            $mbStream = filter_var(explode(':', trim($mode ?? ''), 2)[1] ?? '', FILTER_SANITIZE_NUMBER_INT);
-            $mbStream = !empty($mbStream) ? ((int)$mbStream) : 8;
+            $mbArg = trim(explode(':', trim($mode), 2)[1] ?? '');
+            $mbStream = $mbArg === '' ? 8 : (ctype_digit($mbArg) && strlen($mbArg) <= 2 ? (int) $mbArg : 0);
 
-            if (empty($mbStream) || $mbStream <= 0) {
-                self::$lastError = "[AWS S3] download(): The chunk size in MiB was specified incorrectly in mode 'DOWNLOAD_STREAM:[MiB]'.";
+            if ($mbStream < 1 || $mbStream > 64) {
+                self::$lastError = "[AWS S3] download(): The chunk size in MiB was specified incorrectly in mode 'DOWNLOAD_STREAM:[MiB]': expected an integer from 1 to 64, got '" . addcslashes($mbArg, "\0..\37\177") . "'.";
                 return false;
             }
         }
@@ -1495,9 +1640,12 @@ class S3Storage
 
             // Save to disk mode
             if ($realMode === 'SAVE') {
-                $args['SaveAs'] = $saveAs;
-                $client->getObject($args);
-                return true;
+                return self::saveObjectAs($client, $args, $saveAs);
+            }
+
+            // Relay as it arrives instead of buffering the whole object first.
+            if ($realMode === 'DOWNLOAD_STREAM') {
+                $args['@http'] = ['stream' => true];
             }
 
             // Retrieve object in memory
@@ -1525,7 +1673,8 @@ class S3Storage
                     if ($contentLength !== null) {
                         header('Content-Length: ' . $contentLength);
                     }
-                    header('Content-Disposition: attachment; filename="' . $filename . '"');
+                    header('Content-Disposition: ' . self::attachmentDisposition($filename));
+                    header('X-Content-Type-Options: nosniff');
                     header('Cache-Control: private, no-store, no-cache, must-revalidate, max-age=0');
                     header('Pragma: no-cache');
                 }
@@ -1559,6 +1708,81 @@ class S3Storage
             self::$lastError = "[AWS S3] download(): Unexpected error downloading '{$key}' from bucket '{$bucket}': " . $e->getMessage();
             return false;
         }
+    }
+
+    /**
+     * Builds a Content-Disposition value that no object key can break out of.
+     *
+     * The key's last segment used to be interpolated raw into filename="…": a '"' in a key
+     * (legal in S3) closed the quoted string and let the rest of the key add parameters, and a
+     * non-ASCII name arrived mangled. The quoted filename is now an ASCII-only fallback with
+     * every '"', '\', control and non-ASCII byte replaced by '_', and the exact name travels
+     * percent-encoded in filename* (RFC 6266 / RFC 5987), which every current browser prefers.
+     *
+     * @param string $name File name (may be empty, may hold any bytes).
+     *
+     * @return string The header value, without the "Content-Disposition: " prefix.
+     */
+    private static function attachmentDisposition(string $name): string
+    {
+        if ($name === '') {
+            $name = 'download';
+        }
+
+        $fallback = preg_replace('/[^\x20-\x7E]|["\\\\]/', '_', $name) ?? 'download';
+
+        return 'attachment; filename="' . $fallback . '"; filename*=UTF-8\'\'' . rawurlencode($name);
+    }
+
+    /**
+     * download()'s SAVE mode: fetches into a sibling temporary file, then renames it over $saveAs.
+     *
+     * @param S3Client $client Ready client.
+     * @param array    $args   GetObject arguments (Bucket, Key).
+     * @param string   $saveAs Final destination, already validated by download().
+     *
+     * @return bool True once $saveAs holds the complete object; false otherwise (lastError set).
+     *              On false, $saveAs is exactly as it was before the call.
+     *
+     * @throws AwsException|\Throwable Anything getObject() throws, after the temporary file is removed.
+     */
+    private static function saveObjectAs(S3Client $client, array $args, string $saveAs): bool
+    {
+        // Same directory, so the final rename() stays on one filesystem and is atomic.
+        $partial = $saveAs . '.' . bin2hex(random_bytes(6)) . '.part';
+        $args['SaveAs'] = $partial;
+
+        try {
+            $result = $client->getObject($args);
+        } catch (\Throwable $e) {
+            // The HTTP layer may still hold the partial file open through the error response;
+            // Windows cannot delete an open file.
+            if ($e instanceof AwsException) {
+                $e->getResponse()?->getBody()->close();
+            }
+            if (is_file($partial)) {
+                @unlink($partial);
+            }
+            throw $e;
+        }
+
+        $body = $result['Body'] ?? null;
+        if (!is_file($partial)) {
+            // A zero-byte object may never have made the HTTP layer open its sink.
+            file_put_contents($partial, $body instanceof \Psr\Http\Message\StreamInterface ? (string) $body : '');
+        }
+        // Release the sink before renaming: Windows refuses to rename a file that is still open.
+        if ($body instanceof \Psr\Http\Message\StreamInterface) {
+            $body->close();
+        }
+
+        if (!@rename($partial, $saveAs)) {
+            @unlink($partial);
+            self::$lastError = "[AWS S3] download(): The object was downloaded but could not be moved into place at '{$saveAs}' (is it a directory, or not writable?). The destination was left unchanged.";
+            return false;
+        }
+
+        return true;
     }
 
     /**
@@ -1604,7 +1828,10 @@ class S3Storage
      * - Success: returns an array of items with (key, name, size, last_modified, mime?).
      * - Real failure (AWS/IO): returns false and populates getLastError().
      *
-     * @param string $prefix   Prefix to filter objects (e.g. '/stock_adjustments/').
+     * @param string $prefix   Prefix to filter objects (e.g. 'stock_adjustments/'), matched
+     *                         verbatim: '/stock_adjustments/' only matches keys that really
+     *                         start with '/'. The result is keyed by object key; each item's
+     *                         last_modified is in UTC.
      * @param bool   $withMeta If true, includes the 'mime' field via HeadObject (N+1 requests).
      * @param string $bucket   Bucket name (optional; uses the class default bucket if empty).
      *
@@ -1648,8 +1875,17 @@ class S3Storage
                     }
                 }
 
-                $continuation = $result['IsTruncated'] ? ($result['NextContinuationToken'] ?? null) : null;
-            } while (!empty($continuation));
+                $continuation = null;
+                if (!empty($result['IsTruncated'])) {
+                    $continuation = $result['NextContinuationToken'] ?? null;
+                    // Stopping here used to return the partial listing as if it were complete —
+                    // and delete($recursive) acted on it.
+                    if (empty($continuation)) {
+                        self::$lastError = "[AWS S3] list(): Listing of bucket '{$bucket}', prefix '{$prefix}' is truncated but carries no continuation token; refusing to return a partial list as complete.";
+                        return false;
+                    }
+                }
+            } while ($continuation !== null);
             return $files;
         } catch (AwsException $e) {
             self::$lastError = "[AWS S3] list(): Error listing bucket '{$bucket}', prefix '{$prefix}': " . $e->getAwsErrorMessage();

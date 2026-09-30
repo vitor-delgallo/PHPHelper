@@ -49,6 +49,43 @@ final class NumberTest extends TestCase
         $this->assertSame(3.0, Number::roundDecimal(3.14159, 0));
     }
 
+    /**
+     * The docblock used to call 'round' "round-half-up", which for a negative tie means toward
+     * +INF (-0.125 -> -0.12). The code rounds ties AWAY FROM ZERO, like PHP's round(); the doc now
+     * says so, and this pins it - including that it is NOT banker's rounding (2.5 -> 3, not 2).
+     */
+    public function testRoundDecimalBreaksTiesAwayFromZero(): void
+    {
+        $this->assertSame(-0.13, Number::roundDecimal(-0.125, 2));
+        $this->assertSame(0.13, Number::roundDecimal(0.125, 2));
+        $this->assertSame(3.0, Number::roundDecimal(2.5, 0));
+        $this->assertSame(-3.0, Number::roundDecimal(-2.5, 0));
+        $this->assertSame(1.0, Number::roundDecimal(0.5, 0));
+        $this->assertSame(1.01, Number::roundDecimal(1.005, 2), 'the decimal the caller wrote, not 1.00499999999999989...');
+    }
+
+    /**
+     * FINDING (low): a finite value whose scaled form overflowed came back as INF -
+     * roundDecimal(PHP_FLOAT_MAX, 2, 'floor') was INF. Such a double provably has no digits
+     * beyond the requested precision, so it is returned unchanged.
+     */
+    public function testRoundDecimalNeverTurnsAFiniteValueIntoInfinity(): void
+    {
+        foreach (['round', 'floor', 'ceil'] as $method) {
+            $this->assertSame(PHP_FLOAT_MAX, Number::roundDecimal(PHP_FLOAT_MAX, 2, $method), $method);
+            $this->assertSame(-PHP_FLOAT_MAX, Number::roundDecimal(-PHP_FLOAT_MAX, 308, $method), $method);
+            $this->assertSame(1e300, Number::roundDecimal(1e300, 15, $method), $method);
+        }
+    }
+
+    public function testRoundDecimalSnapsSubToleranceValuesOntoTheGrid(): void
+    {
+        // Documented consequence of the 1e-9 snap: it applies to ceil and to ties as well.
+        $this->assertSame(0.0, Number::roundDecimal(1e-12, 2, 'ceil'));
+        $this->assertSame(0.03, Number::roundDecimal(0.024999999996, 2));
+        $this->assertSame(0.02, Number::roundDecimal(0.0249999, 2), 'a genuine sub-tie still rounds down');
+    }
+
     // ------------------------------------------- roundDecimal(): FINDING (medium) — floor/ceil at
     // ------------------------------------------- N decimals lost a cent to representation error
 
@@ -238,8 +275,7 @@ final class NumberTest extends TestCase
         foreach ([-323, -308, -2, 0, 2, 15, 308] as $precision) {
             foreach (['round', 'floor', 'ceil'] as $method) {
                 $result = Number::roundDecimal(1.5, $precision, $method);
-                $this->assertIsFloat($result);
-                $this->assertFalse(is_nan($result), "precision $precision / $method returned NAN");
+                $this->assertTrue(is_finite($result), "precision $precision / $method returned a non-finite value");
             }
         }
     }
@@ -355,6 +391,46 @@ final class NumberTest extends TestCase
 
         // 901 grid points, only 10 of them whole: missing every fraction in 300 draws is ~1e-885.
         $this->assertTrue($sawFraction, 'explicit $decimals must make fractional values reachable');
+    }
+
+    /**
+     * FINDING (low): the derived precision came from a plain (string) cast, which follows the
+     * `precision` ini. Under precision=17, (string)0.1 is "0.10000000000000001", so
+     * randomDecimal(0.1, 0.3) drew on a 1e-17 grid instead of {0.1, 0.2, 0.3} - and a wider range
+     * such as (0.1, 100.0) threw "exceeds the integer range" outright.
+     */
+    public function testRandomDecimalDerivedPrecisionIgnoresThePrecisionIni(): void
+    {
+        $previous = ini_get('precision');
+        try {
+            ini_set('precision', '17');
+            $this->assertSame('0.10000000000000001', (string)0.1, 'precondition: the ini change took effect');
+
+            for ($i = 0; $i < 100; $i++) {
+                $this->assertContains(Number::randomDecimal(0.1, 0.3), [0.1, 0.2, 0.3]);
+                self::assertOnGrid(Number::randomDecimal(0.1, 100.0), 1);
+            }
+        } finally {
+            ini_set('precision', (string)$previous);
+        }
+    }
+
+    public function testRandomDecimalDerivedPrecisionIgnoresTheNumericLocale(): void
+    {
+        $previous = setlocale(LC_NUMERIC, '0');
+        try {
+            if (setlocale(LC_NUMERIC, 'Portuguese_Brazil.1252', 'pt_BR.UTF-8', 'pt_BR', 'de_DE.UTF-8', 'de_DE') === false) {
+                $this->markTestSkipped('No comma-decimal LC_NUMERIC locale is installed.');
+            }
+
+            // [0.5, 0.7] holds no whole number, so if "0,5" were ever read as having no decimals
+            // the call would throw instead of drawing from {0.5, 0.6, 0.7}.
+            for ($i = 0; $i < 100; $i++) {
+                $this->assertContains(Number::randomDecimal(0.5, 0.7), [0.5, 0.6, 0.7]);
+            }
+        } finally {
+            setlocale(LC_NUMERIC, $previous);
+        }
     }
 
     public function testRandomDecimalReachesBothInclusiveBounds(): void

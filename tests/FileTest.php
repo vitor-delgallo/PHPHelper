@@ -266,8 +266,7 @@ final class FileTest extends TestCase {
     /**
      * REGRESSION: octdec() returns int|float and overflows to FLOAT above PHP_INT_MAX. That float
      * flowed straight out of getPermissionMode() into mkdir()/chmod(), which reject it with an
-     * uncaught TypeError ("must be of type int, float given") — thrown from inside createDir(),
-     * which documents a NEGATIVE RETURN CODE as its only error channel and no throw at all.
+     * uncaught TypeError ("must be of type int, float given").
      */
     #[DataProvider('overlongOctalModeProvider')]
     public function testGetPermissionModeNeverReturnsAFloatForAnOctalStringTooLargeForAnInt(string $mode): void {
@@ -281,16 +280,19 @@ final class FileTest extends TestCase {
         );
     }
 
+    /**
+     * createDir() documents a return code as its only error channel. An overlong mode used to be a
+     * TypeError; after pass 4 it silently became the 0755 DEFAULT (wider than anything the caller
+     * could have meant). An explicit mode that cannot be honoured is now -3, and nothing is created.
+     */
     #[DataProvider('overlongOctalModeProvider')]
-    public function testCreateDirSucceedsInsteadOfRaisingATypeErrorForAnOverlongOctalMode(string $mode): void {
+    public function testCreateDirRejectsAnOverlongOctalModeThroughItsReturnCode(string $mode): void {
         $dir = $this->path('overlong_octal');
 
-        // Under the old code this line raised TypeError, which is not an \Exception and would not
-        // even be caught by a consumer's catch (\Exception) block.
         $result = File::createDir($dir, $mode);
 
-        $this->assertSame(2, $result, 'createDir() must report through its documented return code.');
-        $this->assertDirectoryExists($dir);
+        $this->assertSame(-3, $result, 'createDir() must report an unusable mode through its documented return code.');
+        $this->assertDirectoryDoesNotExist($dir);
     }
 
     #[DataProvider('overlongOctalModeProvider')]
@@ -413,20 +415,32 @@ final class FileTest extends TestCase {
         $file = $this->seedFile('data.txt', 'x');
         $info = File::getPathInfo($file);
 
+        // Exact values, not just "ends with a separator": a dir pointing anywhere else would pass that.
+        $this->assertSame(realpath($this->tmp) . DIRECTORY_SEPARATOR, $info['dir']);
+        $this->assertSame(realpath($file), $info['path']);
         $this->assertSame('data.txt', $info['file']);
         $this->assertTrue($info['exists']);
         $this->assertTrue($info['isFile']);
         $this->assertFalse($info['isDir']);
-        $this->assertStringEndsWith(DIRECTORY_SEPARATOR, $info['dir']);
     }
 
     public function testGetPathInfoDescribesAnExistingDirectory(): void {
         $info = File::getPathInfo($this->tmp);
 
+        $this->assertSame(realpath($this->tmp) . DIRECTORY_SEPARATOR, $info['path']);
+        $this->assertSame($info['path'], $info['dir']);
         $this->assertNull($info['file']);
         $this->assertTrue($info['isDir']);
         $this->assertFalse($info['isFile']);
         $this->assertTrue($info['exists']);
+    }
+
+    public function testGetPathInfoResolvesDotSegmentsOfAMissingPathAgainstTheExistingParent(): void {
+        $info = File::getPathInfo($this->path('missing', '..', 'other', '.', 'new.txt'));
+
+        $this->assertSame(realpath($this->tmp) . DIRECTORY_SEPARATOR . 'other' . DIRECTORY_SEPARATOR, $info['dir']);
+        $this->assertSame('new.txt', $info['file']);
+        $this->assertFalse($info['exists']);
     }
 
     public function testGetPathInfoCreatesTheDirectoryWhenCreatePathIsTrue(): void {
@@ -448,7 +462,13 @@ final class FileTest extends TestCase {
     public function testGetPathInfoTreatsAMissingExtensionlessSegmentAsAFileWhenAsked(): void {
         $info = File::getPathInfo($this->path('ghost'), keepFileNotExists: true);
         $this->assertSame('ghost', $info['file']);
+        $this->assertSame(realpath($this->tmp) . DIRECTORY_SEPARATOR, $info['dir']);
         $this->assertFalse($info['exists']);
+
+        // Without the flag the same missing, extension-less segment is a DIRECTORY.
+        $asDir = File::getPathInfo($this->path('ghost'));
+        $this->assertNull($asDir['file']);
+        $this->assertSame(realpath($this->tmp) . DIRECTORY_SEPARATOR . 'ghost' . DIRECTORY_SEPARATOR, $asDir['dir']);
     }
 
     // ---------------------------------------------------------------------
@@ -997,10 +1017,18 @@ final class FileTest extends TestCase {
         $this->seedFile('plainout', 'placeholder');
         $out = $this->path('plainout');
 
+        // The working directory is moved into the scratch dir, so a regression writes its stray
+        // ".zip" there instead of into the repository.
+        $cwd = getcwd();
+        chdir($this->tmp);
         $strayInCwd = getcwd() . DIRECTORY_SEPARATOR . '.zip';
         $this->assertFileDoesNotExist($strayInCwd, 'Precondition: no stray .zip in the working directory.');
 
-        $this->assertTrue(File::zipDirectory($src, $out, null, true));
+        try {
+            $this->assertTrue(File::zipDirectory($src, $out, null, true));
+        } finally {
+            chdir($cwd);
+        }
 
         $this->assertFileExists(
             $this->path('plainout.zip'),
@@ -1149,14 +1177,20 @@ final class FileTest extends TestCase {
         $this->assertSame(['keep.txt'], $this->entriesIn($dir));
     }
 
-    public function testDeleteFilesReducesTraversingNamesToTheirLeafAndCannotEscapeTheDirectory(): void {
+    /**
+     * A traversing name must neither escape the directory NOR be re-targeted at the same-named leaf
+     * inside it: reducing "../outside.txt" to "outside.txt" deleted bin/outside.txt, a file the
+     * caller never named. The old version of this test seeded no such leaf, so it could not see it.
+     */
+    public function testDeleteFilesRefusesTraversingNamesInsteadOfEscapingOrRetargetingThem(): void {
         $outside = $this->seedFile('outside.txt', 'must survive');
-        $this->seedFile('bin' . DIRECTORY_SEPARATOR . 'a.txt');
+        $sameLeaf = $this->seedFile('bin' . DIRECTORY_SEPARATOR . 'outside.txt', 'must survive too');
         $dir = $this->path('bin');
 
-        File::deleteFiles(['..' . DIRECTORY_SEPARATOR . 'outside.txt', $outside], $dir);
+        $this->assertFalse(File::deleteFiles(['..' . DIRECTORY_SEPARATOR . 'outside.txt', '../outside.txt', $outside], $dir));
 
         $this->assertFileExists($outside, 'deleteFiles() must never delete outside the given directory.');
+        $this->assertFileExists($sameLeaf, 'deleteFiles() must never delete a file other than the one named.');
     }
 
     public function testDeleteFilesReturnsFalseForAMissingDirectory(): void {
@@ -1178,7 +1212,7 @@ final class FileTest extends TestCase {
     public function testRenameUploadFileKeepsTheExtensionAndAppendsAUniqueSuffix(): void {
         $name = File::renameUploadFile('report.JPEG');
 
-        $this->assertMatchesRegularExpression('/^report_\d{14}\d{1,3}\.jpeg$/', $name);
+        $this->assertMatchesRegularExpression('/^report_\d{17}\.jpeg$/', $name);
     }
 
     /**
@@ -1236,7 +1270,7 @@ final class FileTest extends TestCase {
     public function testRenameUploadFileHandlesANameWithoutAnExtension(): void {
         $name = File::renameUploadFile('plainname');
 
-        $this->assertMatchesRegularExpression('/^plainname_\d{14}\d{1,3}$/', $name);
+        $this->assertMatchesRegularExpression('/^plainname_\d{17}$/', $name);
         $this->assertStringNotContainsString('.', $name);
     }
 
@@ -1255,7 +1289,7 @@ final class FileTest extends TestCase {
         $name = File::renameUploadFile('file.###');
 
         $this->assertStringEndsNotWith('.', $name);
-        $this->assertMatchesRegularExpression('/^file_\d{14}\d{1,3}$/', $name);
+        $this->assertMatchesRegularExpression('/^file_\d{17}$/', $name);
     }
 
     /**
@@ -1270,7 +1304,7 @@ final class FileTest extends TestCase {
         $name = File::renameUploadFile('relatório final.csv');
 
         $this->assertStringEndsWith('.csv', $name);
-        $this->assertMatchesRegularExpression('/^relatorio_final_\d{14}\d{1,3}\.csv$/', $name);
+        $this->assertMatchesRegularExpression('/^relatorio_final_\d{17}\.csv$/', $name);
     }
 
     /**
@@ -1281,7 +1315,7 @@ final class FileTest extends TestCase {
     public function testRenameUploadFileKeepsUnderscoresWithoutWideningTheCharset(): void {
         $name = File::renameUploadFile('my_file name!@#$.csv');
 
-        $this->assertMatchesRegularExpression('/^my_file_name_\d{14}\d{1,3}\.csv$/', $name);
+        $this->assertMatchesRegularExpression('/^my_file_name_\d{17}\.csv$/', $name);
         $this->assertStringNotContainsString('/', $name);
         $this->assertStringNotContainsString('\\', $name);
         $this->assertStringNotContainsString('!', $name);
@@ -1293,15 +1327,17 @@ final class FileTest extends TestCase {
         $this->assertGreaterThan(100, strlen($name), 'The fallback budget must be the documented 125, not 0.');
     }
 
-    public function testRenameUploadFileReturnsADifferentNameForRepeatedCalls(): void {
+    /**
+     * Named for what it checks: uniqueness is best-effort by design (a 1/1000 draw per second), so
+     * only the fixed suffix shape can be asserted deterministically on repeated calls.
+     */
+    public function testRenameUploadFileKeepsTheFixedSuffixShapeOnRepeatedCalls(): void {
         $names = [];
         for ($i = 0; $i < 25; $i++) {
             $names[] = File::renameUploadFile('same.txt');
         }
-        // rand(0,999) can collide; assert the suffix shape holds for every result instead of
-        // asserting uniqueness, which would be flaky by design (documented as best-effort).
         foreach ($names as $name) {
-            $this->assertMatchesRegularExpression('/^same_\d{14}\d{1,3}\.txt$/', $name);
+            $this->assertMatchesRegularExpression('/^same_\d{17}\.txt$/', $name);
         }
     }
 
@@ -1630,25 +1666,33 @@ PHP;
         ];
     }
 
-    public function testDownloadFileWithAnEmptyNameReturnsImmediatelyAndDeletesNothing(): void {
+    /**
+     * An empty name used to RETURN silently — nothing sent, $terminateAfterDownload ignored, so the
+     * caller's page kept rendering after what it believed was an exit(). It is now a loud error,
+     * raised before anything is sent or deleted.
+     */
+    public function testDownloadFileWithAnEmptyNameThrowsAndDeletesNothing(): void {
         $file = $this->seedFile('keep.txt', 'still here');
 
         $this->expectOutputString('');
-        File::downloadFile($file, null, true, false);
+        try {
+            File::downloadFile($file, null, true, false);
+            $this->fail('A null download name must be rejected.');
+        } catch (\InvalidArgumentException $e) {
+            $this->assertStringContainsString('download name is required', $e->getMessage());
+        }
 
-        $this->assertFileExists($file, 'An empty download name must abort before any deletion.');
-        $this->assertSame('still here', file_get_contents($file));
+        $this->assertSame('still here', file_get_contents($file), 'An empty download name must abort before any deletion.');
     }
 
-    public function testDownloadFileWithAnEmptyNameDoesNotTerminateEvenWhenAskedTo(): void {
+    public function testDownloadFileWithAnEmptyNameThrowsEvenWhenAskedToTerminate(): void {
         $file = $this->seedFile('keep.txt');
 
         $this->expectOutputString('');
-        // Documented quirk: the empty-name guard returns before $terminateAfterDownload is read,
-        // so this must NOT exit() the process. Reaching the assertion below is the proof.
-        File::downloadFile($file, '', false, true);
-
-        $this->assertTrue(true, 'downloadFile() returned instead of terminating the process.');
+        // Under the default terminate=true, a regression to "return silently" is caught by the
+        // expectation; a regression to "stream and exit" would kill the runner and fail loudly.
+        $this->expectException(\InvalidArgumentException::class);
+        File::downloadFile($file, '', true, true);
     }
 
     /**

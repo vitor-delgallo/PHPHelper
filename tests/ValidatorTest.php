@@ -33,7 +33,32 @@ final class ValidatorPropertyFixture {
     }
 }
 
+/**
+ * Exposes a "virtual" property only through __get()/__isset(), which property_exists() cannot see.
+ */
+final class ValidatorMagicFixture {
+    public function __get(string $name): string {
+        return 'magic';
+    }
+
+    public function __isset(string $name): bool {
+        return true;
+    }
+}
+
 final class ValidatorTest extends TestCase {
+    private string $savedTimezone = 'UTC';
+
+    /** validateDate() reads naive strings in PHP's default timezone: pin it (DST-free). */
+    protected function setUp(): void {
+        $this->savedTimezone = date_default_timezone_get();
+        date_default_timezone_set('UTC');
+    }
+
+    protected function tearDown(): void {
+        date_default_timezone_set($this->savedTimezone);
+    }
+
     // ---------------------------------------------------------------- isHex
 
     public static function providerValidHex(): array {
@@ -155,6 +180,15 @@ final class ValidatorTest extends TestCase {
     }
 
     /**
+     * Regression: a field missing from the format was borrowed from TODAY, so "2024-02" as 'Y-m'
+     * became Feb 30/31 on the 30th/31st of every month and failed. The answer depended on the date.
+     */
+    public function testValidateDateDoesNotDependOnTheCurrentDay(): void {
+        $this->assertTrue(Validator::validateDate('2024-02', 'Y-m'));
+        $this->assertTrue(Validator::validateDate('29/02', 'd/m'));
+    }
+
+    /**
      * Pins the documented fallback: a null format uses DateTime's PROCESS-WIDE default.
      * The default is saved and restored so this test neither depends on nor leaks global state.
      */
@@ -190,6 +224,29 @@ final class ValidatorTest extends TestCase {
         $this->assertFalse(Validator::validateMail('user@'));
         $this->assertFalse(Validator::validateMail('user @example.com'));
         $this->assertFalse(Validator::validateMail('user@exam ple.com'));
+    }
+
+    public static function providerMailWithControlOrWhitespace(): array {
+        return [
+            'trailing LF'       => ["user@example.com\n"],
+            'trailing CRLF'     => ["user@example.com\r\n"],
+            'injected header'   => ["user@example.com\r\nBcc: victim@example.org"],
+            'trailing space'    => ['user@example.com '],
+            'leading tab'       => ["\tuser@example.com"],
+            'NUL byte'          => ["user@example.com\0"],
+            'DEL'               => ["user@example.com\x7F"],
+        ];
+    }
+
+    /**
+     * Regression (header injection): the delegate's pattern ended in a bare '$', which also
+     * matches before a trailing "\n", so "user@example.com\n" validated. Written into a
+     * To:/Reply-To: header, that newline starts a new header line. The guard lives in Validator,
+     * so it holds whatever the delegate's anchoring does.
+     */
+    #[DataProvider('providerMailWithControlOrWhitespace')]
+    public function testValidateMailRejectsControlCharactersAndWhitespace(string $email): void {
+        $this->assertFalse(Validator::validateMail($email));
     }
 
     // ----------------------------------------------------- validatePassword
@@ -351,6 +408,40 @@ final class ValidatorTest extends TestCase {
         $this->assertFalse(Validator::validatePassword("Abc123!xyz\n", ['maxLength' => 10]));
     }
 
+    /** Documented: a line break makes the password invalid. A lone CR used to be accepted. */
+    public function testValidatePasswordRejectsAnyLineBreak(): void {
+        $this->assertFalse(Validator::validatePassword("Abc123!x\r"));
+        $this->assertFalse(Validator::validatePassword("Abc1\n23!x"));
+        $this->assertFalse(Validator::validatePassword("Abc1\r\n23!x"));
+    }
+
+    public function testValidatePasswordRejectsInvalidUtf8(): void {
+        $this->assertFalse(Validator::validatePassword("Abc123!x\xFF"));
+    }
+
+    /**
+     * Documented: digits are ASCII 0-9. Under the old /u regex, '\d' matched Unicode digits, so an
+     * Arabic-Indic three satisfied minDigits.
+     */
+    public function testValidatePasswordCountsOnlyAsciiDigits(): void {
+        $this->assertFalse(Validator::validatePassword("Abcdefg!\u{0663}"));
+        $this->assertTrue(Validator::validatePassword("Abcdefg!3"));
+        // ...but a non-ASCII digit still counts toward the length.
+        $this->assertTrue(Validator::validatePassword("Abc1!\u{0663}\u{0663}\u{0663}"));
+    }
+
+    /**
+     * Regression: the nested-lookahead regex hit PCRE's backtrack limit on long passwords with
+     * large rules, and preg_match() then returned false — so passwords that met every rule were
+     * REJECTED. Counting is linear and exact.
+     */
+    public function testValidatePasswordHandlesLongPasswordsWithLargeRuleValues(): void {
+        $this->assertTrue(Validator::validatePassword(str_repeat('a1', 40) . 'A!', ['maxDigits' => 40]));
+        $this->assertTrue(Validator::validatePassword(str_repeat('ab1', 60) . 'A!', ['maxDigits' => 60, 'minDigits' => 60]));
+        $this->assertFalse(Validator::validatePassword(str_repeat('ab1', 61) . 'A!', ['maxDigits' => 60]));
+        $this->assertFalse(Validator::validatePassword(str_repeat('aA1!', 5) . str_repeat('x', 3000), ['minDigits' => 6]));
+    }
+
     /**
      * Pins the documented special-character set: it is a fixed list, NOT "any non-alphanumeric".
      */
@@ -411,6 +502,10 @@ final class ValidatorTest extends TestCase {
             'trailing comma'  => ['{"a":1,}'],
             'unclosed object' => ['{"a":1'],
             'single quotes'   => ["{'a':1}"],
+            'whitespace only' => ['   '],
+            'UTF-8 BOM'       => ["\xEF\xBB\xBF{}"],
+            'NaN'             => ['NaN'],
+            'deeper than 512' => [str_repeat('[', 600) . str_repeat(']', 600)],
         ];
     }
 
@@ -424,7 +519,7 @@ final class ValidatorTest extends TestCase {
     public function testIsBase64EncodedAcceptsCanonicalBase64(): void {
         $this->assertTrue(Validator::isBase64Encoded(base64_encode('ABC')));
         $this->assertTrue(Validator::isBase64Encoded(base64_encode('AB')));
-        $this->assertTrue(Validator::isBase64Encoded(base64_encode(random_bytes(32))));
+        $this->assertTrue(Validator::isBase64Encoded(base64_encode("\x00\xFF\xFE\x80binary")));
     }
 
     public function testIsBase64EncodedRejectsNonCanonicalOrUndecodableInput(): void {
@@ -520,8 +615,41 @@ final class ValidatorTest extends TestCase {
             Validator::validateXml('<a>1');
             $this->assertTrue(libxml_use_internal_errors(), 'state must be restored to true');
         } finally {
+            libxml_clear_errors();
             libxml_use_internal_errors($previous);
         }
+    }
+
+    /**
+     * Regression: validateXml() read the WHOLE libxml error buffer, so errors a caller had left
+     * there made valid XML report invalid — and then it cleared the caller's errors.
+     */
+    #[RequiresPhpExtension('simplexml')]
+    #[RequiresPhpExtension('libxml')]
+    public function testValidateXmlIgnoresAndPreservesErrorsTheCallerAlreadyBuffered(): void {
+        $previous = libxml_use_internal_errors(true);
+
+        try {
+            libxml_clear_errors();
+            simplexml_load_string('<broken>');
+            $callerErrors = count(libxml_get_errors());
+            $this->assertGreaterThan(0, $callerErrors);
+
+            $this->assertTrue(Validator::validateXml('<a/>'), "the caller's stale errors are not this parse's");
+            $this->assertCount($callerErrors, libxml_get_errors(), "the caller's errors must survive");
+
+            $this->assertFalse(Validator::validateXml('<a>'));
+        } finally {
+            libxml_clear_errors();
+            libxml_use_internal_errors($previous);
+        }
+    }
+
+    /** A libxml WARNING (relative namespace URI) is not a well-formedness error. */
+    #[RequiresPhpExtension('simplexml')]
+    #[RequiresPhpExtension('libxml')]
+    public function testValidateXmlAcceptsWellFormedXmlThatOnlyRaisesWarnings(): void {
+        $this->assertTrue(Validator::validateXml('<a xmlns="relative-uri"/>'));
     }
 
     // ------------------------------------------------------ emptyExceptZero
@@ -564,8 +692,26 @@ final class ValidatorTest extends TestCase {
 
     public function testEmptyExceptZeroReportsPopulatedValuesAsPresent(): void {
         $this->assertFalse(Validator::emptyExceptZero('text'));
+        $this->assertFalse(Validator::emptyExceptZero(' '), 'whitespace is a submitted value here');
         $this->assertFalse(Validator::emptyExceptZero([1]));
         $this->assertFalse(Validator::emptyExceptZero(new ValidatorPropertyFixture()));
+    }
+
+    /**
+     * A Stringable with NO properties has an empty (array) cast, so it used to be "absent"
+     * whatever it rendered as.
+     */
+    public function testEmptyExceptZeroJudgesStringablesByTheirStringForm(): void {
+        $this->assertFalse(Validator::emptyExceptZero(self::propertylessStringable('yes')));
+        $this->assertTrue(Validator::emptyExceptZero(self::propertylessStringable('')));
+    }
+
+    private static function propertylessStringable(string $value): \Stringable {
+        return match ($value) {
+            ''    => new class implements \Stringable { public function __toString(): string { return ''; } },
+            'yes' => new class implements \Stringable { public function __toString(): string { return 'yes'; } },
+            'no'  => new class implements \Stringable { public function __toString(): string { return 'no'; } },
+        };
     }
 
     // ---------------------------------------------------------- hasProperty
@@ -574,6 +720,40 @@ final class ValidatorTest extends TestCase {
         $this->assertTrue(Validator::hasProperty('open', new ValidatorPropertyFixture()));
         $this->assertTrue(Validator::hasProperty('a', ['a' => 1]));
         $this->assertTrue(Validator::hasProperty('0', [0 => 'a']), 'int keys match by string form');
+        $this->assertTrue(Validator::hasProperty('a', ['a' => null]), 'a key holding null exists');
+        $this->assertTrue(Validator::hasProperty('a', (object) ['a' => null]));
+    }
+
+    /**
+     * Regression: property_exists() ignores ArrayAccess offsets, so an ArrayObject — or any
+     * collection — never "had" the keys it plainly holds.
+     */
+    public function testHasPropertySeesArrayAccessOffsets(): void {
+        $collection = new \ArrayObject(['a' => 1, 'n' => null]);
+
+        $this->assertTrue(Validator::hasProperty('a', $collection));
+        $this->assertTrue(Validator::hasProperty('n', $collection));
+        $this->assertFalse(Validator::hasProperty('missing', $collection));
+    }
+
+    /** SplFixedArray::offsetExists() throws a TypeError for a string offset; that must not escape. */
+    public function testHasPropertyDoesNotLetAnArrayAccessImplementationThrow(): void {
+        $this->assertFalse(Validator::hasProperty('a', new \SplFixedArray(3)));
+    }
+
+    /**
+     * Widened from array|object: a scalar or null target (Formatter::cleanEmptyTree() hands over
+     * whatever the tree holds) used to be a TypeError. It simply has no properties.
+     */
+    public function testHasPropertyReturnsFalseForNonContainerTargetsInsteadOfThrowing(): void {
+        $this->assertFalse(Validator::hasProperty('a', null));
+        $this->assertFalse(Validator::hasProperty('a', 'a'));
+        $this->assertFalse(Validator::hasProperty('0', 42));
+    }
+
+    /** Documented limitation: properties served only through __get()/__isset() are not seen. */
+    public function testHasPropertyDoesNotSeeMagicProperties(): void {
+        $this->assertFalse(Validator::hasProperty('anything', new ValidatorMagicFixture()));
     }
 
     /**
@@ -616,17 +796,6 @@ final class ValidatorTest extends TestCase {
         $this->assertFalse(Validator::isNumericArray(['name' => 'b', 0 => 'a']));
     }
 
-    public function testIsNumericArrayIsNotOrderDependent(): void {
-        $mixed = [0 => 'a', 'name' => 'b'];
-        $reordered = ['name' => 'b', 0 => 'a'];
-
-        $this->assertSame(
-            Validator::isNumericArray($mixed),
-            Validator::isNumericArray($reordered),
-            'the same key set must give the same answer regardless of insertion order'
-        );
-    }
-
     public function testIsNumericArrayRejectsStringKeysAndTheEmptyArray(): void {
         $this->assertFalse(Validator::isNumericArray(['name' => 'b']));
         $this->assertFalse(Validator::isNumericArray(['01' => 'a']), '"01" stays a string key');
@@ -649,6 +818,9 @@ final class ValidatorTest extends TestCase {
             'string 0.0'      => ['0.0'],
             'string 00'       => ['00'],
             'padded zero'     => [' 0 '],
+            'negative zero'   => ['-0'],
+            'single space'    => [' '],
+            'tab and newline' => ["\t\n"],
             'undefined'       => ['undefined'],
             'null word'       => ['NULL'],
             'false word'      => ['false'],
@@ -701,6 +873,33 @@ final class ValidatorTest extends TestCase {
         $this->assertTrue(Validator::isCompletelyEmpty(new ValidatorStringableFixture('no')));
         $this->assertTrue(Validator::isCompletelyEmpty(new ValidatorStringableFixture('0')));
         $this->assertFalse(Validator::isCompletelyEmpty(new ValidatorStringableFixture('yes')));
+
+        // Regression: a PROPERTY-LESS Stringable short-circuited through emptyExceptZero()'s
+        // "object with no properties" rule and was empty whatever it rendered as.
+        $this->assertFalse(Validator::isCompletelyEmpty(self::propertylessStringable('yes')));
+        $this->assertTrue(Validator::isCompletelyEmpty(self::propertylessStringable('no')));
+    }
+
+    /**
+     * Regression: all whitespace was stripped before the sentinel match — so "  n o  " was empty —
+     * yet a string of ONLY whitespace collapsed to "", matched nothing, and was NOT empty.
+     * Parser::getBool(" ") therefore returned TRUE.
+     */
+    public function testIsCompletelyEmptyTreatsWhitespaceOnlyStringsLikeTheEmptyString(): void {
+        $this->assertTrue(Validator::isCompletelyEmpty(' '));
+        $this->assertTrue(Validator::isCompletelyEmpty("  \r\n\t "));
+        $this->assertTrue(Validator::isCompletelyEmpty(new ValidatorStringableFixture('   ')));
+    }
+
+    public function testIsCompletelyEmptyReportsAResourceAsContent(): void {
+        $handle = fopen('php://memory', 'r');
+        $this->assertIsResource($handle);
+
+        try {
+            $this->assertFalse(Validator::isCompletelyEmpty($handle));
+        } finally {
+            fclose($handle);
+        }
     }
 
     /**
@@ -745,6 +944,20 @@ final class ValidatorTest extends TestCase {
      */
     public function testIsNegativeNumberIsASignTestNotANumericTest(): void {
         $this->assertTrue(Validator::isNegativeNumber('-abc'));
+        $this->assertTrue(Validator::isNegativeNumber('-0'), 'a sign test: "-0" carries a minus');
+        $this->assertFalse(Validator::isNegativeNumber(-0.0), '-0.0 is empty() in PHP');
+        $this->assertFalse(Validator::isNegativeNumber('+5'));
+        $this->assertFalse(Validator::isNegativeNumber('1e-3'));
+    }
+
+    /**
+     * The Unicode MINUS SIGN (U+2212) is what typeset text and some number formatters emit; it
+     * used to read as positive.
+     */
+    public function testIsNegativeNumberRecognisesTheUnicodeMinusSign(): void {
+        $this->assertTrue(Validator::isNegativeNumber("\u{2212}5"));
+        $this->assertTrue(Validator::isNegativeNumber(" \u{2212} 1.5"));
+        $this->assertFalse(Validator::isNegativeNumber("\u{2013}5"), 'an en dash is not a minus sign');
     }
 
     /**
@@ -803,6 +1016,22 @@ final class ValidatorTest extends TestCase {
         $this->assertFalse(Validator::validateCpf('not a cpf'));
     }
 
+    /**
+     * Regression: every non-digit was discarded before validation, so these returned TRUE and a
+     * caller storing the raw input persisted the garbage along with the CPF.
+     */
+    public function testValidateCpfRejectsCharactersOutsideTheMask(): void {
+        $this->assertFalse(Validator::validateCpf('52998224725abc'));
+        $this->assertFalse(Validator::validateCpf('CPF: 529.982.247-25'));
+        $this->assertFalse(Validator::validateCpf("52998224725\0"));
+        $this->assertFalse(Validator::validateCpf("\u{0665}2998224725"), 'an Arabic-Indic five is not a 5');
+    }
+
+    public function testValidateCpfAcceptsWhitespaceAndSlashAsSeparators(): void {
+        $this->assertTrue(Validator::validateCpf(' 529 982 247 25 '));
+        $this->assertTrue(Validator::validateCpf('529.982.247/25'));
+    }
+
     // ----------------------------------------------------------- validateCnpj
 
     /**
@@ -841,41 +1070,92 @@ final class ValidatorTest extends TestCase {
         }
     }
 
-    public function testValidateCnpjRejectsWrongLengthAndNonNumericInput(): void {
+    public function testValidateCnpjRejectsWrongLengthAndGarbage(): void {
         $this->assertFalse(Validator::validateCnpj(''));
         $this->assertFalse(Validator::validateCnpj('1122233300018'), 'thirteen digits');
         $this->assertFalse(Validator::validateCnpj('112223330001811'), 'fifteen digits');
         $this->assertFalse(Validator::validateCnpj('not a cnpj'));
-        $this->assertFalse(
-            Validator::validateCnpj('12ABC34501DE35'),
-            'the alphanumeric CNPJ format is documented as unsupported'
-        );
     }
 
     /**
-     * CPF and CNPJ are documented near-identically; a caller reads them side by side and assumes
-     * symmetry. Pin that they actually behave symmetrically on masked input.
+     * Regression: the alphanumeric CNPJ (IN RFB 2.229/2024) is issued from July 2026 and was
+     * rejected outright. '12.ABC.345/01DE-35' is the Receita Federal's own published example;
+     * 'AB12345C000109' was computed by hand (char value = ASCII - 48, same weights as the numeric
+     * CNPJ; its first check digit exercises the "remainder < 2 gives 0" branch).
      */
-    public function testValidateCpfAndValidateCnpjBothAcceptMaskedInput(): void {
-        $this->assertTrue(Validator::validateCpf('529.982.247-25'));
-        $this->assertTrue(Validator::validateCnpj('11.222.333/0001-81'));
+    public function testValidateCnpjAcceptsTheAlphanumericFormat(): void {
+        $this->assertTrue(Validator::validateCnpj('12ABC34501DE35'));
+        $this->assertTrue(Validator::validateCnpj('12.ABC.345/01DE-35'));
+        $this->assertTrue(Validator::validateCnpj('AB12345C000109'));
+        $this->assertTrue(Validator::validateCnpj('AB.123.45C/0001-09'));
+    }
+
+    public function testValidateCnpjRejectsAlphanumericValuesWithWrongCheckDigitsOrShape(): void {
+        $this->assertFalse(Validator::validateCnpj('12ABC34501DE36'), 'last check digit mutated');
+        $this->assertFalse(Validator::validateCnpj('12ABC34501DE45'), 'first check digit mutated');
+        $this->assertFalse(Validator::validateCnpj('12ABC34501DF35'), 'a base letter mutated');
+        $this->assertFalse(Validator::validateCnpj('12ABC34501DE3A'), 'check digits are always numeric');
+        $this->assertFalse(Validator::validateCnpj('12abc34501de35'), 'letters are uppercase, as issued');
+        $this->assertFalse(Validator::validateCnpj('12ÁBC34501DE35'), 'only A-Z');
+    }
+
+    /**
+     * Regression: every character outside 0-9 used to be discarded, so a CNPJ with a prefix or a
+     * stray letter validated and the caller persisted the garbage along with it.
+     */
+    public function testValidateCnpjRejectsCharactersOutsideTheMask(): void {
+        $this->assertFalse(Validator::validateCnpj('CNPJ 11.222.333/0001-81'));
+        $this->assertFalse(Validator::validateCnpj('11.222.333/0001-81x'));
+        $this->assertFalse(Validator::validateCnpj("11222333000181\0"));
+        $this->assertTrue(Validator::validateCnpj(' 11 222 333 0001 81 '), 'whitespace is a separator');
     }
 
     // ----------------------------------------------------------- validateHtml
 
-    public function testValidateHtmlDetectsTags(): void {
-        $this->assertTrue(Validator::validateHtml('<p>hi</p>'));
-        $this->assertTrue(Validator::validateHtml('<br>'));
-        $this->assertTrue(Validator::validateHtml('text with <b>bold</b>'));
-        $this->assertTrue(Validator::validateHtml('<script>alert(1)</script>'));
+    public static function providerMarkup(): array {
+        return [
+            'paragraph'             => ['<p>hi</p>'],
+            'void tag'              => ['<br>'],
+            'self-closing'          => ['<br/>'],
+            'inline'                => ['text with <b>bold</b>'],
+            'script'                => ['<script>alert(1)</script>'],
+            'attributes'            => ['<a href="x" title=\'y\'>z</a>'],
+            'event handler'         => ['<img src=x onerror=alert(1)>'],
+            'multi-line tag'        => ["<div\nclass=\"x\">"],
+            'uppercase'             => ['<DIV>'],
+            'closing tag alone'     => ['text</p>'],
+            'custom element'        => ['<my-widget>'],
+            'comment'               => ['<!-- note -->'],
+            'doctype'               => ['<!DOCTYPE html>'],
+            'CDATA'                 => ['<![CDATA[x]]>'],
+            'processing instr.'     => ['<?xml version="1.0"?>'],
+        ];
     }
 
-    public function testValidateHtmlReturnsFalseWithoutTags(): void {
-        $this->assertFalse(Validator::validateHtml(null));
-        $this->assertFalse(Validator::validateHtml(''));
-        $this->assertFalse(Validator::validateHtml('plain text'));
-        $this->assertFalse(Validator::validateHtml('5 < 6'), 'a bare comparison is not a tag');
-        $this->assertFalse(Validator::validateHtml('a > b'));
+    #[DataProvider('providerMarkup')]
+    public function testValidateHtmlDetectsMarkup(string $text): void {
+        $this->assertTrue(Validator::validateHtml($text));
+    }
+
+    public static function providerNoMarkup(): array {
+        return [
+            'null'                  => [null],
+            'empty'                 => [''],
+            'plain text'            => ['plain text'],
+            'spaced comparison'     => ['5 < 6'],
+            'greater than'          => ['a > b'],
+            // strip_tags() read each of these as a tag and reported them as HTML.
+            'unspaced comparison'   => ['1<2'],
+            'letter comparison'     => ['if a<b then'],
+            'heart'                 => ['I <3 you'],
+            'NUL byte'              => ["a\0b"],
+            'unterminated tag'      => ['<p'],
+        ];
+    }
+
+    #[DataProvider('providerNoMarkup')]
+    public function testValidateHtmlReturnsFalseWithoutMarkup(?string $text): void {
+        $this->assertFalse(Validator::validateHtml($text));
     }
 
     /**

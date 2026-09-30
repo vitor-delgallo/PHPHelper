@@ -24,15 +24,28 @@ class Mailer {
      *                       you the exact word 'none'.
      *                       Note that 'none' means "do not REQUIRE encryption", not "refuse it":
      *                       PHPMailer's SMTPAutoTLS still upgrades to STARTTLS opportunistically
-     *                       when the server advertises it.
+     *                       when the server advertises it. 'tls' never falls back: a server that
+     *                       refuses STARTTLS fails the send before any credential is sent.
+     *                       OPTIONAL: 'timeout' — seconds (positive int) for the SMTP connection and
+     *                       each command. PHPMailer's own default is 300, i.e. an unresponsive
+     *                       server holds the calling request for five minutes. Any other value
+     *                       returns FALSE.
      *                       A missing required key makes this function return FALSE without
      *                       sending, throwing, or logging.
      * @param array $sendTo List of recipients, each ['email' => string (required), 'name' => string
-     *                      (optional, the display name; defaults to '')]
-     * @param string $subject Email subject
-     * @param string $body Email body content (HTML). Required, must be non-empty, and is used
-     *                     verbatim as the message body — UNLESS $template names a Laravel view that
-     *                     actually exists, which is the only thing that can replace it.
+     *                      (optional, the display name; defaults to '')]. Every entry — here and in
+     *                      $cc/$cco/$reply/$files/$stringFiles — is shape-checked BEFORE anything is
+     *                      built: a malformed entry (a bare string, a missing 'email', a non-string
+     *                      name) returns FALSE. It used to escape as a TypeError ("Cannot access
+     *                      offset of type string on string") from a function that promises bool.
+     *                      CR/LF in a display name or in $subject is stripped by PHPMailer, and an
+     *                      address containing them is rejected, so neither can inject a header.
+     * @param string $subject Email subject. Required: '' returns FALSE (the subject "0" is fine; it
+     *                        used to be rejected by empty()).
+     * @param string $body Email body content (HTML). Required, must be non-empty ('' and "0" return
+     *                     FALSE — PHPMailer treats "0" as an empty body), and is used verbatim as the
+     *                     message body — UNLESS $template names a Laravel view that actually exists,
+     *                     which is the only thing that can replace it.
      *
      * Optional parameters:
      * @param string|null $useConfig Optional shortcut, case-insensitive. The set is CLOSED:
@@ -47,7 +60,11 @@ class Mailer {
      *                    so omitting them makes every send return FALSE.
      * @param string|null $lang Language setting for the email
      * @param array $files File attachments, each ['file' => string path (required), 'name' => string
-     *                     (optional, the attachment filename; defaults to '')]
+     *                     (optional, the attachment filename; defaults to the file's basename)]. The
+     *                     path is used AS GIVEN — no allow-list applies here, unlike embedded images —
+     *                     so never build it from untrusted input. A missing/unreadable file (or a
+     *                     stream-wrapper path such as phar://) fails the WHOLE send with FALSE.
+     *                     Attachment names are RFC 2047-encoded and CR/LF-stripped by PHPMailer.
      * @param array $stringFiles String-based attachments, each ['string' => string contents
      *                           (required), 'name' => string (optional, filename; defaults to '')]
      * @param int $priority Email priority (1: High, 2: Medium, 3: Low)
@@ -55,7 +72,8 @@ class Mailer {
      * @param array $cc List of CC recipients — same shape as $sendTo
      * @param array $cco List of BCC recipients — same shape as $sendTo
      * @param array $reply List of reply-to addresses — same shape as $sendTo
-     * @param array $headers Custom headers
+     * @param array $headers Custom headers, as accepted by URL::buildHttpHeaderArray(). A header
+     *                       that is malformed or carries CR/LF returns FALSE.
      * @param string|null $template Name of a Laravel Blade view to render as the body, which
      *                    receives ['lang', 'debugMode', 'sendTo', 'subject', 'body']. It is NOT a
      *                    raw HTML body: pass HTML as $body. $body is used instead whenever
@@ -79,7 +97,10 @@ class Mailer {
      *                    the scan (HTML5 drops such a tag too): the rest of the body still ships
      *                    verbatim, simply with nothing embedded from that point on.
      *                    Requires $embeddedImagesBaseDir; see there.
-     * @param string $charset Charset (default: UTF-8)
+     * @param string $charset Charset (default: UTF-8). Must be an RFC 2978 charset name (letters,
+     *                        digits and !#$%&'+-^_`{}~); anything else returns FALSE. PHPMailer writes
+     *                        it into every MIME part header unescaped, so a CR/LF in it used to inject
+     *                        headers — and whole body text — into the message parts.
      * @param bool $useAuth Whether to authenticate with $configs['user'] / $configs['pass'].
      *                      Governs the CREDENTIALS ONLY — 'host', 'port' and 'secure' are applied
      *                      to the transport either way whenever $isSMTP is TRUE.
@@ -87,33 +108,44 @@ class Mailer {
      *                     mail() and EVERY transport key in $configs ('host', 'port', 'secure',
      *                     'user', 'pass') is ignored — they are still required by the guard below,
      *                     but nothing reads them.
-     * @param bool $debugMode Enable debug output. Also passed to the $template view. NOTE: the
-     *                        SMTP conversation is printed to STDOUT (PHPMailer's default), so this
-     *                        must stay FALSE outside a console.
+     * @param bool $debugMode Enable debug output (SMTP client and server lines; PHPMailer masks the
+     *                        AUTH exchange as "[credentials hidden]"). Also passed to the $template
+     *                        view. The transcript goes to error_log() — the CLI's STDERR, or the
+     *                        server log — NEVER to STDOUT. It used to be echoed (PHPMailer's
+     *                        default), which put the SMTP conversation into the HTTP response of any
+     *                        web request that enabled it.
      * @param string|null $embeddedImagesBaseDir The ONLY directory an embedded <img> src is allowed
      *                    to resolve to. REQUIRED when $useEmbeddedImages is TRUE: if it is null,
      *                    blank, or not an existing directory, the send returns FALSE without
      *                    sending, because "attach whatever the body points at" is not an offer this
      *                    function makes. Containment is enforced AFTER realpath(), so neither ../
      *                    nor a symlink can escape the allow-list — a src is only ever read when the
-     *                    file it truly resolves to lies under this directory. Ignored entirely when
-     *                    $useEmbeddedImages is FALSE.
+     *                    file it truly resolves to lies under this directory. A NETWORK src
+     *                    ("\\host\share\x.png", "//host/share/x.png") is refused BEFORE realpath()
+     *                    unless it lies lexically inside this directory: on Windows realpath() opens
+     *                    an SMB session to the named host — offering it the server account's NTLM
+     *                    credentials — before containment could ever be checked. Ignored entirely
+     *                    when $useEmbeddedImages is FALSE.
      *                    It sits LAST, away from the $useEmbeddedImages it belongs to, on purpose: a
      *                    new parameter gets APPENDED. Slotting it next to its partner would have
      *                    shifted $charset/$useAuth/$isSMTP/$debugMode one place right for every
      *                    positional caller — a silent miscompile of working code, which is too high
      *                    a price for reading nicely in the signature.
+     * @param string|null $error BY REFERENCE, OUT only (appended last for the same reason). Set to
+     *                    NULL on success, and to a short reason on every FALSE: which guard refused
+     *                    the call, or PHPMailer's own error message. It never contains the SMTP
+     *                    password (any occurrence, plain or base64, is masked defensively). A FALSE
+     *                    used to carry no reason at all.
      *
      * @return bool TRUE on success. FALSE on a missing/invalid $configs key (including a 'secure'
      *              outside {'tls','ssl','none'}), on $useEmbeddedImages without a usable
-     *              $embeddedImagesBaseDir, on an empty $sendTo / $subject / $body, on a $template
-     *              that fails to render, and on any PHPMailer failure — those are caught and
-     *              swallowed here, so a FALSE carries no reason, no exception and no log line.
-     *              CAUTION: outside the $template render (which is total: any Throwable from Blade
-     *              becomes FALSE), only \PHPMailer\PHPMailer\Exception is caught. Any OTHER
-     *              Throwable raised while the message is built PROPAGATES to the caller — including
-     *              the ErrorException that a strict error handler (Laravel's, for one) makes out of
-     *              a PHP warning. So this function can both return FALSE and throw.
+     *              $embeddedImagesBaseDir, on an empty $sendTo / $subject / $body, on a malformed
+     *              recipient/attachment entry, header or $charset, on a $template that fails to
+     *              render, and on any PHPMailer failure — see $error for which.
+     *              Only \PHPMailer\PHPMailer\Exception (and \InvalidArgumentException from the
+     *              header builder) is caught while the message is built; with the shape checks
+     *              above, anything else that escapes is a genuine bug — or the ErrorException a
+     *              strict error handler makes out of a PHP warning — and PROPAGATES.
      */
     public static function sendMail(
         array $configs,
@@ -137,9 +169,26 @@ class Mailer {
         bool $useAuth = true,
         bool $isSMTP = true,
         bool $debugMode = false,
-        ?string $embeddedImagesBaseDir = null
+        ?string $embeddedImagesBaseDir = null,
+        ?string &$error = null
     ): bool {
+        $error = null;
+
         if (!class_exists(\PHPMailer\PHPMailer\PHPMailer::class)) {
+            $error = 'PHPMailer is not installed.';
+            return false;
+        }
+
+        // Every value below is later handed to string-typed PHPMailer/validator calls; a non-string
+        // used to escape as a TypeError instead of the promised FALSE.
+        foreach (['email', 'name', 'user', 'pass', 'host'] as $key) {
+            if (isset($configs[$key]) && !is_string($configs[$key])) {
+                $error = "\$configs['{$key}'] must be a string.";
+                return false;
+            }
+        }
+        if (isset($configs['timeout']) && (!is_int($configs['timeout']) || $configs['timeout'] < 1)) {
+            $error = "\$configs['timeout'] must be a positive number of seconds.";
             return false;
         }
 
@@ -164,6 +213,7 @@ class Mailer {
         if (!$isShortcut) {
             $secure = self::normaliseSmtpSecure($configs['secure'] ?? null);
             if ($secure === null) {
+                $error = "\$configs['secure'] must be exactly 'tls', 'ssl' or 'none'.";
                 return false;
             }
             $configs['secure'] = $secure;
@@ -179,6 +229,7 @@ class Mailer {
                 ? realpath($embeddedImagesBaseDir)
                 : false;
             if ($resolvedBase === false || !is_dir($resolvedBase)) {
+                $error = '$useEmbeddedImages requires $embeddedImagesBaseDir to name an existing directory.';
                 return false;
             }
             $imagesBaseDir = $resolvedBase;
@@ -192,9 +243,28 @@ class Mailer {
             empty($configs['email']) ||
             empty($configs['name']) ||
             empty($sendTo) ||
-            empty($subject) ||
+            // Not empty(): the subject "0" is legitimate text. The BODY keeps empty() on purpose:
+            // PHPMailer itself refuses a body of "0" as "Message body empty", so it must be refused
+            // here, with this reason, rather than fail later inside send().
+            $subject === '' ||
             empty($body)
         ) {
+            $error = 'A required value is missing: $configs host/port/user/pass/email/name, $sendTo, $subject or $body.';
+            return false;
+        }
+
+        $error = self::describeInvalidEntries($sendTo, '$sendTo', 'email')
+            ?? self::describeInvalidEntries($cc, '$cc', 'email')
+            ?? self::describeInvalidEntries($cco, '$cco', 'email')
+            ?? self::describeInvalidEntries($reply, '$reply', 'email')
+            ?? self::describeInvalidEntries($files, '$files', 'file')
+            ?? self::describeInvalidEntries($stringFiles, '$stringFiles', 'string', true);
+        if ($error !== null) {
+            return false;
+        }
+
+        if (preg_match("/^[A-Za-z0-9!#$%&'+\\-^_`{}~]+\\z/", $charset) !== 1) {
+            $error = '$charset must be a charset name such as UTF-8.';
             return false;
         }
 
@@ -224,7 +294,14 @@ class Mailer {
             }
         }
 
-        $headers = URL::buildHttpHeaderArray($headers);
+        try {
+            $headers = URL::buildHttpHeaderArray($headers);
+        } catch (\InvalidArgumentException $e) {
+            // The builder refuses CR/LF and malformed names by throwing; this function's contract
+            // for a bad header is FALSE, as it always was when PHPMailer did the refusing.
+            $error = 'Invalid custom header: ' . $e->getMessage();
+            return false;
+        }
         $priority = empty($priority) || $priority < 0 ? 0 : $priority;
         $wrap = empty($wrap) || $wrap < 0 ? 0 : $wrap;
 
@@ -253,6 +330,7 @@ class Mailer {
                     ])->render()
                     : null;
             } catch (\Throwable $e) {
+                $error = self::maskSecret('The template could not be rendered: ' . $e->getMessage(), $configs['pass'] ?? null);
                 return false;
             }
 
@@ -270,8 +348,13 @@ class Mailer {
         $ret = false;
         try {
             if($params['isSMTP']) {
-                $mail->SMTPDebug  = $params['debugMode'] ? 2 : FALSE;
+                $mail->SMTPDebug  = $params['debugMode'] ? \PHPMailer\PHPMailer\SMTP::DEBUG_SERVER : \PHPMailer\PHPMailer\SMTP::DEBUG_OFF;
+                // Never 'echo' (PHPMailer's default): that writes the SMTP transcript into the HTTP
+                // response of a web request. DEBUG_SERVER is also the highest level at which
+                // PHPMailer still masks the AUTH exchange; DEBUG_LOWLEVEL would log the credentials.
+                $mail->Debugoutput = 'error_log';
                 $mail->Mailer     = 'smtp';
+                if (isset($configs['timeout'])) $mail->Timeout = $configs['timeout'];
 
                 // WHERE we deliver is independent of WHETHER we authenticate. Gating these on
                 // $useAuth meant an unauthenticated relay silently fell back to PHPMailer's own
@@ -417,15 +500,61 @@ class Mailer {
             $mail->AltBody = strip_tags($mail->Body);
 
             $ret = $mail->send();
+            if (!$ret) {
+                $error = self::maskSecret($mail->ErrorInfo !== '' ? $mail->ErrorInfo : 'PHPMailer reported a failed send.', $configs['pass'] ?? null);
+            }
 
             $mail->clearAllRecipients();
             $mail->clearAttachments();
             $mail->clearCustomHeaders();
             $mail->clearReplyTos();
         } catch (\PHPMailer\PHPMailer\Exception $e) {
+            $error = self::maskSecret($e->getMessage(), $configs['pass'] ?? null);
         }
 
         return $ret;
+    }
+
+    /**
+     * Checks a recipient/attachment list for the entry shape sendMail() documents.
+     *
+     * @param array $entries The list, e.g. $sendTo.
+     * @param string $label Its parameter name, for the message.
+     * @param string $requiredKey The key every entry must carry ('email', 'file' or 'string').
+     * @param bool $allowEmptyRequired Whether '' is a valid value for $requiredKey (a string
+     *                                 attachment may legitimately be empty).
+     * @return string|null A description of the first bad entry, or NULL when all are well-formed.
+     */
+    private static function describeInvalidEntries(array $entries, string $label, string $requiredKey, bool $allowEmptyRequired = false): ?string {
+        foreach ($entries as $index => $entry) {
+            if (!is_array($entry)) {
+                return "{$label}[{$index}] must be an array, " . get_debug_type($entry) . ' given.';
+            }
+            if (!isset($entry[$requiredKey]) || !is_string($entry[$requiredKey]) || (!$allowEmptyRequired && $entry[$requiredKey] === '')) {
+                return "{$label}[{$index}]['{$requiredKey}'] must be a non-empty string.";
+            }
+            if (isset($entry['name']) && !is_string($entry['name'])) {
+                return "{$label}[{$index}]['name'] must be a string.";
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Masks $secret — as written and base64-encoded, the two forms an SMTP exchange carries — in a
+     * message that is about to be handed back to the caller.
+     *
+     * @param string $message The message.
+     * @param string|null $secret The SMTP password, if any.
+     * @return string
+     */
+    private static function maskSecret(string $message, ?string $secret): string {
+        if ($secret === null || $secret === '') {
+            return $message;
+        }
+
+        return str_replace([$secret, base64_encode($secret)], '[hidden]', $message);
     }
 
     /**
@@ -616,6 +745,19 @@ class Mailer {
             return null;
         }
 
+        // A network path must not reach realpath() at all: on Windows it opens an SMB session to
+        // the named host — offering it this server's NTLM credentials — long before the
+        // containment check below could refuse the file. Only a network src that already sits
+        // LEXICALLY inside a network base directory is allowed to be resolved.
+        if (preg_match('#^[\\\\/]{2}#', $src) === 1) {
+            $normalise = static fn(string $path): string => rtrim(str_replace('\\', '/', $path), '/') . '/';
+            $lexicallyInside = preg_match('#(^|[\\\\/])\.\.([\\\\/]|$)#', $src) !== 1
+                && strncasecmp($normalise($src), $normalise($baseDir), strlen($normalise($baseDir))) === 0;
+            if (!$lexicallyInside) {
+                return null;
+            }
+        }
+
         $candidate = self::isAbsolutePath($src) ? $src : $baseDir . DIRECTORY_SEPARATOR . $src;
         $real      = realpath($candidate);
         if ($real === false || !is_file($real) || !is_readable($real)) {
@@ -655,6 +797,15 @@ class Mailer {
     /**
      * Validates an email address.
      *
+     * The WHOLE string must be the address: the pattern is anchored with the D modifier, so a
+     * trailing "\n" fails. Without it `$` also matched just before a final newline, and
+     * "victim@example.com\n" validated — a header-injection vector for any caller that used this
+     * as the gate before writing the address into a header. (Validator::isEmail() delegates here.)
+     *
+     * Syntax only, and deliberately loose on host names: an underscore or a label ending in '-'
+     * is accepted, although PHPMailer's own validator will still refuse such an address at send
+     * time.
+     *
      * @param string|null $email The email address to validate
      * @return bool TRUE if the email is valid, FALSE otherwise
      */
@@ -662,7 +813,7 @@ class Mailer {
         if (empty($email)) return false;
 
         $isValid = preg_match(
-            '/^(?:[\w\!\#\$\%\&\'\*\+\-\/\=\?\^\`\{\|\}\~]+\.)*[\w\!\#\$\%\&\'\*\+\-\/\=\?\^\`\{\|\}\~]+@(?:(?:(?:[a-zA-Z0-9_](?:[a-zA-Z0-9_\-](?!\.)){0,61}[a-zA-Z0-9_-]?\.)+[a-zA-Z0-9_](?:[a-zA-Z0-9_\-](?!$)){0,61}[a-zA-Z0-9_]?)|(?:\[(?:(?:[01]?\d{1,2}|2[0-4]\d|25[0-5])\.){3}(?:[01]?\d{1,2}|2[0-4]\d|25[0-5])\]))$/',
+            '/^(?:[\w\!\#\$\%\&\'\*\+\-\/\=\?\^\`\{\|\}\~]+\.)*[\w\!\#\$\%\&\'\*\+\-\/\=\?\^\`\{\|\}\~]+@(?:(?:(?:[a-zA-Z0-9_](?:[a-zA-Z0-9_\-](?!\.)){0,61}[a-zA-Z0-9_-]?\.)+[a-zA-Z0-9_](?:[a-zA-Z0-9_\-](?!$)){0,61}[a-zA-Z0-9_]?)|(?:\[(?:(?:[01]?\d{1,2}|2[0-4]\d|25[0-5])\.){3}(?:[01]?\d{1,2}|2[0-4]\d|25[0-5])\]))$/D',
             $email
         );
 

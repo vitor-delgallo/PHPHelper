@@ -41,7 +41,10 @@ final class DBFTest extends TestCase {
      * @param array $fields Each: [string $name, string $type, int $len, int $dec]
      * @param array $rows   Each: list of values, positional to $fields
      * @param array $opts   'recordCount' => override the header's record count (to forge a
-     *                      count the file cannot back), 'eof' => append the 0x1A marker
+     *                      count the file cannot back), 'eof' => append the 0x1A marker,
+     *                      'rawNames' => [fieldIndex => exact 11-byte name area],
+     *                      'terminator' => the byte written after the field table (0x0D),
+     *                      'deleted' => list of row indexes to flag '*'
      * @return string Absolute path of the written file
      */
     private function makeDbf(array $fields, array $rows, array $opts = []): string {
@@ -59,8 +62,9 @@ final class DBFTest extends TestCase {
 
         $out = $header;
         $offset = 1;
-        foreach ($fields as [$name, $type, $len, $dec]) {
-            $out .= str_pad(substr($name, 0, 10), 11, "\0"); // DBF names are NUL-padded to 11 bytes
+        foreach ($fields as $index => [$name, $type, $len, $dec]) {
+            // DBF names are NUL-padded to 11 bytes
+            $out .= $opts['rawNames'][$index] ?? str_pad(substr($name, 0, 10), 11, "\0");
             $out .= $type;
             $out .= pack('V', $offset);
             $out .= pack('C', $len);
@@ -68,10 +72,10 @@ final class DBFTest extends TestCase {
             $out .= str_repeat("\0", 14);
             $offset += $len;
         }
-        $out .= chr(13); // field-list terminator
+        $out .= $opts['terminator'] ?? chr(13); // field-list terminator
 
-        foreach ($rows as $row) {
-            $record = ' '; // not deleted
+        foreach ($rows as $rowIndex => $row) {
+            $record = in_array($rowIndex, $opts['deleted'] ?? [], true) ? '*' : ' ';
             foreach ($fields as $i => $field) {
                 $record .= str_pad(substr((string)$row[$i], 0, $field[2]), $field[2], ' ');
             }
@@ -267,17 +271,28 @@ final class DBFTest extends TestCase {
         $this->assertSame(DBF::DBFReadBasic($path, 'records'), $scan['records']);
     }
 
+    /**
+     * Each buffer is the record exactly as on disk: RecordLength (14) bytes, the deleted flag and
+     * then 13 bytes of field data. The reader used to seek one byte PAST the first flag, so every
+     * buffer was this record's data glued to the NEXT record's flag (or the 0x1A EOF marker), and a
+     * record's own deleted flag could not be found in its own buffer.
+     */
     public function testScanModeExposesRawRecordBuffersVerbatim(): void {
         $path = $this->samplePath();
 
         $scan = DBF::DBFReadBasic($path, 'scan');
 
         $this->assertCount(2, $scan['raw']);
-        // Each buffer is RecordLength (14) bytes: 13 bytes of field data (10 + 3) plus the
-        // following byte, which is the next record's deleted flag (or the 0x1A EOF marker).
-        $this->assertSame('Alice     30  ', $scan['raw'][0]);
-        $this->assertSame('Bob       7  ' . chr(26), $scan['raw'][1]);
-        $this->assertSame('Alice     30 ', substr($scan['raw'][0], 0, 13), 'field data of record 0');
+        $this->assertSame(' Alice     30 ', $scan['raw'][0]);
+        $this->assertSame(' Bob       7  ', $scan['raw'][1]);
+    }
+
+    public function testScanRawBufferStartsWithTheRecordsOwnDeletedFlag(): void {
+        $path = $this->makeDbf([['NAME', 'C', 10, 0]], [['Alice'], ['Bob'], ['Cy']], ['deleted' => [1]]);
+
+        $raw = DBF::DBFReadBasic($path, 'scan')['raw'];
+
+        $this->assertSame([' ', '*', ' '], array_map(static fn (string $buf): string => $buf[0], $raw));
     }
 
     public function testNonScanModesDoNotExposeRawBuffers(): void {
@@ -459,11 +474,159 @@ final class DBFTest extends TestCase {
         $this->assertSame('Alice', $records[0]['NAME']);
     }
 
-    public function testReadBasicDecodesUnicodeEscapeSequencesInValues(): void {
-        $path = $this->makeDbf([['CITY', 'C', 12, 0]], [['São Paulo']]);
+    // ---------------------------------------------------------------- DBFReadBasic: values are data
+
+    /**
+     * Replaces testReadBasicDecodesUnicodeEscapeSequencesInValues, which was tautological: its
+     * fixture held no escape sequence at all, so it passed whether or not anything was decoded.
+     *
+     * FINDING (fixed): every value went through Parser::decodeTextArray(), which rewrites a literal
+     * "\uXXXX" into a character. On raw DBF bytes that is corruption: this path came back as
+     * "C:㫾\x.txt".
+     */
+    public function testReadBasicDoesNotRewriteLiteralBackslashUSequences(): void {
+        $path = $this->makeDbf([['PATH', 'C', 20, 0], ['NOTE', 'C', 12, 0]], [['C:\\ucafe\\x.txt', '\\u00e9 raw']]);
+
+        $record = DBF::DBFReadBasic($path, 'records')[0];
+
+        $this->assertSame('C:\\ucafe\\x.txt', $record['PATH']);
+        $this->assertSame('\\u00e9 raw', $record['NOTE']);
+    }
+
+    public function testReadBasicReturnsTheBytesUntouchedWhenNoEncodingIsGiven(): void {
+        $cp850 = mb_convert_encoding('São Paulo', 'CP850', 'UTF-8');
+        $path = $this->makeDbf([['CITY', 'C', 12, 0]], [[$cp850]]);
+
+        $this->assertSame($cp850, DBF::DBFReadBasic($path, 'records')[0]['CITY']);
+    }
+
+    /** The actual encoding problem of legacy DBF files: text in a DOS/Windows code page. */
+    public function testReadBasicConvertsFieldNamesAndValuesFromTheGivenCodePage(): void {
+        $path = $this->makeDbf(
+            [['CIDADE', 'C', 12, 0], [mb_convert_encoding('AÇÃO', 'CP850', 'UTF-8'), 'C', 8, 0]],
+            [[mb_convert_encoding('São Paulo', 'CP850', 'UTF-8'), mb_convert_encoding('Ênfase', 'CP850', 'UTF-8')]]
+        );
+
+        $all = DBF::DBFReadBasic($path, 'all', 'CP850');
+
+        $this->assertSame(['CIDADE', 'AÇÃO'], array_column($all['schema'], 'fieldname'));
+        $this->assertSame(['CIDADE' => 'São Paulo', 'AÇÃO' => 'Ênfase'], $all['records'][0]);
+    }
+
+    public function testReadBasicConvertsFromWindows1252(): void {
+        $path = $this->makeDbf([['NOME', 'C', 12, 0]], [[mb_convert_encoding('João Ñandú', 'CP1252', 'UTF-8')]]);
+
+        $this->assertSame('João Ñandú', DBF::DBFReadBasic($path, 'records', 'CP1252')[0]['NOME']);
+    }
+
+    /** CP437 is the dBase default and mbstring does not know it: iconv is the fallback. */
+    public function testReadBasicConvertsFromACodePageOnlyIconvKnows(): void {
+        if (!function_exists('iconv') || @iconv('CP437', 'UTF-8', "\x82") !== 'é') {
+            $this->markTestSkipped('iconv with CP437 support is not available');
+        }
+
+        $path = $this->makeDbf([['NAME', 'C', 10, 0]], [["Caf\x82"]]); // "Café" in CP437
+
+        $this->assertSame('Café', DBF::DBFReadBasic($path, 'records', 'CP437')[0]['NAME']);
+    }
+
+    public function testReadBasicRejectsAnUnknownEncodingBeforeReadingAnything(): void {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('unknown source encoding');
+
+        DBF::DBFReadBasic($this->tmpDir . DIRECTORY_SEPARATOR . 'does-not-even-exist.dbf', 'records', 'NOT-A-CODEPAGE');
+    }
+
+    public function testReadBasicRejectsAnEmptyEncodingInsteadOfFallingBackToTheLocale(): void {
+        $this->expectException(\InvalidArgumentException::class);
+
+        DBF::DBFReadBasic($this->samplePath(), 'records', ' ');
+    }
+
+    /** Binary-safe read: CR, LF and the 0x1A EOF byte inside a value are data, not structure. */
+    public function testReadBasicIsBinarySafeInsideValues(): void {
+        $path = $this->makeDbf([['MEMO', 'C', 10, 0], ['N', 'N', 2, 0]], [["A\r\nB\x1AC", '7'], ['next', '8']]);
 
         $records = DBF::DBFReadBasic($path, 'records');
 
-        $this->assertSame('São Paulo', $records[0]['CITY']);
+        $this->assertSame([['MEMO' => "A\r\nB\x1AC", 'N' => '7'], ['MEMO' => 'next', 'N' => '8']], $records);
+    }
+
+    // ---------------------------------------------------------------- DBFReadBasic: hostile field tables
+
+    /**
+     * FINDING (fixed): records were cut with an unpack() format assembled from the field NAMES
+     * ("A10NAME/A3AGE/"). A name is data: "1ST" made the format "A101ST", i.e. a 101-byte field
+     * named "ST", and a '/' split one field into two format codes — every later column misaligned
+     * or unpack() warned and the read died.
+     */
+    public function testReadBasicKeepsFieldsAlignedWhateverCharactersTheFieldNamesHold(): void {
+        $path = $this->makeDbf(
+            [['1ST', 'C', 4, 0], ['A/B', 'C', 3, 0], ['X*', 'C', 2, 0], ['LAST', 'C', 5, 0]],
+            [['abcd', 'efg', 'hi', 'jklmn'], ['1234', '567', '89', 'final']]
+        );
+
+        $records = DBF::DBFReadBasic($path, 'records');
+
+        $this->assertSame(
+            [
+                ['1ST' => 'abcd', 'A/B' => 'efg', 'X*' => 'hi', 'LAST' => 'jklmn'],
+                ['1ST' => '1234', 'A/B' => '567', 'X*' => '89', 'LAST' => 'final'],
+            ],
+            $records
+        );
+    }
+
+    /** A name ends at its first NUL; some writers leave garbage, not NULs, in the padding. */
+    public function testReadBasicCutsTheFieldNameAtItsFirstNul(): void {
+        $path = $this->makeDbf(
+            [['NAME', 'C', 6, 0]],
+            [['Alice']],
+            ['rawNames' => [0 => "NAME\0GARBAG"]]
+        );
+
+        $this->assertSame([['NAME' => 'Alice']], DBF::DBFReadBasic($path, 'records'));
+        $this->assertSame('NAME', DBF::DBFReadBasic($path, 'schema')[0]['fieldname']);
+    }
+
+    /**
+     * FINDING (fixed): the descriptor loop stopped only at a 0x0D byte or EOF. Without the
+     * terminator it read the first record's bytes as a 33rd descriptor, added a phantom field
+     * named after the data, and misaligned every record. The header length bounds the table.
+     */
+    public function testReadBasicBoundsTheFieldTableByTheHeaderLengthWhenTheTerminatorIsMissing(): void {
+        $path = $this->makeDbf(
+            [['NAME', 'C', 10, 0], ['AGE', 'N', 3, 0]],
+            [['Alice', '30'], ['Bob', '7']],
+            ['terminator' => ' ']
+        );
+
+        $all = DBF::DBFReadBasic($path, 'all');
+
+        $this->assertSame(['NAME', 'AGE'], array_column($all['schema'], 'fieldname'));
+        $this->assertSame([['NAME' => 'Alice', 'AGE' => '30'], ['NAME' => 'Bob', 'AGE' => '7']], $all['records']);
+    }
+
+    /** Duplicate names are malformed; the documented outcome is "the later field wins". */
+    public function testReadBasicDuplicateFieldNamesCollapseOntoTheLaterField(): void {
+        $path = $this->makeDbf([['CODE', 'C', 3, 0], ['CODE', 'C', 3, 0]], [['one', 'two']]);
+
+        $all = DBF::DBFReadBasic($path, 'all');
+
+        $this->assertCount(2, $all['schema'], 'the schema still reports both descriptors');
+        $this->assertSame([['CODE' => 'two']], $all['records']);
+    }
+
+    /** RecordLength must cover the deleted flag plus every field, or no record can be cut. */
+    public function testReadBasicReturnsNoRecordsWhenRecordLengthCannotHoldTheFields(): void {
+        $path = $this->makeDbf([['NAME', 'C', 10, 0]], [['Alice']]);
+        $bytes = file_get_contents($path);
+        $bytes = substr_replace($bytes, pack('v', 10), 10, 2); // 10 < 1 + 10
+        $path = $this->writeTmp('short-reclen.dbf', $bytes);
+
+        $all = DBF::DBFReadBasic($path, 'all');
+
+        $this->assertCount(1, $all['schema']);
+        $this->assertSame([], $all['records']);
     }
 }

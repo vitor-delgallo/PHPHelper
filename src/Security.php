@@ -4,13 +4,35 @@ namespace VD\PHPHelper;
 
 class Security {
     /**
-     * Number of byte blocks to read per iteration during file encryption (AES-256-GCM).
+     * Plaintext bytes per data block used by encryptFileV2 until setFileEncryptBlocksBytes() says
+     * otherwise.
      *
-     * This value can be adjusted based on the file size to optimize memory usage.
+     * @var int
+     */
+    private const DEFAULT_FILE_ENCRYPT_BLOCK_BYTES = 3200000;
+
+    /**
+     * Default for the largest length-encoded block of the V2 file format, measured as it sits on
+     * disk (base64). See setFileMaxEncodedBlockBytes().
+     *
+     * @var int
+     */
+    private const DEFAULT_FILE_MAX_ENCODED_BLOCK_BYTES = 268435456; // 256 MiB
+
+    /**
+     * Plaintext bytes read per data block by encryptFileV2. 0 = not set (the default applies).
      *
      * @var int
      */
     private static int $fileEncryptBlocksBytes = 0;
+
+    /**
+     * Largest length-encoded block (bytes, base64) of the V2 file format. 0 = not set (the default
+     * applies).
+     *
+     * @var int
+     */
+    private static int $fileMaxEncodedBlockBytes = 0;
 
     /**
      * Minimum master-key length (in bytes) for the AES-256 code paths. HKDF cannot add
@@ -36,12 +58,27 @@ class Security {
     private const FILE_V2_VERSION = 'v2';
 
     /**
-     * Upper bound (bytes) accepted for a single length-encoded block on read. Prevents a
-     * crafted/corrupted file from forcing a huge allocation before authentication runs.
+     * Cipher of the V2 file format; also written as the file's first header block.
+     *
+     * @var string
+     */
+    private const FILE_V2_CIPHER = 'aes-256-gcm';
+
+    /**
+     * Random bytes behind the per-file id. It is written hex-encoded, i.e. as twice as many
+     * characters.
      *
      * @var int
      */
-    private const MAX_ENCODED_BLOCK_BYTES = 268435456; // 256 MiB
+    private const FILE_V2_FILE_ID_BYTES = 16;
+
+    /**
+     * AES-GCM nonce and tag sizes of the V2 file format.
+     *
+     * @var int
+     */
+    private const GCM_IV_BYTES = 12;
+    private const GCM_TAG_BYTES = 16;
 
     /**
      * Generates cryptographically secure random bytes, failing CLOSED.
@@ -66,21 +103,33 @@ class Security {
     }
 
     /**
+     * Refuses a master key shorter than MIN_KEY_BYTES.
+     *
+     * @param string $key Master key
+     *
+     * @throws \Exception
+     * @return void
+     */
+    private static function assertKeyLength(string $key): void {
+        if (strlen($key) < self::MIN_KEY_BYTES) {
+            throw new \Exception("Invalid encryption key. The key must be at least " . self::MIN_KEY_BYTES . " bytes long.");
+        }
+    }
+
+    /**
      * Derives a key of the specified length from the given key & salt using HKDF with SHA-256.
      * This function is used to generate encryption keys of the required length from a base key.
-     * 
+     *
      * @param string $key Base key to derive from
      * @param int $length Desired length of the derived key in bytes
      * @param string|null $salt Optional salt value to add randomness to the derived key
-     * 
+     * @param string $info Domain label: keys derived for different purposes never coincide
+     *
      * @throws \Exception
      * @return string
      */
     private static function deriveKey(string $key, int $length, ?string $salt = "", string $info = 'derived-key'): string {
-        // Checks if the key is empty or it does not have the min length for AES-256.
-        if (empty($key) || mb_strlen($key, '8bit') < self::MIN_KEY_BYTES) {
-            throw new \Exception("Invalid encryption key. The key must be at least " . self::MIN_KEY_BYTES . " bytes long.");
-        }
+        self::assertKeyLength($key);
 
         return hash_hkdf(
             'sha256',
@@ -90,173 +139,403 @@ class Security {
             ($salt ?? "")
         );
     }
-    
+
     /**
-     * Reads a length-encoded block from the given file pointer.
-     * The block format is expected to be: "{length}-{base64_encoded_data}".
-     * The numeric length is read until the "-" separator, then the corresponding
-     * number of bytes is read and base64-decoded before being returned.
+     * Converts a value to the string an encrypt/hash method operates on.
      *
-     * NEVER raises: a hostile length header is rejected by the guards rather than forwarded to
-     * fread(), which raises a ValueError (an \Error) on a zero length and would escape the
-     * \Exception-based error handling of every caller.
+     * The old `(string) $value` turned EVERY array into the literal "Array" (with only a warning):
+     * encryptDataDB/encryptLocal stored "Array" for real data — silent, unrecoverable corruption —
+     * and generateSearchHash gave every array the same blind index. A non-Stringable object raised
+     * an \Error past the documented \Exception. Both are refused now.
      *
-     * @param resource $fp File pointer opened for reading
+     * @param mixed $value Scalar or Stringable. true/false become "1"/"0".
+     * @param string $method Calling method, for the message
      *
-     * @return string|bool  Returns the decoded block content,
-     *                      false if the block length is invalid (absent, zero, over
-     *                      MAX_ENCODED_BLOCK_BYTES), the data cannot be fully read, or the payload
-     *                      is not strict base64,
-     *                      true if it has reached the end of file
+     * @throws \InvalidArgumentException For an array, a non-Stringable object or a resource
+     * @return string
      */
-    private static function readLengthEncodedBlock($fp): string|bool {
-        $lenData = "";
-        while (!feof($fp)) {
-            $char = fgetc($fp);
-            if ($char === "-") {
-                break;
-            } else if ($char === false) {
-                if($lenData === "" && feof($fp)) {
-                    return true;
-                } else {
-                    return false;
-                }
-            } 
-            
-            // Abort early if the length header grows implausibly long (hostile/corrupt file).
-            if (mb_strlen($lenData, '8bit') > 20) {
-                return false;
-            }
-            $lenData .= $char;
+    private static function scalarToString(mixed $value, string $method): string {
+        if (is_string($value)) {
+            return $value;
+        }
+        if (is_bool($value)) {
+            return ($value ? "1" : "0");
+        }
+        if (is_int($value) || is_float($value) || $value instanceof \Stringable) {
+            return (string) $value;
         }
 
-        $lenData = Str::onlyNumbers($lenData);
-        if ($lenData === "") {
-            return false;
-        }
-
-        $len = (int) $lenData;
-        // Bound the declared length BEFORE allocating: a crafted/corrupt file must not be able
-        // to force a huge fread() before any authentication runs (memory-exhaustion DoS).
-        //
-        // $len === 0 is REJECTED, not read: fread($fp, 0) raises a ValueError, which is an \Error
-        // and NOT an \Exception, so it escaped decryptFileV2's documented catch and skipped the
-        // rollback — leaving unauthenticated plaintext behind on disk. writeLengthEncodedBlock()
-        // never emits a zero-length block (every block written carries a cipher name, version,
-        // salt, file id, IV, tag or ciphertext, all non-empty), so "0-" only ever means a corrupt
-        // or hostile file. Fail closed.
-        if ($len <= 0 || $len > self::MAX_ENCODED_BLOCK_BYTES) {
-            return false;
-        }
-
-        $data = fread($fp, $len);
-        if ($data === false || mb_strlen($data, '8bit') !== $len) {
-            return false;
-        }
-
-        // $data is non-empty here ($len >= 1), so a "" result can only come from base64_decode
-        // itself; strict mode returns false on any invalid byte.
-        return base64_decode($data, true);
+        throw new \InvalidArgumentException(
+            "{$method}() accepts a string, int, float, bool, Stringable or null; " . get_debug_type($value) . " given."
+        );
     }
-    
+
     /**
-     * Writes a length-encoded block to the given file pointer.
-     * The given content is base64-encoded and written in the format:
-     * "{length}-{base64_encoded_data}".
+     * Size of $rawBytes once base64-encoded, as a length-encoded block carries it: 4*ceil(n/3).
      *
-     * A PARTIAL write is a failure. fwrite() reports the number of bytes it actually wrote and
-     * returns a short count (or 0) rather than false when the disk is full or a quota is hit;
-     * accepting that would emit a truncated block and let encryptFileV2 report success for a
-     * ciphertext that can never be decrypted. $fp here is always a blocking local file opened by
-     * encryptFileV2, so a short count is never a benign "try again later" — it is data loss.
+     * @param int $rawBytes Raw payload size
      *
-     * @param resource $fp File pointer opened for writing
-     * @param string $text Raw content to be encoded and written
-     *
-     * @return bool Returns true only when the whole block reached the stream, false otherwise
+     * @return int|float A float only for a size too large for a PHP int (block sizes near PHP_INT_MAX)
      */
-    private static function writeLengthEncodedBlock($fp, $text): bool {
-        $textEncoded = base64_encode($text);
-        $payload = mb_strlen($textEncoded, '8bit') . "-" . $textEncoded;
-        $written = fwrite($fp, $payload);
-        if ($written === false || $written !== mb_strlen($payload, '8bit')) {
-            return false;
-        }
-
-        return true;
+    private static function encodedBlockBytes(int $rawBytes): int|float {
+        // intdiv() first: ($rawBytes + 2) would overflow for a size near PHP_INT_MAX.
+        return intdiv($rawBytes, 3) * 4 + ($rawBytes % 3 === 0 ? 0 : 4);
     }
-    
+
     /**
-     * Resolves and validates the real source file path.
-     * It first attempts to resolve the absolute path using realpath(). If that fails,
-     * it checks whether the given source is an uploaded file. An exception is thrown
-     * if the source is not valid or cannot be resolved.
+     * The smallest usable max-encoded-block limit: the encoded size of the largest FIXED-size block
+     * every V2 file contains (the hex file id, 44 bytes). Below it not even an empty file could be
+     * written or read. (The end marker carries the block count, at most 19 digits = 28 bytes.)
      *
-     * @param string|null $source Source file path
+     * @return int
+     */
+    private static function fileV2MinEncodedBlockBytes(): int {
+        return (int) max(
+            self::encodedBlockBytes(strlen(self::FILE_V2_CIPHER)),
+            self::encodedBlockBytes(strlen(self::FILE_V2_VERSION)),
+            self::encodedBlockBytes(self::FILE_V2_FILE_ID_BYTES * 2),
+            self::encodedBlockBytes(self::GCM_IV_BYTES),
+            self::encodedBlockBytes(self::GCM_TAG_BYTES)
+        );
+    }
+
+    /**
+     * Refuses to encrypt when a block could be written that decryptFileV2 would refuse to read.
+     *
+     * The limit used to be enforced on READ only: a block size above 201.326.592 bytes (or a huge
+     * salt) produced a file that encryptFileV2 reported as a success and decryptFileV2 could never
+     * decrypt. The check is made against the CONFIGURED block size, not against the size of the
+     * file at hand, so a bad configuration fails on every call instead of only on the first file
+     * that happens to be large.
+     *
+     * @param int $blockBytes Plaintext bytes per data block
+     * @param string $salt Salt as it will be written to the header
      *
      * @throws \Exception
+     * @return void
+     */
+    private static function assertFileV2BlocksFitLimit(int $blockBytes, string $salt): void {
+        $limit = self::getFileMaxEncodedBlockBytes();
+
+        $encodedBlock = self::encodedBlockBytes($blockBytes);
+        if ($encodedBlock > $limit) {
+            throw new \Exception(sprintf(
+                "Refusing to encrypt: a %d-byte plaintext block (setFileEncryptBlocksBytes) is written as a %.0f-byte base64 block, "
+                . "above the max-encoded-block limit of %d bytes (setFileMaxEncodedBlockBytes); decryptFileV2 would refuse it and "
+                . "the file could never be decrypted. Lower the block size to at most %d bytes, or raise the limit to at least %.0f "
+                . "bytes — and decrypt under a limit at least that large.",
+                $blockBytes,
+                $encodedBlock,
+                $limit,
+                intdiv($limit, 4) * 3,
+                $encodedBlock
+            ));
+        }
+
+        $encodedSalt = self::encodedBlockBytes(strlen($salt));
+        if ($encodedSalt > $limit) {
+            throw new \Exception(sprintf(
+                "Refusing to encrypt: a %d-byte salt is written as a %.0f-byte header block, above the max-encoded-block limit of "
+                . "%d bytes (setFileMaxEncodedBlockBytes); decryptFileV2 would refuse it. Use a shorter salt, or raise the limit "
+                . "to at least %.0f bytes — and decrypt under a limit at least that large.",
+                strlen($salt),
+                $encodedSalt,
+                $limit,
+                $encodedSalt
+            ));
+        }
+    }
+
+    /**
+     * Reads one length-encoded block, "{length}-{base64}", and returns its DECODED payload.
+     *
+     * Strict on purpose. The header blocks are authenticated only indirectly, and every declared
+     * length precedes an allocation, so the container accepts exactly one byte sequence per file:
+     *  - the length is canonical decimal: digits only, no sign, no leading zero, never 0 (fread()
+     *    with 0 is a ValueError), within getFileMaxEncodedBlockBytes() and within what is left of
+     *    the file — checked BEFORE the read, which allocates the declared length up front, so a
+     *    hostile length cannot force a huge allocation ahead of authentication;
+     *  - the payload is the CANONICAL base64 of what it decodes to. PHP's strict base64_decode()
+     *    still skips whitespace and ignores non-zero padding bits, so a modified file could decode
+     *    to identical bytes and decrypt "successfully".
+     *
+     * Every failure THROWS, naming $what. A declared length above the limit gets a message naming
+     * the setter, because the ordinary cause is a file written by a process with a raised limit.
+     *
+     * @param resource $fp File pointer opened for reading
+     * @param string $what Name of the block, for the error message
+     *
+     * @throws \Exception
+     * @return string|null The decoded payload (never ""), or NULL at a clean end of file — nothing
+     *                     at all left to read. Callers decide whether that EOF is legitimate.
+     */
+    private static function readLengthEncodedBlock($fp, string $what): ?string {
+        $limit = self::getFileMaxEncodedBlockBytes();
+        $limitString = (string) $limit;
+
+        $digits = "";
+        while (true) {
+            // @: a read error (e.g. a byte-range lock on Windows) ends in an exception or a
+            // "truncated" failure below — a raw notice would only leak the path.
+            $char = @fgetc($fp);
+            if ($char === false) {
+                if ($digits === "") {
+                    return null;
+                }
+                throw new \Exception("Error on reading {$what}: the file ends inside a block length (truncated).");
+            }
+            if ($char === "-") {
+                break;
+            }
+            if (strspn($char, "0123456789") !== 1 || ($digits === "" && $char === "0")) {
+                throw new \Exception("Error on reading {$what}: malformed block length.");
+            }
+
+            $digits .= $char;
+            if (strlen($digits) > strlen($limitString)) {
+                throw self::blockOverLimitException($what, "at least " . $digits, $limit);
+            }
+        }
+
+        if ($digits === "") {
+            throw new \Exception("Error on reading {$what}: malformed block length.");
+        }
+        // Same number of digits and no leading zeros: comparing the strings compares the numbers,
+        // with no int overflow for a length near PHP_INT_MAX.
+        if (strlen($digits) === strlen($limitString) && strcmp($digits, $limitString) > 0) {
+            throw self::blockOverLimitException($what, $digits, $limit);
+        }
+
+        $length = (int) $digits;
+
+        // fread() allocates the full $length up front, so a 20-byte file declaring a block just
+        // under the limit would still cost a limit-sized allocation. Compare with what is left.
+        $stat = fstat($fp);
+        $position = ftell($fp);
+        if ($stat !== false && $position !== false && $length > $stat['size'] - $position) {
+            throw new \Exception("Error on reading {$what}: the file ends inside a block (truncated).");
+        }
+
+        $data = @fread($fp, $length);
+        if ($data === false || strlen($data) !== $length) {
+            throw new \Exception("Error on reading {$what}: the file ends inside a block (truncated).");
+        }
+
+        $decoded = base64_decode($data, true);
+        if ($decoded === false || $decoded === "" || base64_encode($decoded) !== $data) {
+            throw new \Exception("Error on reading {$what}: the block is not canonical base64.");
+        }
+
+        return $decoded;
+    }
+
+    /**
+     * readLengthEncodedBlock() for a block that MUST be present: an end of file there is a
+     * truncation, never a clean end.
+     *
+     * @param resource $fp File pointer opened for reading
+     * @param string $what Name of the block, for the error message
+     *
+     * @throws \Exception
+     * @return string
+     */
+    private static function readRequiredLengthEncodedBlock($fp, string $what): string {
+        $block = self::readLengthEncodedBlock($fp, $what);
+        if ($block === null) {
+            throw new \Exception("Error on reading {$what}: the file ends before it (truncated).");
+        }
+
+        return $block;
+    }
+
+    /**
+     * The error for a block whose declared length exceeds the max-encoded-block limit.
+     *
+     * @param string $what Name of the block
+     * @param string $declared Declared length, as read
+     * @param int $limit Limit in effect
+     *
+     * @return \Exception
+     */
+    private static function blockOverLimitException(string $what, string $declared, int $limit): \Exception {
+        return new \Exception(
+            "Error on reading {$what}: the block declares {$declared} encoded bytes, above the max-encoded-block limit of "
+            . "{$limit} bytes in effect in this process. If the file is trusted and was encrypted by a process with a larger "
+            . "block size, raise the limit with Security::setFileMaxEncodedBlockBytes() to at least the declared size before "
+            . "decrypting; otherwise the file is corrupt or hostile."
+        );
+    }
+
+    /**
+     * Writes $raw as one length-encoded block: "{length}-{base64}".
+     *
+     * @param resource $fp File pointer opened for writing
+     * @param string $raw Raw content to be encoded and written; never "" (it would read back as the
+     *                    rejected "0-")
+     * @param string $what Name of the block, for the error message
+     *
+     * @throws \Exception When the block did not reach the stream in full
+     * @return void
+     */
+    private static function writeLengthEncodedBlock($fp, string $raw, string $what): void {
+        $encoded = base64_encode($raw);
+
+        // Two writes rather than one concatenation: no third copy of a multi-megabyte block.
+        self::writeAll($fp, strlen($encoded) . "-", $what);
+        self::writeAll($fp, $encoded, $what);
+    }
+
+    /**
+     * Writes $data in full or throws.
+     *
+     * A PARTIAL write is a failure. fwrite() returns a SHORT count (or 0) rather than false on a
+     * full disk or an exhausted quota; accepting it truncates the output while the caller reports
+     * success. Every stream written here is a local file this class opened, so a short count is
+     * never a benign "try again later".
+     *
+     * @param resource $fp File pointer opened for writing
+     * @param string $data Bytes to write
+     * @param string $what Name of what is written, for the error message
+     *
+     * @throws \Exception
+     * @return void
+     */
+    private static function writeAll($fp, string $data, string $what): void {
+        $length = strlen($data);
+        $written = @fwrite($fp, $data);
+        if ($written === false || $written !== $length) {
+            throw new \Exception(
+                "Error on writing {$what}: only " . (int) $written . " of {$length} bytes reached the file (disk full or quota exceeded?)."
+            );
+        }
+    }
+
+    /**
+     * The GCM AAD of one V2 block: binds it to its file, the format version, its kind ("D" data,
+     * "F" end marker) and its position, so reorder, duplication, cross-file splice and header
+     * tamper all fail authentication. Shared by both directions so they cannot drift apart.
+     *
+     * @param string $fileId Per-file id, as written in the header
+     * @param string $kind "D" or "F"
+     * @param int $index Position of a data block; the block count for the end marker
+     *
+     * @return string
+     */
+    private static function fileV2Aad(string $fileId, string $kind, int $index): string {
+        return $fileId . "|" . self::FILE_V2_VERSION . "|" . $kind . "|" . $index;
+    }
+
+    /**
+     * Encrypts one V2 block and writes it as the [iv][tag][ciphertext] triple.
+     *
+     * @param resource $fp File pointer opened for writing
+     * @param string $key Derived file key
+     * @param string $fileId Per-file id
+     * @param string $kind "D" (data) or "F" (end marker)
+     * @param int $index Position of a data block; the block count for the end marker
+     * @param string $plaintext Non-empty plaintext
+     *
+     * @throws \Exception
+     * @return void
+     */
+    private static function writeFileV2Triple($fp, string $key, string $fileId, string $kind, int $index, string $plaintext): void {
+        // Fresh CSPRNG nonce per block; fails closed if no strong RNG is available.
+        $iv = self::secureRandomBytes(self::GCM_IV_BYTES);
+        $tag = "";
+        $ciphertext = openssl_encrypt(
+            $plaintext,
+            self::FILE_V2_CIPHER,
+            $key,
+            OPENSSL_RAW_DATA,
+            $iv,
+            $tag,
+            self::fileV2Aad($fileId, $kind, $index),
+            self::GCM_TAG_BYTES
+        );
+
+        $isData = ($kind === "D");
+        if ($ciphertext === false || strlen($ciphertext) !== strlen($plaintext)) {
+            throw new \Exception($isData ? "Error on creating cipher of plaintext" : "Error on creating end marker");
+        }
+        if (strlen($tag) !== self::GCM_TAG_BYTES) {
+            throw new \Exception($isData ? "Error on validating tag length" : "Error on validating end marker tag length");
+        }
+
+        self::writeLengthEncodedBlock($fp, $iv, $isData ? "IV ciphertext" : "end marker IV");
+        self::writeLengthEncodedBlock($fp, $tag, $isData ? "tag ciphertext" : "end marker tag");
+        self::writeLengthEncodedBlock($fp, $ciphertext, $isData ? "ciphertext" : "end marker ciphertext");
+    }
+
+    /**
+     * Resolves and validates the real source file path.
+     *
+     * @param string $source Source file path (or the tmp_name of an upload)
+     *
+     * @throws \Exception When it does not exist or is not a regular file
      * @return string Returns the validated real source file path
      */
-    private static function getRealSource(?string $source) : string {
-        $ret = false;
-
-        // Attempts to get the absolute path of the source file
-        $sourceReal = realpath($source);
-        if(!empty($sourceReal)) {
-            $ret = $sourceReal;
-        } elseif (is_uploaded_file($source)) {
-            // A genuine PHP upload whose realpath() failed: keep the tmp path itself
-            // (previously this branch left $ret=false and wrongly rejected real uploads).
+    private static function getRealSource(string $source) : string {
+        // realpath("") is the current DIRECTORY, not "no file"; and a NUL byte makes realpath()
+        // raise a ValueError — an \Error past every documented `catch (\Exception)`.
+        $ret = ($source === "" || str_contains($source, "\0") ? false : realpath($source));
+        if ($ret === false && $source !== "" && !str_contains($source, "\0") && is_uploaded_file($source)) {
+            // A genuine PHP upload whose realpath() failed: keep the tmp path itself.
             $ret = $source;
         }
 
-        // Checks the validity of the source files
-        $sourceReal = null;
-        if (empty($ret)) {
-            throw new \Exception("File not found to be encrypted.");
+        if ($ret === false || $ret === "") {
+            throw new \Exception("File not found: the source path does not exist.");
+        }
+
+        // realpath() resolves a DIRECTORY too. Read as a file it came back empty on POSIX, so
+        // encryptFileV2 wrote a valid ciphertext of nothing and reported success.
+        if (!is_file($ret)) {
+            throw new \Exception("The source is not a regular file.");
         }
 
         return $ret;
     }
-    
+
     /**
      * Resolves and validates the destination file path for writing.
-     * It extracts the file name and directory, ensures the target directory exists
-     * (creating it when allowed), normalizes the final path, and validates that the
-     * destination is usable for generating the output file.
+     * It extracts the file name and directory, creates a missing target directory (with
+     * File::getDefaultMode() — never with the caller's FILE mode: a '0600' directory has no execute
+     * bit and nothing could be created inside it), and normalizes the final path.
      *
-     * @param string|null $destination Destination file path
-     * @param string|null $permissionMode Optional permission mode used when creating the destination directory
+     * @param string $destination Destination file path
      *
      * @throws \Exception
      * @return string Returns the validated full destination file path
      */
-    private static function getRealDestination(?string $destination, ?string $permissionMode = null) : string {
-        $ret = false;
-
-        $destPath = File::getPathInfo($destination, keepFileNotExists: true, createPath: $permissionMode ?? true);
-        if(empty($destPath['path']) || empty($destPath['file'])) {
+    private static function getRealDestination(string $destination) : string {
+        // Checked here too, not only trusted to File::getPathInfo(): a NUL byte reaching a
+        // filesystem function is a ValueError, and a blank path must never resolve to the cwd.
+        if (trim($destination) === "" || str_contains($destination, "\0")) {
             throw new \Exception("Invalid destination path provided for writing!");
         }
 
-        if(empty($destPath['dir']) || !is_dir($destPath['dir'])) {
+        $destPath = File::getPathInfo($destination, keepFileNotExists: true, createPath: true);
+
+        // Strict checks: empty() also rejected a destination file literally named "0".
+        if (($destPath['path'] ?? "") === "" || ($destPath['file'] ?? "") === "") {
+            throw new \Exception("Invalid destination path provided for writing!");
+        }
+
+        if (($destPath['dir'] ?? "") === "" || !is_dir($destPath['dir'])) {
             throw new \Exception("Error on creating destination path!");
         }
 
-        $ret = $destPath['path'];
-        $destPath = null;
-
-        return $ret;
+        return $destPath['path'];
     }
 
     /**
      * Rejects a file operation whose destination IS the source file.
      *
-     * encryptFileV2/decryptFileV2 stream source -> destination: they open the destination for
-     * writing (which TRUNCATES it) and only then read the source. When both are the same file the
-     * source is destroyed before it is ever read, and the call still reports success — the read
-     * loop simply re-reads whatever the writer has already emitted. Callers lose the file with no
-     * error. In-place operation is therefore REFUSED here, loudly, before anything is opened.
+     * The destination is only replaced once the output is complete, so an in-place call would no
+     * longer shred the input mid-read — but it would REPLACE the only copy of the input with the
+     * output. For encryptFileV2 that is irreversible the moment the key is mistyped or lost, and
+     * for decryptFileV2 in append mode it is meaningless. It is refused, loudly, before anything
+     * is opened; write elsewhere and rename afterwards.
      *
      * Identity is decided on RESOLVED paths and on file identity, never on the raw strings:
      * './x' vs 'x', a trailing separator, '..' segments, a symlink to the source and — on Windows
@@ -270,18 +549,13 @@ class Security {
      *     Skipped when the platform reports no inode (ino 0) rather than guessing — an
      *     unavailable inode must not make every ordinary call fail.
      *  2. Canonical path equality (realpath), as the FALLBACK for a platform with no inodes.
-     *     Note realpath() output is canonical but not guaranteed fully expanded: it resolves a
-     *     junction while leaving an 8.3 short name in the prefix intact, so two of its results can
-     *     still differ for one file. Hence check 1 leads.
+     *     realpath() output is canonical but not guaranteed fully expanded (it can leave an 8.3
+     *     short name in the prefix), so two of its results can differ for one file: check 1 leads.
      *
-     * Case is deliberately NOT folded, on any platform. Windows paths are usually
-     * case-insensitive, but a directory can opt into case sensitivity (fsutil, and WSL does it by
-     * default), where 'x.txt' and 'X.TXT' are two different files — folding case there REFUSES a
-     * legitimate call. Nothing is lost: on a case-insensitive volume the two spellings are one
-     * file, so realpath() returns the same on-disk name for both AND they share an inode.
-     *
-     * A destination that does not exist yet cannot be the source, so it needs no stat — that is
-     * the ordinary case and it must stay cheap and side-effect free.
+     * Case is deliberately NOT folded, on any platform: a directory can opt into case sensitivity
+     * (fsutil; WSL does it by default), where 'x.txt' and 'X.TXT' are two different files. On a
+     * case-insensitive volume the two spellings are one file, so realpath() returns the same
+     * on-disk name for both AND they share an inode.
      *
      * @param string $source Resolved source path, as returned by getRealSource()
      * @param string $destination Resolved destination path, as returned by getRealDestination()
@@ -290,39 +564,32 @@ class Security {
      * @return void
      */
     private static function assertDestinationIsNotSource(string $source, string $destination): void {
-        $message = "The destination must not be the same file as the source. Encrypting or "
-            . "decrypting a file in place would truncate it before it is read and destroy its "
-            . "contents; write to a different path.";
+        $message = "The destination must not be the same file as the source. The output replaces the "
+            . "destination, so an in-place call would replace the only copy of the input; write to a "
+            . "different path.";
 
         clearstatcache(true, $source);
         clearstatcache(true, $destination);
 
         // realpath() returns false for a path that does not exist — the normal case for a
         // destination. Fall back to the given path then: getRealSource()/getRealDestination() have
-        // already resolved everything that CAN be resolved (the destination's directory is always
-        // realpath()-resolved), so the remaining string compare is between canonical forms.
+        // already resolved everything that CAN be resolved.
         $sourceReal = realpath($source);
         $destinationReal = realpath($destination);
 
         $paths = [];
         foreach ([($sourceReal === false ? $source : $sourceReal), ($destinationReal === false ? $destination : $destinationReal)] as $path) {
             // Unify the separators ONLY on Windows, where '/' and '\' are interchangeable. On
-            // POSIX a backslash is an ordinary, legal character in a file name, so rewriting it
-            // would make the distinct files "a\b.txt" and "a/b.txt" compare equal and refuse a
-            // legitimate call.
+            // POSIX a backslash is an ordinary, legal character in a file name.
             if (DIRECTORY_SEPARATOR === "\\") {
                 $path = str_replace("/", DIRECTORY_SEPARATOR, $path);
             }
 
             // Drop trailing separators ("x/" is the same file as "x") without eating a root.
-            // Belt-and-braces: getRealDestination() already folds a trailing separator away.
-            while (mb_strlen($path, '8bit') > 1 && str_ends_with($path, DIRECTORY_SEPARATOR)) {
-                $path = mb_substr($path, 0, -1, '8bit');
+            while (strlen($path) > 1 && str_ends_with($path, DIRECTORY_SEPARATOR)) {
+                $path = substr($path, 0, -1);
             }
 
-            // Case is NOT folded here — see the note above. Folding it would reject a legitimate
-            // 'x.txt' -> 'X.TXT' on a case-sensitive directory (fsutil/WSL), and it catches
-            // nothing the inode check below does not already catch.
             $paths[] = $path;
         }
 
@@ -342,8 +609,7 @@ class Security {
             return;
         }
 
-        // An inode of 0 means "not reported by this platform/filesystem", NOT "inode zero". Two
-        // unrelated files would both report 0 and every ordinary call would be rejected.
+        // An inode of 0 means "not reported by this platform/filesystem", NOT "inode zero".
         if (empty($sourceStat['ino']) || empty($destinationStat['ino'])) {
             return;
         }
@@ -354,7 +620,239 @@ class Security {
     }
 
     /**
-     * Returns the block size (bytes) read per iteration by encryptFileV2.
+     * Parses the caller's octal permission mode BEFORE anything is touched.
+     *
+     * File::getPermissionMode() silently turns a malformed mode into the 0755 default — wider than
+     * what a caller asking for '0600' on a decrypted secret wanted — so a malformed mode is refused
+     * here instead, like File::writeFile() does.
+     *
+     * @param string|null $permissionMode Octal string such as "0600"; NULL = not given
+     *
+     * @throws \InvalidArgumentException When given but not an octal mode <= 07777
+     * @return int|null
+     */
+    private static function parseFileMode(?string $permissionMode): ?int {
+        if ($permissionMode === null) {
+            return null;
+        }
+
+        $length = strlen($permissionMode);
+        if ($length < 1 || $length > 5 || strspn($permissionMode, "01234567") !== $length || octdec($permissionMode) > 07777) {
+            throw new \InvalidArgumentException("Invalid permission mode '{$permissionMode}': expected an octal string such as '0600'.");
+        }
+
+        return (int) octdec($permissionMode);
+    }
+
+    /**
+     * Refuses to replace a READ-ONLY destination unless the caller passed a $permissionMode.
+     *
+     * The old code chmod()ed every existing destination to the 0755 default before writing, so a
+     * read-only file was silently made writable (and executable) and overwritten, on every
+     * platform. A read-only bit is taken to mean "do not overwrite" now; an explicit mode is the
+     * caller saying otherwise.
+     *
+     * @param string $destination Resolved destination path
+     * @param int|null $mode Parsed permission mode
+     *
+     * @throws \Exception
+     * @return void
+     */
+    private static function assertDestinationReplaceable(string $destination, ?int $mode): void {
+        clearstatcache(true, $destination);
+        if ($mode === null && is_file($destination) && !is_writable($destination)) {
+            throw new \Exception(
+                "The destination exists and is read-only; it is only replaced when a \$permissionMode is given."
+            );
+        }
+    }
+
+    /**
+     * Creates the staging file the file functions write into, instead of writing the destination
+     * directly: a NEW, exclusively created sibling of $destination (so the final rename() stays on
+     * one filesystem and is atomic, and 'x' never opens a file or symlink someone else planted).
+     *
+     * It is created OWNER-ONLY (umask 077) and keeps that mode while it is written. Permissions are
+     * checked when a file is opened, not on each read, so a staging file created 0644 and
+     * narrowed afterwards could be opened by another user in between — who would then read every
+     * byte of plaintext written later. applyStagingMode() sets the final mode once it is complete.
+     *
+     * @param string $destination Resolved destination path
+     *
+     * @throws \Exception
+     * @return array{0: string, 1: resource} [staging path, handle opened for writing]
+     */
+    private static function openStagingFile(string $destination): array {
+        $directory = dirname($destination);
+        $path = "";
+        $fp = false;
+        $oldUmask = umask(0077);
+        try {
+            for ($attempt = 0; $attempt < 3 && $fp === false; $attempt++) {
+                $path = $directory . DIRECTORY_SEPARATOR . ".phphelper-" . bin2hex(self::secureRandomBytes(8)) . ".part";
+                $fp = @fopen($path, 'xb');
+                if ($fp === false && !file_exists($path)) {
+                    break;
+                }
+            }
+        } finally {
+            umask($oldUmask);
+        }
+
+        if ($fp === false) {
+            throw new \Exception("Error while writing to the destination file: cannot create a staging file in its directory.");
+        }
+
+        return [$path, $fp];
+    }
+
+    /**
+     * Gives a COMPLETE staging file its final mode, right before it replaces the destination:
+     * $mode when given; otherwise the permission bits of the destination it replaces (a 0600 file
+     * must not come back 0644); otherwise what a plain new file gets (0666 & ~umask).
+     *
+     * @param string $stagingPath Finished, closed staging file
+     * @param string $destination Resolved destination path
+     * @param int|null $mode Parsed permission mode
+     *
+     * @throws \Exception When an explicit $mode cannot be applied
+     * @return void
+     */
+    private static function applyStagingMode(string $stagingPath, string $destination, ?int $mode): void {
+        $explicitMode = ($mode !== null);
+        if (!$explicitMode) {
+            clearstatcache(true, $destination);
+            $existing = (is_file($destination) ? @fileperms($destination) : false);
+            $mode = ($existing === false ? (0666 & ~umask()) : ($existing & 07777));
+        }
+
+        // Only a mode the CALLER asked for is fatal to miss; the fallbacks are best effort (some
+        // filesystems do not model permission bits at all).
+        if (!@chmod($stagingPath, $mode) && $explicitMode) {
+            throw new \Exception("Error while writing to the destination file: cannot apply permission mode " . sprintf('%04o', $mode) . ".");
+        }
+    }
+
+    /**
+     * Flushes and closes a finished staging file.
+     *
+     * @param resource $fp Staging file handle; closed on return, whatever happens
+     *
+     * @throws \Exception
+     * @return void
+     */
+    private static function closeStagingFile($fp): void {
+        $flushed = @fflush($fp);
+        // Best effort: without it a power loss right after the rename() can leave an empty file on
+        // some filesystems, but not every filesystem supports it, so failing here is not fatal.
+        @fsync($fp);
+        $closed = @fclose($fp);
+
+        if (!$flushed || !$closed) {
+            throw new \Exception("Error while writing to the destination file: it could not be flushed to disk.");
+        }
+    }
+
+    /**
+     * Moves a finished staging file over $destination with one rename(): a reader, a crash or a
+     * killed process sees either the previous destination or the complete new one — never a
+     * partial file and never unauthenticated plaintext.
+     *
+     * @param string $stagingPath Finished staging file
+     * @param string $destination Resolved destination path
+     * @param int|null $mode Parsed permission mode
+     *
+     * @throws \Exception When the destination cannot be replaced; the staging file is left for the
+     *                    caller to remove
+     * @return void
+     */
+    private static function commitStagingFile(string $stagingPath, string $destination, ?int $mode): void {
+        clearstatcache(true, $destination);
+        if ($mode !== null && is_file($destination) && !is_writable($destination)) {
+            // Windows cannot rename over a read-only file. Its replacement carries $mode anyway, so
+            // granting $mode to the file about to be replaced changes nothing that survives.
+            @chmod($destination, $mode);
+        }
+
+        for ($attempt = 1; ; $attempt++) {
+            if (@rename($stagingPath, $destination)) {
+                return;
+            }
+            // Windows only: a scanner or indexer can hold a freshly closed file for a moment.
+            if (DIRECTORY_SEPARATOR !== "\\" || $attempt >= 5) {
+                break;
+            }
+            usleep(20000 * $attempt);
+        }
+
+        throw new \Exception(
+            "Error while writing to the destination file: the finished output could not be moved into place "
+            . "(read-only, open in another process, or not writable?)."
+        );
+    }
+
+    /**
+     * decryptFileV2's append mode: copies an AUTHENTICATED staging file onto the end of
+     * $destination (or moves it into place when $destination does not exist yet).
+     *
+     * The copy is the only step that writes into the caller's existing file, and it only starts
+     * once every block has been verified. If it comes up short, the destination is truncated back
+     * to the length it had, so parts appended by earlier calls survive.
+     *
+     * @param string $stagingPath Finished staging file
+     * @param string $destination Resolved destination path
+     * @param int|null $mode Parsed permission mode
+     *
+     * @throws \Exception
+     * @return void
+     */
+    private static function appendStagingFile(string $stagingPath, string $destination, ?int $mode): void {
+        clearstatcache(true, $destination);
+        if (!is_file($destination)) {
+            self::commitStagingFile($stagingPath, $destination, $mode);
+            return;
+        }
+
+        if ($mode !== null) {
+            @chmod($destination, $mode);
+        }
+
+        $fpDestination = @fopen($destination, 'ab');
+        $fpStaging = @fopen($stagingPath, 'rb');
+        if ($fpDestination === false || $fpStaging === false) {
+            if ($fpDestination !== false) {
+                @fclose($fpDestination);
+            }
+            if ($fpStaging !== false) {
+                @fclose($fpStaging);
+            }
+            throw new \Exception("Error while writing to the destination file.");
+        }
+
+        $entryLength = (int) (fstat($fpDestination)['size'] ?? 0);
+        $expected = (int) (fstat($fpStaging)['size'] ?? -1);
+        $copied = @stream_copy_to_stream($fpStaging, $fpDestination);
+        $complete = ($copied === $expected && @fflush($fpDestination));
+        if ($complete) {
+            @fsync($fpDestination);
+        } else {
+            @ftruncate($fpDestination, $entryLength);
+        }
+        @fclose($fpStaging);
+        @fclose($fpDestination);
+
+        if (!$complete) {
+            throw new \Exception(
+                "Error on writing plaintext: the decrypted part could not be appended in full; the destination was "
+                . "truncated back to its previous length."
+            );
+        }
+
+        @unlink($stagingPath);
+    }
+
+    /**
+     * Returns the block size (plaintext bytes) read per iteration by encryptFileV2.
      *
      * When no value is set (initial state, or after setFileEncryptBlocksBytes(null)), the default
      * of 3.200.000 is installed and returned, so this never returns 0.
@@ -364,104 +862,200 @@ class Security {
     public static function getFileEncryptBlocksBytes(): int
     {
         if (empty(self::$fileEncryptBlocksBytes)) {
-            self::setFileEncryptBlocksBytes(3200000);
+            self::setFileEncryptBlocksBytes(self::DEFAULT_FILE_ENCRYPT_BLOCK_BYTES);
         }
 
         return self::$fileEncryptBlocksBytes;
     }
 
     /**
-     * Sets the block size (bytes) read per iteration during file encryption.
+     * Sets the block size (plaintext bytes) read per iteration during file encryption.
+     *
+     * encryptFileV2 holds a few copies of one block in memory at a time (plaintext, ciphertext,
+     * base64), so this is also what bounds its memory use. The block size is not recorded in the
+     * file: decryptFileV2 needs no setting to match it — except that every block must fit
+     * getFileMaxEncodedBlockBytes() (4*ceil(size/3) <= limit, i.e. at most 201.326.592 bytes under
+     * the default limit). That is checked when encryptFileV2 runs, not here, so the two setters
+     * can be called in either order.
      *
      * This is PROCESS-GLOBAL static state: on a long-lived worker (FPM child, queue worker, Swoole)
-     * a value set here survives until it is changed or reset, across requests/jobs. Pass null to
-     * reset, which makes the next getFileEncryptBlocksBytes() reinstall the 3.200.000 default.
+     * a value set here survives until it is changed or reset, across requests/jobs.
      *
-     * @param int|null $fileEncryptBlocksBytes Block size in bytes; must be >= 1. Pass NULL to reset
-     *                                         to the default (the reset is real: it clears any
-     *                                         previously-set value, it is not a no-op).
+     * @param int|null $fileEncryptBlocksBytes Block size in bytes; must be >= 1. NULL resets to the
+     *                                         default (a real reset, not a no-op).
      *
-     * @throws \Exception When a non-null value <= 0 is given. Such a value is a caller bug and is
-     *                    rejected LOUDLY rather than silently ignored, because a silently-kept
-     *                    previous value causes memory blowups far from this call site.
+     * @throws \InvalidArgumentException When a non-null value <= 0 is given. It is rejected LOUDLY
+     *                                   and the value in effect is kept.
      * @return void
      */
     public static function setFileEncryptBlocksBytes(?int $fileEncryptBlocksBytes): void
     {
-        // NULL means "reset": 0 is the sentinel getFileEncryptBlocksBytes() treats as "unset", so
-        // it reinstalls the default. This must clear a previously-set value, not preserve it.
+        // NULL means "reset": 0 is the sentinel getFileEncryptBlocksBytes() treats as "unset".
         if ($fileEncryptBlocksBytes === null) {
             self::$fileEncryptBlocksBytes = 0;
             return;
         }
 
         if ($fileEncryptBlocksBytes <= 0) {
-            throw new \Exception("Invalid file encryption block size: must be >= 1 byte, or null to reset to the default.");
+            throw new \InvalidArgumentException("Invalid file encryption block size: must be >= 1 byte, or null to reset to the default.");
         }
 
         self::$fileEncryptBlocksBytes = $fileEncryptBlocksBytes;
     }
 
     /**
+     * Returns the largest length-encoded block (bytes, base64 as written on disk) the V2 file
+     * format may contain — see setFileMaxEncodedBlockBytes().
+     *
+     * When no value is set (initial state, or after setFileMaxEncodedBlockBytes(null)), the default
+     * of 268.435.456 (256 MiB) is installed and returned.
+     *
+     * @return int Always >= 44
+     */
+    public static function getFileMaxEncodedBlockBytes(): int
+    {
+        if (empty(self::$fileMaxEncodedBlockBytes)) {
+            self::setFileMaxEncodedBlockBytes(self::DEFAULT_FILE_MAX_ENCODED_BLOCK_BYTES);
+        }
+
+        return self::$fileMaxEncodedBlockBytes;
+    }
+
+    /**
+     * Sets the largest length-encoded block (bytes, base64 as written on disk) the V2 file format
+     * may contain. It is enforced on BOTH sides:
+     *  - decryptFileV2 refuses a block that declares more, BEFORE allocating anything, so a corrupt
+     *    or hostile file cannot force a huge allocation ahead of authentication. It is therefore
+     *    also the largest single read decryptFileV2 makes: keep it within memory_limit.
+     *  - encryptFileV2 refuses, before touching the destination, a configuration that could write
+     *    a larger block: a plaintext block size (setFileEncryptBlocksBytes) or salt whose base64
+     *    form, 4*ceil(n/3) bytes, exceeds it. The largest plaintext block a limit L allows is
+     *    3*floor(L/4) bytes — 201.326.592 under the default.
+     *
+     * CROSS-PROCESS: the limit is not recorded in the file. A file written under a raised limit
+     * must be decrypted under a limit at least as large; decryptFileV2's error names the size it
+     * found and this setter.
+     *
+     * This is PROCESS-GLOBAL static state, like setFileEncryptBlocksBytes().
+     *
+     * @param int|null $maxEncodedBlockBytes Limit in bytes, >= 44: the encoded size of the largest
+     *                                       fixed-size block every V2 file contains (its 32-char
+     *                                       file id). Below that no file — not even an empty one —
+     *                                       could be written or read, so such a value is rejected
+     *                                       here rather than failing on every call. NULL resets to
+     *                                       the default.
+     *
+     * @throws \InvalidArgumentException When a non-null value below the minimum is given. The value
+     *                                   in effect is kept.
+     * @return void
+     */
+    public static function setFileMaxEncodedBlockBytes(?int $maxEncodedBlockBytes): void
+    {
+        if ($maxEncodedBlockBytes === null) {
+            self::$fileMaxEncodedBlockBytes = 0;
+            return;
+        }
+
+        $minimum = self::fileV2MinEncodedBlockBytes();
+        if ($maxEncodedBlockBytes < $minimum) {
+            throw new \InvalidArgumentException(
+                "Invalid max encoded block size {$maxEncodedBlockBytes}: must be >= {$minimum} bytes (the encoded size of the "
+                . "file id block every encrypted file contains), or null to reset to the default."
+            );
+        }
+
+        self::$fileMaxEncodedBlockBytes = $maxEncodedBlockBytes;
+    }
+
+    /**
      * Generates a search hash for a given string using HMAC with a derived key.
      * This function is used to create a consistent hash for search purposes, allowing for secure comparisons without exposing the original data.
-     * 
-     * @param mixed $str The input string to generate the search hash for
-     * @param string $key Base key to derive the search hash key from
-     * @param string|null $salt (Optional) Salt value to add randomness to the derived search hash key
-     * 
-     * @throws \Exception
-     * @return string
+     *
+     * Deterministic by design (that is what makes it searchable): equal inputs give equal hashes,
+     * so it reveals equality between rows. Scalars are normalized first — true/1/"1" hash alike,
+     * as do false/0/"0" — and null/"" return "" without hashing.
+     *
+     * @param mixed $str The value to hash: a string, int, float, bool, Stringable or null
+     * @param string $key Base key to derive the search hash key from (>= 32 bytes)
+     * @param string|null $salt (Optional) Salt value to add randomness to the derived search hash key.
+     *                          NULL and "" are the same salt.
+     *
+     * @throws \Exception When the key is shorter than 32 bytes
+     * @throws \InvalidArgumentException For an array, a non-Stringable object or a resource. These
+     *                                   used to be hashed as the literal "Array" — every array
+     *                                   shared one blind index — or to raise an \Error.
+     * @return string 64 lowercase hex characters, or "" for null/""
      */
     public static function generateSearchHash(mixed $str, string $key, ?string $salt = ""): string {
         if ($str === null || $str === "") {
             return "";
         }
 
-        if(is_bool($str)) {
-            $str = (int) $str;
-        }
-        $str = (string) $str;
-
-        // Checks if the key is empty or it does not have the min length for AES-256-grade keying
-        if (empty($key) || mb_strlen($key, '8bit') < self::MIN_KEY_BYTES) {
-            throw new \Exception("Invalid encryption key. The key must be at least " . self::MIN_KEY_BYTES . " bytes long.");
+        $str = self::scalarToString($str, __FUNCTION__);
+        if ($str === "") {
+            return "";
         }
 
         // Normalize the salt (null -> "") so a null vs "" caller cannot yield different, unstable
         // blind indexes. The blind index must be perfectly deterministic to match on lookup.
-        $keySearch = hash_hkdf(
-            'sha256',
-            $key,
-            32,
-            'search-hash',
-            ($salt ?? "")
-        );
+        $keySearch = self::deriveKey($key, 32, $salt, 'search-hash');
 
         // hex: 64 caracteres
         return hash_hmac('sha256', $str, $keySearch);
     }
 
     /**
-     * Encrypts the given file and saves the result to a new destination file V2
+     * Encrypts a file with AES-256-GCM into the authenticated, chunked V2 format.
      *
-     * IN-PLACE IS REFUSED. $destination must not resolve to the same file as $source: the
-     * destination is opened for writing (truncating it) before the source is read, so an in-place
-     * call would shred the plaintext and then encrypt its own output — and report success. The
-     * check compares device+inode plus RESOLVED paths, so './x' vs 'x', a trailing separator, a
-     * symlink, a hard link and (on Windows) an 8.3 short name or a case-insensitive spelling are
-     * all caught. Encrypt to a different path; if you need the result to land on the source path,
-     * rename it there yourself once this call has returned successfully.
+     * FORMAT (stable; decryptFileV2 reads files written by every earlier version of this method).
+     * A sequence of length-encoded blocks, "{decimal length}-{base64}":
+     *   header:   "aes-256-gcm", "v2", salt, file id (32 hex chars of CSPRNG output)
+     *   per data block i (0-based): IV (12 bytes), tag (16), ciphertext
+     *   end marker: IV, tag, ciphertext of the decimal block count
+     * Key = HKDF-SHA256(master key, salt, info "file-v2"). Each block's AAD is
+     * "{fileId}|v2|D|{i}" ("...|F|{count}" for the end marker), so a reordered, duplicated,
+     * dropped, truncated or spliced (even same-key) block fails authentication.
+     *
+     * STREAMING: the source is read one block at a time (setFileEncryptBlocksBytes, default
+     * 3.200.000 bytes), so memory stays bounded by a few copies of one block whatever the file size.
+     *
+     * LOUD, AND BEFORE ANY SIDE EFFECT: a configuration that could write a block decryptFileV2
+     * would refuse — see setFileMaxEncodedBlockBytes() — is refused before the destination (or its
+     * directory) is touched, as are a short key, a malformed $permissionMode, a missing or
+     * non-regular source, an in-place call and a read-only destination with no $permissionMode.
+     *
+     * ATOMIC: the output is written to a staging file next to $destination and renamed over it only
+     * once it is complete. On ANY failure the staging file is removed and an existing $destination
+     * is left exactly as it was — a failed call used to truncate it and then delete it. A crash
+     * leaves at most a stray ".phphelper-*.part" file. An existing destination is REPLACED (a new
+     * file, not a rewrite): its permission bits are carried over when $permissionMode is null, but
+     * ownership, ACLs and hard links to it are not, and a destination that is a symlink is replaced
+     * by a regular file rather than written through.
+     *
+     * IN-PLACE IS REFUSED: $destination must not resolve to the same file as $source (see
+     * assertDestinationIsNotSource): replacing the only plaintext copy with its ciphertext is
+     * irreversible if the key is mistyped or lost. Encrypt to another path and rename afterwards.
      *
      * @param string $source Path to the file to be encrypted (use tmp_name if from $_FILES)
-     * @param string $key Encryption key to be used
+     * @param string $key Master key (>= 32 bytes)
      * @param string $destination Path where the encrypted file should be saved. MUST NOT be $source.
-     * @param string|null $salt Optional salt for key derivation
-     * @param string|null $permissionMode Optional file permission mode to apply to the destination file
+     *                            A missing directory is created with File::getDefaultMode().
+     * @param string|null $salt Optional salt for key derivation. It is stored in the file header —
+     *                          decryptFileV2 needs no salt argument — so it separates keys, it is
+     *                          not a secret. NULL and "" are stored as "?".
+     * @param string|null $permissionMode Octal mode for the destination file (e.g. "0600"). The
+     *                                    output is written owner-only and given this mode once it
+     *                                    is complete, just before it replaces the destination. NULL:
+     *                                    a new file gets the platform default (0666 & ~umask), a
+     *                                    replaced one keeps its previous bits.
+     *                                    A malformed mode throws \InvalidArgumentException (it used
+     *                                    to fall back silently to 0755). It is never used for the
+     *                                    directory.
      *
-     * @return string Returns the path to the encrypted file
-     * @throws \Exception If $destination is the same file as $source, or if encryption fails or
-     *                    file handling encounters an error
+     * @return string Returns the resolved path of the encrypted file
+     * @throws \Exception If $destination is the same file as $source, on an over-limit block or
+     *                    salt, or if encryption or file handling fails. An \Error raised midway is
+     *                    rethrown wrapped in an \Exception, after the cleanup.
      *
      * @ref https://riptutorial.com/php/example/25499/symmetric-encryption-and-decryption-of-large-files-with-openssl
      */
@@ -469,163 +1063,99 @@ class Security {
         if (!extension_loaded('openssl')) {
             throw new \Exception("OpenSSL not loaded");
         }
+
+        $mode = self::parseFileMode($permissionMode);
+
+        // "" would be written as the "0-" block the reader rejects, so "no salt" is stored as "?".
         $salt = (($salt ?? "") === "" ? "?" : $salt);
         // Domain-separated key (distinct from the DB-cell / local subsystems).
         $key = self::deriveKey($key, 32, $salt, 'file-v2');
 
-        // Attempts to get the absolute path of the source file
+        // Before any path is resolved: resolving the destination may create its directory.
+        $blockBytes = self::getFileEncryptBlocksBytes();
+        self::assertFileV2BlocksFitLimit($blockBytes, $salt);
+
         $source = self::getRealSource($source);
-
-        // Sets the destination file path
-        $destination = self::getRealDestination($destination, $permissionMode);
-
-        // Refuse to write onto the source. This MUST precede the chmod and the fopen below: both
-        // touch the destination, and the fopen(..., 'wb') would truncate the source irrecoverably.
+        $destination = self::getRealDestination($destination);
         self::assertDestinationIsNotSource($source, $destination);
+        self::assertDestinationReplaceable($destination, $mode);
 
-        // Sets the default permission mode if it's empty
-        $mode = File::getPermissionMode($permissionMode);
+        // The source is opened BEFORE anything is created: an unreadable source used to be
+        // discovered only after the destination had been truncated.
+        $fpIn = @fopen($source, 'rb');
+        if ($fpIn === false) {
+            throw new \Exception("Error on opening source file stream");
+        }
 
-        // Sets the IV (Initialization Vector) length using the 'AES-256-gcm' algorithm
-        $cipher = "aes-256-gcm";
-        $version = self::FILE_V2_VERSION;
-        $iv_length = openssl_cipher_iv_length($cipher);
-        $tag_length = 16;
+        $stagingPath = null;
+        $fpOut = false;
+        try {
+            [$stagingPath, $fpOut] = self::openStagingFile($destination);
 
-        // Random per-file identity, folded into EVERY block's AAD so blocks cannot be spliced in
-        // from another file (even one under the same key) and the header cannot be swapped.
-        $fileId = bin2hex(self::secureRandomBytes(16));
+            // Random per-file identity, folded into EVERY block's AAD so blocks cannot be spliced in
+            // from another file (even one under the same key) and the header cannot be swapped.
+            $fileId = bin2hex(self::secureRandomBytes(self::FILE_V2_FILE_ID_BYTES));
 
-        // Sets the permission of the destination file
-        $oldMask = umask(0);
-        @chmod($destination, $mode);
-        umask($oldMask);
+            // The header is not MAC'd on its own: the file id is bound into every block's AAD and
+            // the salt drives the key, so tampering with either fails every block.
+            self::writeLengthEncodedBlock($fpOut, self::FILE_V2_CIPHER, "cipher type");
+            self::writeLengthEncodedBlock($fpOut, self::FILE_V2_VERSION, "cipher version");
+            self::writeLengthEncodedBlock($fpOut, $salt, "cipher salt");
+            self::writeLengthEncodedBlock($fpOut, $fileId, "file id");
 
-        // Attempts to open the destination file for writing
-        if ($fpOut = fopen($destination, 'wb')) {
-            // Initializes the error flag
-            $error = false;
-
-            // Writes the header (cipher, version, salt, fileId). Its integrity is enforced because
-            // $fileId is bound into every block's AAD and $salt drives key derivation.
-            if(!self::writeLengthEncodedBlock($fpOut, $cipher)) {
-                $error = "Error on writing cipher type";
-            }
-            if(!$error && !self::writeLengthEncodedBlock($fpOut, $version)) {
-                $error = "Error on writing cipher version";
-            }
-            if(!$error && !self::writeLengthEncodedBlock($fpOut, $salt)) {
-                $error = "Error on writing cipher salt";
-            }
-            if(!$error && !self::writeLengthEncodedBlock($fpOut, $fileId)) {
-                $error = "Error on writing file id";
-            }
-
-            // Monotonic block counter, bound into each block's AAD to fix its position.
+            $stat = fstat($fpIn);
+            $sizeAtOpen = ($stat === false ? null : $stat['size']);
+            $bytesRead = 0;
             $index = 0;
-
-            // Attempts to open the source file for reading
-            if (!$error && $fpIn = fopen($source, 'rb')) {
-                // Reads blocks of text, encrypts them, and writes to the destination file
-                while (!feof($fpIn)) {
-                    // Reads a block from the source file
-                    $plaintext = fread($fpIn, self::getFileEncryptBlocksBytes());
-                    if($plaintext === false) {
-                        $error = "Error on reading plaintext";
-                        break;
-                    }
-
-                    if($plaintext === "") {
-                        break;
-                    }
-
-                    // Fresh CSPRNG nonce; fails closed if no strong RNG is available.
-                    $iv = self::secureRandomBytes($iv_length);
-
-                    // AAD binds this ciphertext to (file, version, "data", position): reorder,
-                    // duplicate, cross-file splice, and header tamper all fail the GCM tag.
-                    $aad = $fileId . "|" . $version . "|D|" . $index;
-                    $ciphertext = openssl_encrypt(
-                        $plaintext,
-                        $cipher,
-                        $key,
-                        OPENSSL_RAW_DATA,
-                        $iv,
-                        $tag,
-                        $aad,
-                        $tag_length
-                    );
-                    if($ciphertext === false) {
-                        $error = "Error on creating cipher of plaintext";
-                        break;
-                    }
-                    if (mb_strlen($tag, '8bit') !== $tag_length) {
-                        $error = "Error on validating tag length";
-                        break;
-                    }
-
-                    if(!self::writeLengthEncodedBlock($fpOut, $iv)) {
-                        $error = "Error on writing IV ciphertext";
-                        break;
-                    }
-                    if(!self::writeLengthEncodedBlock($fpOut, $tag)) {
-                        $error = "Error on writing tag ciphertext";
-                        break;
-                    }
-                    if(!self::writeLengthEncodedBlock($fpOut, $ciphertext)) {
-                        $error = "Error on writing ciphertext";
-                        break;
-                    }
-
-                    $index++;
+            while (true) {
+                // fread() allocates its full length up front: never ask for more than is left, so
+                // a large block size costs nothing on a small file. Past the size seen at open,
+                // small reads detect the end (or a file that grew meanwhile).
+                $remaining = ($sizeAtOpen === null ? $blockBytes : $sizeAtOpen - $bytesRead);
+                $plaintext = @fread($fpIn, ($remaining > 0 ? min($blockBytes, $remaining) : min($blockBytes, 8192)));
+                if ($plaintext === false) {
+                    throw new \Exception("Error on reading plaintext");
                 }
+                if ($plaintext === "") {
+                    break;
+                }
+                $bytesRead += strlen($plaintext);
+
+                self::writeFileV2Triple($fpOut, $key, $fileId, "D", $index, $plaintext);
+                $index++;
+            }
+
+            // Some read failures look like a plain end of file. Encrypting what was read so far
+            // would produce a VALID ciphertext of a truncated file — silent data loss.
+            if ($sizeAtOpen !== null && $bytesRead < $sizeAtOpen) {
+                throw new \Exception("Error on reading plaintext: only {$bytesRead} of {$sizeAtOpen} bytes could be read.");
+            }
+
+            // Authenticated end marker: the block count under AAD "...|F|<count>", so dropping
+            // trailing blocks or the marker itself is detected on decrypt.
+            self::writeFileV2Triple($fpOut, $key, $fileId, "F", $index, (string) $index);
+
+            $handle = $fpOut;
+            $fpOut = false;
+            self::closeStagingFile($handle);
+            self::applyStagingMode($stagingPath, $destination, $mode);
+
+            self::commitStagingFile($stagingPath, $destination, $mode);
+            $stagingPath = null;
+        } catch (\Throwable $e) {
+            if (is_resource($fpOut)) {
+                @fclose($fpOut);
+            }
+            if ($stagingPath !== null) {
+                @unlink($stagingPath);
+            }
+
+            // One failure channel, as documented: an \Error is wrapped, keeping it as getPrevious().
+            throw ($e instanceof \Exception ? $e : new \Exception($e->getMessage(), 0, $e));
+        } finally {
+            if (is_resource($fpIn)) {
                 @fclose($fpIn);
-            } else if(!$error) {
-                // Sets the error flag if the source file could not be opened
-                $error = "Error on opening source file stream";
             }
-
-            // Authenticated trailer: encrypts the total block count under AAD "...|F|<count>", so
-            // dropping trailing blocks (truncation) or removing the trailer is detected on decrypt.
-            if (!$error) {
-                $iv = self::secureRandomBytes($iv_length);
-                $aad = $fileId . "|" . $version . "|F|" . $index;
-                $ciphertext = openssl_encrypt(
-                    (string) $index,
-                    $cipher,
-                    $key,
-                    OPENSSL_RAW_DATA,
-                    $iv,
-                    $tag,
-                    $aad,
-                    $tag_length
-                );
-                if($ciphertext === false) {
-                    $error = "Error on creating end marker";
-                } else if (mb_strlen($tag, '8bit') !== $tag_length) {
-                    $error = "Error on validating end marker tag length";
-                } else if(!self::writeLengthEncodedBlock($fpOut, $iv)) {
-                    $error = "Error on writing end marker IV";
-                } else if(!self::writeLengthEncodedBlock($fpOut, $tag)) {
-                    $error = "Error on writing end marker tag";
-                } else if(!self::writeLengthEncodedBlock($fpOut, $ciphertext)) {
-                    $error = "Error on writing end marker ciphertext";
-                }
-            }
-
-            // Closes the destination file
-            @fclose($fpOut);
-
-            // Checks if any error occurred during encryption
-            if ($error) {
-                // Deletes the destination file if an error occurred
-                if(is_file($destination)) {
-                    @unlink($destination);
-                }
-                throw new \Exception($error);
-            }
-        } else {
-            throw new \Exception("Error while writing to the destination file.");
         }
 
         // Returns the path of the encrypted file
@@ -637,46 +1167,50 @@ class Security {
      *
      * FAILS LOUD — this function NEVER returns false. Every failure mode (unreadable source,
      * unresolvable destination, wrong key, tampered/reordered/spliced block, truncated file with no
-     * authenticated end marker, missing OpenSSL) throws \Exception. There is no falsy return a
-     * caller could mistake for success, matching decryptDataDB's guarantee. Callers MUST try/catch;
-     * an `if ($out === false)` guard is dead code and will not run.
+     * authenticated end marker, trailing data, a block over getFileMaxEncodedBlockBytes(), missing
+     * OpenSSL) throws \Exception; an \Error raised midway is wrapped in one. Callers MUST try/catch.
      *
      * The \Exception messages are raw internal diagnostics ("Encrypted file is truncated ...").
      * They are for logs — do NOT render them to end users.
      *
-     * On failure the destination is restored to its pre-call state: in "w" mode the (freshly
-     * created/truncated) destination is deleted; in "a" mode it is truncated back to the length it
-     * had on entry, so appending a bad part NEVER destroys parts already appended. Unauthenticated
-     * plaintext is never left behind either way. This holds even when the failure is a raised
-     * \Error rather than a detected tamper: nothing leaves this function without the rollback.
+     * NO UNAUTHENTICATED PLAINTEXT EVER REACHES $destination. The plaintext is written to a staging
+     * file next to it and only moved into place ("w") or appended ("a") once the whole file —
+     * end marker included — has been verified. On any failure the staging file is removed and
+     * $destination is left exactly as it was, in both modes; the old code wrote into the
+     * destination as it went and deleted it on failure, destroying a pre-existing file, and a crash
+     * mid-way left a truncated plaintext behind under the destination's name. The one exception:
+     * if appending the VERIFIED plaintext itself fails (disk full), the destination is truncated
+     * back to its previous length, so parts appended by earlier calls survive.
+     * Append mode therefore needs room for the plaintext twice while it runs.
      *
-     * A failure raised BEFORE the destination is opened (missing OpenSSL, unresolvable source or
-     * destination, a destination that is the source, an invalid $outReadMode, a header that does
-     * not match, a key deriveKey rejects) leaves an existing destination file untouched — not its
-     * contents, and not its permissions either: the chmod() that applies $permissionMode is
-     * deliberately deferred until this call is committed to opening the destination, so a rejected
-     * call cannot widen the mode of a file it never writes to.
+     * An existing destination is REPLACED in "w" mode (a new file, not a rewrite): its permission
+     * bits are carried over when $permissionMode is null, but ownership, ACLs and hard links are
+     * not, and a destination that is a symlink is replaced rather than written through.
      *
-     * IN-PLACE IS REFUSED. $destination must not resolve to the same file as $source. Opening the
-     * destination truncates it, so decrypting in place destroys the ciphertext — and does it
-     * SILENTLY for a small file (the whole envelope happens to fit in the stream read buffer, so
-     * it still "works"), while a larger file fails mid-read and the rollback then deletes the
-     * caller's only copy. The check compares device+inode plus RESOLVED paths, so './x' vs 'x', a
-     * trailing separator, a symlink, a hard link and (on Windows) an 8.3 short name or a
-     * case-insensitive spelling are all caught. Decrypt to a different path and rename afterwards
-     * if needed.
+     * CROSS-PROCESS LIMIT: a file written under a raised setFileMaxEncodedBlockBytes() can only be
+     * decrypted under a limit at least as large; the error names the size and the setter.
+     *
+     * IN-PLACE IS REFUSED. $destination must not resolve to the same file as $source (see
+     * assertDestinationIsNotSource). Decrypt to a different path and rename afterwards if needed.
      *
      * @param string $source Path to the file to be decrypted (use tmp_name when from $_FILES)
-     * @param string $key Master key (>= 32 bytes), the same one passed to encryptFileV2
+     * @param string $key Master key (>= 32 bytes), the same one passed to encryptFileV2. The salt
+     *                    is read from the file header.
      * @param string $destination Path where the decrypted file should be saved. MUST NOT be $source.
-     * @param string|null $permissionMode Optional file permission mode to apply to the destination file
-     * @param string $outReadMode How the destination is opened. Accepts exactly "w"/"wb" (truncate,
+     *                            A missing directory is created with File::getDefaultMode().
+     * @param string|null $permissionMode Octal mode for the destination file (e.g. "0600"). The
+     *                                    plaintext is written owner-only and given this mode once
+     *                                    it is verified, just before it reaches the destination.
+     *                                    NULL: a new file gets the platform default (0666 & ~umask),
+     *                                    a replaced one keeps its previous bits, and a READ-ONLY
+     *                                    existing destination is refused. In append mode an
+     *                                    existing destination is chmod()ed to the given mode. A
+     *                                    malformed mode throws \InvalidArgumentException.
+     * @param string $outReadMode How the destination is written. Accepts exactly "w"/"wb" (replace,
      *                            the default) or "a"/"ab" (append — for reassembling a multi-part
-     *                            payload into one destination). Any other value THROWS; it is never
-     *                            silently rewritten, because substituting a truncating mode for an
-     *                            appending one destroys the caller's data.
+     *                            payload into one destination). Any other value THROWS.
      *
-     * @return string Returns the path of the decrypted file
+     * @return string Returns the resolved path of the decrypted file
      * @throws \Exception If $destination is the same file as $source, on an unknown $outReadMode,
      *                    or on any source/destination resolution, authentication, truncation or
      *                    tamper failure.
@@ -686,237 +1220,116 @@ class Security {
             throw new \Exception("OpenSSL not loaded");
         }
 
-        // Attempts to get the absolute path of the source file
-        $source = self::getRealSource($source);
-
-        // Sets the destination file path
-        $destination = self::getRealDestination($destination, $permissionMode);
-
-        // Refuse to write onto the source. This MUST precede the chmod and both fopen()s below:
-        // opening the destination truncates the ciphertext we are about to read, and the rollback
-        // would then delete what is left of the caller's only copy.
-        self::assertDestinationIsNotSource($source, $destination);
-
-        // Sets the default permission mode if it's empty
-        $mode = File::getPermissionMode($permissionMode);
-
-        // Sets the IV (Initialization Vector) length using the algorithm
-        $cipher = "aes-256-gcm";
-        // Must be the SAME constant encryptFileV2 writes and binds into every block's AAD: a
-        // hardcoded literal here silently stops decrypting new files the moment the constant moves.
-        $version = self::FILE_V2_VERSION;
-        $iv_length = openssl_cipher_iv_length($cipher);
-        $tag_length = 16;
-
-        // Normalize the documented modes to their binary form. An unrecognized mode is REJECTED,
-        // never silently rewritten: the old code mapped the documented "a" onto "wb", which
-        // truncated the destination a caller had asked to append to (silent data destruction).
+        // An unrecognized mode is REJECTED, never silently rewritten: the old code mapped the
+        // documented "a" onto "wb" and truncated the destination a caller had asked to append to.
         $appendMode = in_array($outReadMode, array('a', 'ab'), true);
         if (!$appendMode && !in_array($outReadMode, array('w', 'wb'), true)) {
             throw new \Exception("Invalid \$outReadMode '{$outReadMode}': expected 'w'/'wb' (truncate) or 'a'/'ab' (append).");
         }
-        $outReadMode = ($appendMode ? "ab" : "wb");
 
-        // Length of the destination BEFORE we touch it. In append mode a failure must roll back to
-        // exactly this length, so previously-appended parts survive a bad part.
-        clearstatcache(true, $destination);
-        $destExistedBefore = is_file($destination);
-        $appendStartOffset = ($appendMode && $destExistedBefore ? (int) filesize($destination) : 0);
+        // Everything that needs no file is validated before the destination directory can be
+        // created by getRealDestination().
+        $mode = self::parseFileMode($permissionMode);
+        self::assertKeyLength($key);
 
-        // NOTE: applying $permissionMode to the destination is DEFERRED to just before it is
-        // opened (see below). Doing it here would chmod the caller's file on the way to a failure
-        // that never writes a byte — a mismatched header or a rejected key would leave the
-        // destination's mode WIDENED, contradicting the "untouched" guarantee documented above.
+        $source = self::getRealSource($source);
+        $destination = self::getRealDestination($destination);
+        self::assertDestinationIsNotSource($source, $destination);
+        self::assertDestinationReplaceable($destination, $mode);
 
-        // Attempts to open the source file for reading
-        if (!($fpIn = fopen($source, 'rb'))) {
+        $fpIn = @fopen($source, 'rb');
+        if ($fpIn === false) {
             throw new \Exception("Error while reading the source file.");
         }
 
-        // Initializes the error flag. It holds either false, a diagnostic string, or the \Throwable
-        // that aborted the read.
-        $error = false;
-
-        // Declared BEFORE the try so the close/rollback below can see them even if the body aborts
-        // before the destination is ever opened. $destinationOpened is what licenses the rollback:
-        // until fopen() succeeds, this call has not touched the destination, so it has nothing to
-        // roll back and no right to delete the caller's file.
+        $stagingPath = null;
         $fpOut = false;
-        $destinationOpened = false;
-
-        // EVERYTHING from here to the rollback runs inside try/catch, because no failure may leave
-        // this function without the rollback running. A raised \Error (ValueError, TypeError) is
-        // NOT an \Exception, so it would sail straight through the callers' documented
-        // `catch (\Exception)` AND past the cleanup, stranding unauthenticated plaintext on disk.
         try {
-            // Reads the cipher in source file
-            $fCipher = self::readLengthEncodedBlock($fpIn);
-            if (is_bool($fCipher) || $fCipher !== $cipher) {
-                $error = "Cipher type does not match with the one used in function";
+            $fCipher = self::readRequiredLengthEncodedBlock($fpIn, "cipher type");
+            if ($fCipher !== self::FILE_V2_CIPHER) {
+                throw new \Exception("Cipher type does not match with the one used in function");
             }
 
-            // Reads the version in source file
-            $fVersion = self::readLengthEncodedBlock($fpIn);
-            if (!$error && (is_bool($fVersion) || $fVersion !== $version)) {
-                $error = "Cipher version does not match with the one used in function";
+            $fVersion = self::readRequiredLengthEncodedBlock($fpIn, "cipher version");
+            if ($fVersion !== self::FILE_V2_VERSION) {
+                throw new \Exception("Cipher version does not match with the one used in function");
             }
 
-            // Reads the salt in source file
-            $salt = self::readLengthEncodedBlock($fpIn);
-            if (!$error && is_bool($salt)) {
-                $error = "Error on reading cipher salt";
-            }
+            $salt = self::readRequiredLengthEncodedBlock($fpIn, "cipher salt");
+            $fileId = self::readRequiredLengthEncodedBlock($fpIn, "file id");
+            $key = self::deriveKey($key, 32, $salt, 'file-v2');
 
-            // Reads the per-file identity (bound into every block AAD).
-            $fileId = self::readLengthEncodedBlock($fpIn);
-            if (!$error && (is_bool($fileId) || $fileId === "")) {
-                $error = "Error on reading file id";
-            }
+            // Created only once the header is known good: a file that is not ours never gets as
+            // far as creating anything next to the destination.
+            [$stagingPath, $fpOut] = self::openStagingFile($destination);
 
-            if (!$error) {
-                $key = self::deriveKey($key, 32, $salt, 'file-v2');
-            }
-
-            // Expected position of the next data block, and whether the authenticated end marker
-            // was seen. Truncation is detected by the marker being absent.
             $index = 0;
-            $sawTrailer = false;
-
-            // Attempts to open the destination file for writing
-            if (!$error) {
-                // Sets the permission of the destination file. Deferred to here from before the
-                // header reads: every pre-open rejection above must leave the caller's destination
-                // exactly as it found it, permissions included. The chmod still happens immediately
-                // BEFORE the fopen, so the mode a written destination ends up with is unchanged.
-                $oldMask = umask(0);
-                @chmod($destination, $mode);
-                umask($oldMask);
-
-                if (!($fpOut = fopen($destination, $outReadMode))) {
-                    $error = "Error while writing to the destination file.";
-                } else {
-                    // From here on the destination has been created or truncated by US, so a
-                    // failure must roll it back.
-                    $destinationOpened = true;
+            while (true) {
+                $iv = self::readLengthEncodedBlock($fpIn, "IV ciphertext");
+                if ($iv === null) {
+                    throw new \Exception("Encrypted file is truncated (missing authenticated end marker)");
                 }
-            }
-
-            while (!$error) {
-                // Reads one [iv][tag][ciphertext] triple.
-                $iv = self::readLengthEncodedBlock($fpIn);
-                if ($iv === true) {
-                    // Clean EOF: valid only if we already consumed the end marker.
-                    break;
-                }
-                if ($iv === false) {
-                    $error = "Error on reading IV ciphertext";
-                    break;
-                }
-                if (mb_strlen($iv, '8bit') !== $iv_length) {
-                    $error = "Error on validating iv length";
-                    break;
+                if (strlen($iv) !== self::GCM_IV_BYTES) {
+                    throw new \Exception("Error on validating iv length");
                 }
 
-                $tag = self::readLengthEncodedBlock($fpIn);
-                if (is_bool($tag)) {
-                    $error = "Error on reading tag ciphertext";
-                    break;
-                }
-                if (mb_strlen($tag, '8bit') !== $tag_length) {
-                    $error = "Error on validating tag length";
-                    break;
+                $tag = self::readRequiredLengthEncodedBlock($fpIn, "tag ciphertext");
+                if (strlen($tag) !== self::GCM_TAG_BYTES) {
+                    throw new \Exception("Error on validating tag length");
                 }
 
-                $ciphertext = self::readLengthEncodedBlock($fpIn);
-                if (is_bool($ciphertext)) {
-                    $error = "Error on reading ciphertext";
-                    break;
-                }
+                $ciphertext = self::readRequiredLengthEncodedBlock($fpIn, "ciphertext");
 
                 // Try to authenticate it as the DATA block at the expected position.
-                $dataAad = $fileId . "|" . $version . "|D|" . $index;
-                $plaintext = openssl_decrypt($ciphertext, $cipher, $key, OPENSSL_RAW_DATA, $iv, $tag, $dataAad);
+                $plaintext = openssl_decrypt($ciphertext, self::FILE_V2_CIPHER, $key, OPENSSL_RAW_DATA, $iv, $tag, self::fileV2Aad($fileId, "D", $index));
                 if ($plaintext !== false) {
-                    // fwrite() returns the number of bytes actually written: on a full disk or a
-                    // quota limit it returns a SHORT count (or 0), not false. Testing only for
-                    // false accepted a partial write and let this function return the destination
-                    // path as a success — silently truncated plaintext, which is exactly what the
-                    // FAILS LOUD contract above forbids. Demand every byte.
-                    $plaintextLength = mb_strlen($plaintext, '8bit');
-                    $written = fwrite($fpOut, $plaintext);
-                    if ($written === false || $written !== $plaintextLength) {
-                        $error = "Error on writing plaintext";
-                        break;
-                    }
+                    self::writeAll($fpOut, $plaintext, "plaintext");
                     $index++;
                     continue;
                 }
 
                 // Otherwise it must be the authenticated end marker for exactly $index blocks.
-                $trailerAad = $fileId . "|" . $version . "|F|" . $index;
-                $count = openssl_decrypt($ciphertext, $cipher, $key, OPENSSL_RAW_DATA, $iv, $tag, $trailerAad);
-                if ($count !== false && $count === (string) $index) {
-                    $sawTrailer = true;
-                    // The end marker must be the last block: reject any trailing/spliced data.
-                    if (self::readLengthEncodedBlock($fpIn) !== true) {
-                        $error = "Trailing data after end-of-file marker";
-                    }
-                    break;
+                $count = openssl_decrypt($ciphertext, self::FILE_V2_CIPHER, $key, OPENSSL_RAW_DATA, $iv, $tag, self::fileV2Aad($fileId, "F", $index));
+                if ($count === false || $count !== (string) $index) {
+                    throw new \Exception(
+                        "Error on creating plaintext of a ciphertext: block {$index} failed authentication "
+                        . "(wrong key, or the file was tampered with, reordered, spliced or truncated)."
+                    );
                 }
-
-                // Neither a valid data block nor a valid end marker => tamper / reorder / splice.
-                $error = "Error on creating plaintext of a ciphertext";
                 break;
             }
 
-            // A file with no authenticated end marker has been truncated.
-            if (!$error && !$sawTrailer) {
-                $error = "Encrypted file is truncated (missing authenticated end marker)";
+            // The end marker must be the last block: reject any trailing/spliced data. A read error
+            // here (false) cannot prove there is none, so it fails closed as well.
+            if (@fread($fpIn, 1) !== "") {
+                throw new \Exception("Trailing data after end-of-file marker");
             }
+
+            $handle = $fpOut;
+            $fpOut = false;
+            self::closeStagingFile($handle);
+            self::applyStagingMode($stagingPath, $destination, $mode);
+
+            if ($appendMode) {
+                self::appendStagingFile($stagingPath, $destination, $mode);
+            } else {
+                self::commitStagingFile($stagingPath, $destination, $mode);
+            }
+            $stagingPath = null;
         } catch (\Throwable $e) {
-            // Carry the failure into the shared cleanup path below instead of unwinding here, so a
-            // raised \Error rolls back exactly like a detected tamper does.
-            $error = $e;
-        }
-
-        // Closes the source and destination file
-        @fclose($fpIn);
-        if ($fpOut) {
-            @fclose($fpOut);
-        }
-
-        // Checks if any error occurred during decryption
-        if ($error) {
-            // Roll the destination back to its pre-call state. Unauthenticated plaintext must
-            // never survive a failure, but neither must data this call did not write: in append
-            // mode the file (and every part appended by an earlier successful call) belongs to
-            // the caller, so truncate back to the entry length instead of deleting it.
-            //
-            // $destinationOpened gates the whole thing. A failure raised BEFORE the destination
-            // was opened (an unreadable header, a key deriveKey rejects) has not touched the file,
-            // so deleting it would destroy a caller file this call never wrote a byte of — the
-            // opposite of "restored to its pre-call state".
-            if ($destinationOpened && is_file($destination)) {
-                if ($appendMode && $destExistedBefore) {
-                    if ($fpTrunc = fopen($destination, 'r+b')) {
-                        @ftruncate($fpTrunc, $appendStartOffset);
-                        @fclose($fpTrunc);
-                    }
-                } else {
-                    @unlink($destination);
-                }
+            if (is_resource($fpOut)) {
+                @fclose($fpOut);
+            }
+            if ($stagingPath !== null) {
+                @unlink($stagingPath);
             }
 
-            // Honor the documented contract: this function signals failure with an \Exception and
-            // nothing else. An \Exception raised inside (deriveKey's short-key rejection) keeps its
-            // identity and message; an \Error is wrapped, preserving the original as ->getPrevious().
-            if ($error instanceof \Exception) {
-                throw $error;
+            // One failure channel, as documented: an \Error is wrapped, keeping it as getPrevious().
+            throw ($e instanceof \Exception ? $e : new \Exception($e->getMessage(), 0, $e));
+        } finally {
+            if (is_resource($fpIn)) {
+                @fclose($fpIn);
             }
-            if ($error instanceof \Throwable) {
-                throw new \Exception($error->getMessage(), 0, $error);
-            }
-            throw new \Exception($error);
         }
 
         // Returns the path of the decrypted file
@@ -931,13 +1344,17 @@ class Security {
      * The version AND the caller's $aad are both fed as GCM Additional Authenticated Data, so a
      * value cannot be reinterpreted under another version, table, column, or row.
      *
-     * @param mixed $str The value to encrypt (null/empty encrypt to "")
+     * @param mixed $str The value to encrypt: a string, int, float, bool (stored as "1"/"0"),
+     *                   Stringable or null. null/"" encrypt to "". Decryption always returns a
+     *                   string — the original type is not recorded.
      * @param string $key Master key (>= 32 bytes)
      * @param string $aad Context to bind, e.g. "{table}.{column}:{row_id}". REQUIRED and should be
      *                     unique per logical cell. An empty AAD is rejected to forbid an unbound value.
      * @param string|null $salt Optional per-subject salt for key derivation
      *
      * @return string
+     * @throws \InvalidArgumentException For an array, a non-Stringable object or a resource — an
+     *                                   array used to be stored as the literal "Array".
      * @throws \Exception
      */
     public static function encryptDataDB(mixed $str, string $key, string $aad, ?string $salt = ""): string {
@@ -949,10 +1366,11 @@ class Security {
             return "";
         }
 
-        if(is_bool($str)) {
-            $str = (int) $str;
+        $str = self::scalarToString($str, __FUNCTION__);
+        if ($str === "") {
+            // A Stringable that renders "": an empty ciphertext would be rejected as too short.
+            return "";
         }
-        $str = (string) $str;
 
         // A missing context defeats the whole point of the AAD binding.
         if ($aad === "") {
@@ -1032,7 +1450,9 @@ class Security {
 
         $key = self::deriveKey($key, 32, $salt, 'db-cell');
 
-        $decoded = Parser::base64Decode($payload);
+        // Native strict decode: encryptDataDB emits plain base64 and nothing else, and the GCM tag
+        // authenticates the bytes, so no data-URI or other leniency is wanted here.
+        $decoded = base64_decode($payload, true);
         if ($decoded === false) {
             throw new \Exception("Failed to decode the secret message. Invalid base64.");
         }
@@ -1079,13 +1499,16 @@ class Security {
      *
      * The result is the MAC concatenated with the IV and ciphertext, encoded in Base64.
      *
-     * @param mixed $str The plaintext to encrypt (null/empty encrypt to "")
+     * @param mixed $str The plaintext to encrypt: a string, int, float, bool (as "1"/"0"),
+     *                   Stringable or null. null/"" encrypt to "". Decryption returns a string.
      * @param string $key Master key of AT LEAST 32 bytes. Shorter keys are REJECTED, including
      *                    16..31-byte ones: HKDF cannot add entropy, so a sub-32-byte master would
      *                    never reach real 256-bit strength.
      * @param string|null $salt Optional salt for key derivation
      *
      * @return string Encrypted string, Base64 encoded
+     * @throws \InvalidArgumentException For an array, a non-Stringable object or a resource — an
+     *                                   array used to be encrypted as the literal "Array".
      * @throws \Exception If the key is shorter than 32 bytes, or secure random bytes can't be generated
      *
      * @link https://stackoverflow.com/questions/9262109/simplest-two-way-encryption-using-php
@@ -1099,10 +1522,10 @@ class Security {
             return "";
         }
 
-        if(is_bool($str)) {
-            $str = (int) $str;
+        $str = self::scalarToString($str, __FUNCTION__);
+        if ($str === "") {
+            return "";
         }
-        $str = (string) $str;
 
         // The 32-byte floor is enforced once, by deriveKey (see MIN_KEY_BYTES).
         $key = self::deriveKey($key, 32, $salt, 'local');
@@ -1141,19 +1564,20 @@ class Security {
     /**
      * Decrypts a Base64-encoded string encrypted with AES-256-CTR and authenticated with HMAC-SHA256.
      *
-     * It verifies the MAC before attempting decryption. If the MAC is invalid, an exception is thrown.
+     * It verifies the MAC (constant-time) before attempting decryption. Every failure THROWS.
      *
      * @param string|null $str The encrypted string, Base64 encoded ("" for an empty value)
      * @param string $key Master key of AT LEAST 32 bytes — the same one passed to encryptLocal.
      *                    Shorter keys are REJECTED (see encryptLocal).
      * @param string|null $salt Optional salt for key derivation
      *
-     * @return string|false Decrypted string or false if decryption fails
+     * @return string Decrypted string ("" for an empty input). The return type used to include
+     *                false, which no path could produce after the MAC check; it is now `string`.
      * @throws \Exception If the key is shorter than 32 bytes, Base64 is malformed, or MAC verification fails
      *
      * @link https://stackoverflow.com/questions/9262109/simplest-two-way-encryption-using-php
      */
-    public static function decryptLocal(?string $str, string $key, ?string $salt = ""): string|false {
+    public static function decryptLocal(?string $str, string $key, ?string $salt = ""): string {
         if (!extension_loaded('openssl')) {
             throw new \Exception("OpenSSL not loaded");
         }
@@ -1171,8 +1595,8 @@ class Security {
             hash_hkdf("sha256", $key, 32, "local-authentication"),
         ];
 
-        // Decode Base64 (custom function)
-        $decoded = Parser::base64Decode($str);
+        // Native strict decode: encryptLocal emits plain base64, and the MAC authenticates the bytes.
+        $decoded = base64_decode($str, true);
         if ($decoded === false) {
             throw new \Exception("Failed to decode encrypted message. Invalid Base64.");
         }
@@ -1189,31 +1613,53 @@ class Security {
         $payload = mb_substr($decoded, $macSize, null, '8bit');
 
         $calculatedMac = hash_hmac("sha256", $payload, $authKey, true);
-        if (!hash_equals($mac, $calculatedMac)) {
+        if (!hash_equals($calculatedMac, $mac)) {
             throw new \Exception("Provided MAC does not match the calculated MAC.");
         }
 
         $nonce = mb_substr($payload, 0, $ivLength, '8bit');
         $encryptedPayload = mb_substr($payload, $ivLength, null, '8bit');
 
-        return openssl_decrypt(
+        $plaintext = openssl_decrypt(
             $encryptedPayload,
             $cipher,
             $encKey,
             OPENSSL_RAW_DATA,
             $nonce
         );
+        if ($plaintext === false) {
+            throw new \Exception("Decryption failed.");
+        }
+
+        return $plaintext;
     }
 
     /**
-     * Encrypts a string, can be used cross-platform.
+     * Encrypts a value in the aes-bridge GCM format, so it can be decrypted on other platforms.
      *
-     * @param mixed $var Value to be encrypted
+     * INTEROPERABILITY — READ THIS, the peer must replicate the key step exactly. The value handed
+     * to aes-bridge as its PASSPHRASE is not your master key but
+     *     HKDF-SHA256(ikm = master key, salt = $salt ("" if null), info = "derived-key", length = 32)
+     * as 32 RAW BYTES (binary — not hex, not UTF-8 text). aes-bridge then runs its own
+     * PBKDF2-SHA256 (100.000 iterations, random 16-byte salt) on that passphrase. The output is
+     * base64(salt[16] || nonce[12] || ciphertext || tag[16]) — aes-bridge's GCM format — so any
+     * aes-bridge GCM implementation that accepts a BINARY passphrase can decrypt it once it has
+     * derived the same 32 bytes. Passing the master key to aes-bridge directly will NOT work.
+     *
+     * Booleans are encoded as the marker strings "{{!BOOL_TRUE!}}" / "{{!BOOL_FALSE!}}" (a
+     * non-PHP peer sees those strings), and decryptCrossPlatform turns those exact strings back
+     * into booleans — so encrypting the literal string "{{!BOOL_TRUE!}}" decrypts to true.
+     * Ints/floats are encrypted as their string form and come back as strings.
+     *
+     * @param mixed $var Value to be encrypted: string, int, float, bool, Stringable or null.
+     *                   null and "" are returned unchanged, unencrypted.
      * @param string $key Master key of AT LEAST 32 bytes. Shorter keys are REJECTED (HKDF cannot
      *                    add entropy).
-     * @param string|null $salt Salt for key derivation
+     * @param string|null $salt Salt for key derivation. NULL and "" are the same salt.
      *
      * @return string|null
+     * @throws \InvalidArgumentException For an array, a non-Stringable object or a resource (these
+     *                                   used to escape as a \TypeError from aes-bridge)
      * @throws \Exception
      *
      * @ref https://github.com/mervick/aes-bridge-php
@@ -1230,28 +1676,40 @@ class Security {
             return $var;
         }
 
-        // The 32-byte floor is enforced once, by deriveKey (see MIN_KEY_BYTES).
-        $key = self::deriveKey($key, 32, $salt);
-
         if ($var === true) {
             $var = "{{!BOOL_TRUE!}}";
-        }
-        if ($var === false) {
+        } elseif ($var === false) {
             $var = "{{!BOOL_FALSE!}}";
+        } else {
+            $var = self::scalarToString($var, __FUNCTION__);
         }
-        return \AesBridge\Gcm::encrypt($var, $key);
+
+        // The 32-byte floor is enforced once, by deriveKey (see MIN_KEY_BYTES).
+        $passphrase = self::deriveKey($key, 32, $salt);
+
+        return \AesBridge\Gcm::encrypt($var, $passphrase);
     }
 
     /**
-     * Decrypts a string, can be used cross-platform.
+     * Decrypts a value in the aes-bridge GCM format — see encryptCrossPlatform() for the exact key
+     * derivation a peer must use.
      *
-     * @param mixed $encrypted Text to be decrypted
+     * FAILS LOUD. aes-bridge's own Gcm::decrypt() returns openssl_decrypt()'s false through a
+     * `string` return type, which PHP coerces to "" — so a WRONG KEY or a TAMPERED value used to
+     * come back as "" (plus a warning for a short input), indistinguishable from a real empty
+     * value. The format is therefore parsed here, with aes-bridge's own key derivation, and every
+     * failure throws.
+     *
+     * @param mixed $encrypted Base64 value produced by encryptCrossPlatform or any aes-bridge GCM
+     *                         implementation. null and "" are returned unchanged.
      * @param string $key Master key of AT LEAST 32 bytes — the same one passed to
      *                    encryptCrossPlatform. Shorter keys are REJECTED.
      * @param string|null $salt Salt for key derivation
      *
-     * @return mixed
-     * @throws \Exception
+     * @return mixed The decrypted string; true/false for the boolean markers; null/"" unchanged
+     * @throws \InvalidArgumentException When $encrypted is not a string (or null)
+     * @throws \Exception On invalid base64, a too-short value, or authentication failure (wrong
+     *                    key/salt, tampered value)
      *
      * @ref https://github.com/mervick/aes-bridge-php
      */
@@ -1266,19 +1724,76 @@ class Security {
         if ($encrypted === null || $encrypted === "") {
             return $encrypted;
         }
+        if (!is_string($encrypted)) {
+            throw new \InvalidArgumentException("decryptCrossPlatform() expects a base64 string; " . get_debug_type($encrypted) . " given.");
+        }
 
         // The 32-byte floor is enforced once, by deriveKey (see MIN_KEY_BYTES).
-        $key = self::deriveKey($key, 32, $salt);
+        $passphrase = self::deriveKey($key, 32, $salt);
 
-        $ret = \AesBridge\Gcm::decrypt($encrypted, $key);
+        $ret = self::aesBridgeGcmDecrypt($encrypted, $passphrase);
         if ($ret === "{{!BOOL_TRUE!}}") {
-            $ret = true;
+            return true;
         }
         if ($ret === "{{!BOOL_FALSE!}}") {
-            $ret = false;
+            return false;
         }
+
         return $ret;
     }
+
+    /**
+     * Decrypts aes-bridge's GCM format — base64(salt[16] || nonce[12] || ciphertext || tag[16]) —
+     * throwing on every failure instead of returning "".
+     *
+     * The key comes from aes-bridge's own \AesBridge\derive_key() (defined alongside
+     * \AesBridge\Gcm), so its PBKDF2 parameters cannot drift from what Gcm::encrypt() used.
+     *
+     * @param string $encoded Base64 envelope
+     * @param string $passphrase Passphrase given to aes-bridge (the derived key)
+     *
+     * @throws \Exception
+     * @return string
+     */
+    private static function aesBridgeGcmDecrypt(string $encoded, string $passphrase): string {
+        $saltBytes = 16;
+        $nonceBytes = 12;
+        $tagBytes = 16;
+
+        $data = base64_decode($encoded, true);
+        if ($data === false) {
+            throw new \Exception("Failed to decode the encrypted value. Invalid base64.");
+        }
+        if (strlen($data) < $saltBytes + $nonceBytes + $tagBytes) {
+            throw new \Exception("Encrypted payload is too short.");
+        }
+        if (!function_exists('AesBridge\derive_key')) {
+            throw new \Exception("Function '\AesBridge\derive_key' not found");
+        }
+
+        $aesKey = \AesBridge\derive_key($passphrase, substr($data, 0, $saltBytes));
+        $plaintext = openssl_decrypt(
+            substr($data, $saltBytes + $nonceBytes, -$tagBytes),
+            'aes-256-gcm',
+            $aesKey,
+            OPENSSL_RAW_DATA,
+            substr($data, $saltBytes, $nonceBytes),
+            substr($data, -$tagBytes)
+        );
+        if ($plaintext === false) {
+            throw new \Exception("Decryption failed: authentication tag mismatch.");
+        }
+
+        return $plaintext;
+    }
+
+    /**
+     * Objects applySecurityFunctionArray() is walking, higher up the recursion stack (its cycle
+     * guard). Empty between top-level calls.
+     *
+     * @var \SplObjectStorage<object, null>|null
+     */
+    private static ?\SplObjectStorage $applyWalkInProgress = null;
 
     /**
      * Applies a Security encrypt/decrypt/hash method to every scalar leaf of an array or object.
@@ -1299,15 +1814,23 @@ class Security {
      * need a per-cell AAD, which is meaningless for a bulk array walk — call them directly.
      *
      * @param mixed $item Value, array or object to walk. Arrays/objects recurse to every scalar
-     *                    leaf; an object is converted to an array and RETURNED AS AN ARRAY.
+     *                    leaf; an object is converted to an array — `(array)` semantics, so private
+     *                    and protected properties are included under their mangled keys — and
+     *                    RETURNED AS AN ARRAY. The leaf methods' own conversions apply: e.g.
+     *                    encryptLocal turns null into "" and ints into strings, so a round trip
+     *                    does not restore types.
      * @param string $key Master key, forwarded as the 2nd argument to $fnName
      * @param string|null $salt Optional salt for key derivation, forwarded as the THIRD argument
-     * @param string $fnName Name of one of the five allowlisted methods above. A "Security::" or
-     *                       "self::" prefix is optional and stripped. An empty name returns $item
-     *                       unchanged.
+     * @param string $fnName Name of one of the five allowlisted methods above. A class prefix of
+     *                       "self::", "static::", "class::", "Security::" or the fully-qualified
+     *                       class name is optional and stripped; any other class prefix is
+     *                       refused. An empty name returns $item unchanged.
      *
      * @throws \Exception When $fnName is not one of the five allowlisted methods, or by $fnName
      *                    itself (invalid key, authentication failure, ...).
+     * @throws \InvalidArgumentException When an object contains itself (directly or through other
+     *                                   objects): a cycle has no array form, and walking it used to
+     *                                   recurse until the process died with an uncatchable fatal.
      * @return mixed The walked structure; arrays/objects come back as arrays, a scalar comes back
      *               as $fnName's return value.
      */
@@ -1316,10 +1839,13 @@ class Security {
             return $item;
         }
 
-        // Strip an optional "self::" / "Security::" / "class::" prefix down to the bare method name.
-        foreach (["self::", "Security::", "class::"] AS $prefix) {
-            if (Str::containsString($fnName, $prefix, true)) {
-                $fnName = Str::replaceString($prefix, "", $fnName, true);
+        // Strip an optional class prefix naming THIS class down to the bare method name. Anything
+        // else before "::" is some other class, and is refused by the allowlist below.
+        $separator = strrpos($fnName, "::");
+        if ($separator !== false) {
+            $class = strtolower(ltrim(substr($fnName, 0, $separator), "\\"));
+            if (in_array($class, ["self", "static", "class", "security", strtolower(self::class)], true)) {
+                $fnName = substr($fnName, $separator + 2);
             }
         }
 
@@ -1354,7 +1880,21 @@ class Security {
         $callable = [self::class, $method];
 
         if (is_object($item)) {
-            $item = (array) $item;
+            self::$applyWalkInProgress ??= new \SplObjectStorage();
+            if (self::$applyWalkInProgress->contains($item)) {
+                throw new \InvalidArgumentException(
+                    "applySecurityFunctionArray cannot walk a cyclic object graph: " . $item::class . " contains itself."
+                );
+            }
+
+            // Held while the object's own array form is walked; released on every exit, so a
+            // refusal cannot leave an instance marked for the caller's next call.
+            self::$applyWalkInProgress->attach($item);
+            try {
+                return self::applySecurityFunctionArray((array) $item, $key, $salt, $method);
+            } finally {
+                self::$applyWalkInProgress->detach($item);
+            }
         }
         if (!is_array($item)) {
             return call_user_func($callable, $item, $key, $salt);
@@ -1422,6 +1962,13 @@ class Security {
     private const XSS_VOID_ELEMENTS = ['br', 'hr', 'img', 'col', 'wbr'];
 
     /**
+     * libxml's XML_ERR_NO_MEMORY error code (PHP defines no constant for error codes).
+     *
+     * @var int
+     */
+    private const LIBXML_ERR_NO_MEMORY = 2;
+
+    /**
      * Allow-listed attributes whose value is a URL and therefore needs scheme validation.
      *
      * @var string[]
@@ -1466,16 +2013,30 @@ class Security {
     /**
      * Validates a URL attribute value against XSS_ALLOWED_URL_SCHEMES.
      *
-     * The scheme is matched against a PROBE copy with every control character and every kind of
-     * whitespace removed, because browsers ignore those when resolving a scheme: "jav&#x09;ascript:"
-     * decodes to "jav\tascript:" and still executes. Testing the raw value would miss it.
+     * The scheme is matched against a PROBE copy with entities decoded and every control character
+     * and every kind of whitespace removed, because browsers ignore those when resolving a scheme:
+     * "jav&#x09;ascript:" decodes to "jav\tascript:" and still executes. Testing the raw value
+     * would miss it.
      *
      * @param string $value Decoded attribute value
      * @return string|null The ORIGINAL value when the scheme is allowed (or the URL is relative);
      *                     null when the attribute must be dropped.
      */
     private static function xssSafeUrl(string $value): ?string {
-        $probe = preg_replace('/[\p{C}\p{Z}\s]+/u', '', $value);
+        // Entities are decoded (to a fixed point) in the PROBE only. libxml's HTML4 parser leaves
+        // HTML5-only references such as "&colon;" and "&Tab;" undecoded, so "javascript&colon;..."
+        // reaches us literally. Emitted escaped it is inert to a browser — but one stray
+        // html_entity_decode() downstream would turn it into a live javascript: URL.
+        $probe = $value;
+        for ($i = 0; $i < 3; $i++) {
+            $decoded = html_entity_decode($probe, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            if ($decoded === $probe) {
+                break;
+            }
+            $probe = $decoded;
+        }
+
+        $probe = preg_replace('/[\p{C}\p{Z}\s]+/u', '', $probe);
 
         // preg_replace returns null on a malformed-UTF-8 subject: fail CLOSED.
         if ($probe === null || $probe === "") {
@@ -1570,6 +2131,11 @@ class Security {
             return self::xssEscape($data);
         }
 
+        // libxml works on C strings: a NUL inside an attribute value cut the rest of the DOCUMENT
+        // off — '<a href="x\0y">text</a>' came back as '<a href="x"></a>'. U+FFFD is what an HTML5
+        // parser substitutes for NUL in most contexts anyway.
+        $data = str_replace("\0", "\u{FFFD}", $data);
+
         $document = new \DOMDocument();
 
         // Hostile input is expected to be malformed; libxml must not emit warnings for it. Restore
@@ -1595,12 +2161,15 @@ class Security {
         // discarded, yet $loaded is true — so the guard below never fired and the sanitizer silently
         // dropped content. Inspect the errors BEFORE clearing them, and fail closed on a fatal.
         //
-        // Only level >= LIBXML_ERR_FATAL counts. LIBXML_ERR_ERROR (level 2) is the normal, expected
-        // response to hostile-but-parseable markup (`<svg/onload=1>`, mismatched tags, a raw `&`);
-        // failing closed on those would escape almost every real input and destroy the allow-list.
+        // Only level >= LIBXML_ERR_FATAL counts, plus one ERROR-level code: XML_ERR_NO_MEMORY (2),
+        // which is how libxml reports "xmlSAX2Characters: huge text node" — it then keeps only the
+        // first 10.000.000 bytes of that text, again with $loaded true. Other LIBXML_ERR_ERROR
+        // (level 2) errors are the normal response to hostile-but-parseable markup
+        // (`<svg/onload=1>`, mismatched tags, a raw `&`); failing closed on those would escape
+        // almost every real input and destroy the allow-list.
         $fatalParseError = false;
         foreach (libxml_get_errors() as $parseError) {
-            if ($parseError->level >= LIBXML_ERR_FATAL) {
+            if ($parseError->level >= LIBXML_ERR_FATAL || $parseError->code === self::LIBXML_ERR_NO_MEMORY) {
                 $fatalParseError = true;
                 break;
             }
@@ -1609,21 +2178,15 @@ class Security {
         libxml_clear_errors();
         libxml_use_internal_errors($previousErrorMode);
 
-        if (!$loaded || $fatalParseError) {
+        if (!$loaded || $fatalParseError || $document->documentElement === null) {
             return self::xssEscape($data);
         }
 
-        $body = $document->getElementsByTagName('body')->item(0);
-        if ($body === null) {
-            return self::xssEscape($data);
-        }
-
-        $html = "";
-        foreach ($body->childNodes as $child) {
-            $html .= self::xssSanitizeNode($child);
-        }
-
-        return $html;
+        // Rebuilt from the ROOT, not from the first <body>: after a literal "</body></html>" libxml
+        // nests the rest of the input in a second <html>/<body>, which reading only the first body
+        // silently discarded. <html>/<body> are not allow-listed, so they unwrap; <head> (our own
+        // wrapper's) is a dropped subtree.
+        return self::xssSanitizeNode($document->documentElement);
     }
 
     /**
@@ -1840,11 +2403,13 @@ class Security {
      *    back byte-for-byte, and sanitize on OUTPUT (or store both forms) rather than destroying
      *    the original on input.
      *  - If ext-dom is unavailable, the input is not valid UTF-8, or libxml reports a FATAL parse
-     *    error (notably "Excessive depth in document: 256" — HTML nested deeper than 255 elements),
-     *    it falls back to escaping the whole string (htmlspecialchars, ENT_QUOTES|ENT_SUBSTITUTE):
-     *    still safe, but it destroys legitimate markup. This is deliberate: loadHTML() returns TRUE
-     *    on the depth error while SILENTLY TRUNCATING the tree at depth 255, so trusting it would
-     *    discard content without a word. Escaping keeps the content visible and inert.
+     *    error (notably "Excessive depth in document: 256" — HTML nested deeper than 255 elements)
+     *    or a text node over 10.000.000 bytes ("huge text node"), it falls back to escaping the
+     *    whole string (htmlspecialchars, ENT_QUOTES|ENT_SUBSTITUTE): still safe, but it destroys
+     *    legitimate markup. This is deliberate: loadHTML() returns TRUE in both cases while
+     *    SILENTLY TRUNCATING the tree or the text, so trusting it would discard content without a
+     *    word. Escaping keeps the content visible and inert.
+     *  - NUL bytes become U+FFFD (libxml would otherwise cut the input off at the first one).
      *  - ARRAY KEYS ARE NOT WALKED — only values are. A key is a structural identifier, and
      *    rewriting it could collide two entries into one and silently drop data, so keys are left
      *    byte-for-byte intact and MAY STILL CONTAIN LIVE MARKUP (the keys of $_POST are
@@ -1945,9 +2510,15 @@ class Security {
      * @param bool $addSlashes Whether to apply addslashes()
      * @param bool $escapeDB Whether to escape for DB queries using custom method
      * @param bool $trim Whether to apply trim()
-     * @param bool $formatDecimal Whether to format value as a decimal
-     * @param bool $asInteger Whether to extract only numeric digits
-     * @param bool $asBoolean Whether to convert result to boolean
+     * @param bool $formatDecimal Formats the value with Formatter::formatNumber()'s defaults ("."
+     *                            in and out; any other character is discarded first, so "1,5"
+     *                            becomes "15" — see that method). The result is a string.
+     * @param bool $asInteger Keeps only the ASCII digits (Str::onlyNumbers): the SIGN and the
+     *                        decimal separator are dropped too ("-12.5" becomes "125"). The result
+     *                        is a digit string, or the int 0 when no digit was left.
+     * @param bool $asBoolean !Validator::isCompletelyEmpty(): false for null, "", whitespace-only
+     *                        strings, any numeric zero ("0", "0.0", " 0 ") and placeholders such
+     *                        as "null", "false", "no", "undefined"; true otherwise.
      * @param bool $base64Encode Whether to base64-encode the result
      * @param bool $base64Decode Whether to base64-decode the result
      * @param bool $base64UrlEncode Whether to base64-URL-encode the result
@@ -1990,7 +2561,7 @@ class Security {
     ): mixed {
         if (
             $source === null ||
-            ($key !== null && (!is_array($source) || !Validator::hasProperty($key, $source) || $source[$key] === null))
+            ($key !== null && (!is_array($source) || !array_key_exists($key, $source) || $source[$key] === null))
         ) {
             return $ifNull;
         }
@@ -2053,7 +2624,9 @@ class Security {
             }
 
             if ($jsonEncode) {
-                $val = json_encode($val, true);
+                // json_encode()'s 2nd parameter is $flags, not json_decode()'s $assoc: the `true`
+                // written here always meant flags = 1 = JSON_HEX_TAG. Spelled out, same output.
+                $val = json_encode($val, JSON_HEX_TAG);
             } elseif ($jsonDecode) {
                 $val = json_decode(Str::decodeText($val), true);
             }
@@ -2113,6 +2686,7 @@ class Security {
      *
      * @throws \Exception When $password is null or "". An empty password is a validation failure
      *                    the caller must handle — it is never silently turned into a stored value.
+     *                    Also when this PHP build has no Argon2 support.
      * @return string Argon2id hash, always non-empty
      */
     public static function encryptPassword(?string $password): string {
@@ -2120,6 +2694,11 @@ class Security {
         // legitimate password "0".
         if ($password === null || $password === "") {
             throw new \Exception("Cannot hash an empty password.");
+        }
+
+        // PASSWORD_ARGON2ID only exists on builds with Argon2; referencing it elsewhere is an \Error.
+        if (!defined('PASSWORD_ARGON2ID')) {
+            throw new \Exception("Argon2id is not available in this PHP build.");
         }
 
         return password_hash($password, PASSWORD_ARGON2ID);

@@ -104,8 +104,14 @@ final class SQLTest extends TestCase {
         self::assertSame("''", SQL::escapeString(''));
     }
 
-    public function testEscapeStringEscapesSingleQuotes(): void {
-        self::assertSame("'O\\'Brien'", SQL::escapeString("O'Brien"));
+    /**
+     * FINDING (fixed): the quote used to be rendered as \' — which only escapes while backslash is
+     * an escape character. It is now doubled, the one form every SQL dialect and every MySQL
+     * sql_mode agrees on.
+     */
+    public function testEscapeStringDoublesSingleQuotes(): void {
+        self::assertSame("'O''Brien'", SQL::escapeString("O'Brien"));
+        self::assertSame("''''", SQL::escapeString("'"));
     }
 
     /**
@@ -116,12 +122,42 @@ final class SQLTest extends TestCase {
         self::assertSame("'a\\\\'", SQL::escapeString('a\\'));
 
         // The classic payload: "\' OR 1=1 -- " must stay entirely inside the literal.
-        self::assertSame("'\\\\\\' OR 1=1 -- '", SQL::escapeString("\\' OR 1=1 -- "));
+        self::assertSame("'\\\\'' OR 1=1 -- '", SQL::escapeString("\\' OR 1=1 -- "));
     }
 
-    public function testEscapeStringStripsInvisibleControlCharacters(): void {
-        self::assertSame("'ab'", SQL::escapeString("a\x00b"));
-        self::assertSame("'ab'", SQL::escapeString("a\x1Fb"));
+    /**
+     * FINDING (fixed): control characters used to be STRIPPED, so the value stored was not the
+     * value given ("a\x1Bb" became "ab") — silent data mutation from an escaper. They are inert
+     * inside a quoted literal and are now kept; only NUL is escaped, as MySQL's \0.
+     */
+    public function testEscapeStringKeepsControlCharactersAndEscapesOnlyNul(): void {
+        self::assertSame("'a\\0b'", SQL::escapeString("a\x00b"));
+        self::assertSame("'a\x1Fb'", SQL::escapeString("a\x1Fb"));
+        self::assertSame("'a\x1B[31mb\x7F'", SQL::escapeString("a\x1B[31mb\x7F"));
+        self::assertSame("'line1\r\nline2\ttab\x1A'", SQL::escapeString("line1\r\nline2\ttab\x1A"));
+    }
+
+    /** Multibyte text is passed through byte-for-byte: only ' \ and NUL are ever touched. */
+    public function testEscapeStringPassesMultibyteTextThroughUnchanged(): void {
+        self::assertSame("'São Paulo — 東京 🙂'", SQL::escapeString('São Paulo — 東京 🙂'));
+        // Invalid UTF-8 is not "repaired" either: the escaper is not a validator.
+        self::assertSame("'\xC3\x28\xFF'", SQL::escapeString("\xC3\x28\xFF"));
+    }
+
+    /** A numeric STRING stays a quoted string: the escaper never guesses a type from content. */
+    public function testEscapeStringQuotesNumericLookingStrings(): void {
+        self::assertSame("'1e3'", SQL::escapeString('1e3'));
+        self::assertSame("'007'", SQL::escapeString('007'));
+        self::assertSame("'-0'", SQL::escapeString('-0'));
+    }
+
+    /** var_export() forms are what floats render as; each must be a valid numeric literal. */
+    public function testEscapeStringRendersExtremeFloatsAsNumericLiterals(): void {
+        self::assertSame('1.0E+25', SQL::escapeString(1e25));
+        self::assertSame('1.0E-7', SQL::escapeString(1e-7));
+        self::assertSame('-0.0', SQL::escapeString(-0.0));
+        self::assertSame((string) PHP_INT_MAX, SQL::escapeString(PHP_INT_MAX));
+        self::assertSame((string) PHP_INT_MIN, SQL::escapeString(PHP_INT_MIN));
     }
 
     public function testEscapeStringRendersNullAsTheBareKeyword(): void {
@@ -313,6 +349,19 @@ final class SQLTest extends TestCase {
         self::assertCount(2, $data, 'the dataset must survive an error return');
     }
 
+    /** empty() used to accept "  " as a table name and refuse a table literally named "0". */
+    public function testPrepareRejectsAWhitespaceOnlyTableButAcceptsATableNamedZero(): void {
+        $data = [['id' => 1]];
+
+        self::assertFalse(SQL::prepareInsertOrUpdateMySQL($data, "  \t"));
+        self::assertCount(1, $data);
+
+        self::assertSame(
+            'INSERT INTO 0 (`id`) VALUES (1) ON DUPLICATE KEY UPDATE `id`=VALUES(`id`)',
+            SQL::prepareInsertOrUpdateMySQL($data, '0')
+        );
+    }
+
     public function testPrepareReturnsFalseForAnEmptyInsertFieldsList(): void {
         $data = [['id' => 1]];
 
@@ -337,7 +386,7 @@ final class SQLTest extends TestCase {
         $sql = SQL::prepareInsertOrUpdateMySQL($data, 'clients', 'id,name', 'name=VALUES(name)');
 
         self::assertSame(
-            "INSERT INTO clients (id,name) VALUES (1,'O\\'Brien'),(2,'Ada') "
+            "INSERT INTO clients (id,name) VALUES (1,'O''Brien'),(2,'Ada') "
                 . 'ON DUPLICATE KEY UPDATE name=VALUES(name)',
             $sql
         );
@@ -474,6 +523,56 @@ final class SQLTest extends TestCase {
 
         self::assertSame(['1', '2', '3', '4', '5'], $emitted, 'every row exactly once, in order');
         self::assertSame([], $data);
+    }
+
+    // ---------------------------------------------------------------- prepareInsertOrUpdateMySQL: statement size cap
+
+    /**
+     * FINDING (fixed): the only batch limit was a third of PHP's free memory, which knows nothing
+     * about the server's max_allowed_packet — on a roomy host a big dataset became one statement
+     * of hundreds of MB that MySQL refuses outright, after the rows had been consumed.
+     */
+    public function testPrepareClosesTheStatementAtTheByteCapAndTheDrainLoopEmitsEveryRowOnce(): void {
+        $data = [];
+        for ($i = 1; $i <= 50; $i++) {
+            $data[] = ['id' => $i, 'v' => str_repeat('x', 20)];
+        }
+
+        $cap = 200;
+        $statements = [];
+        $guard = 0;
+        while (($sql = SQL::prepareInsertOrUpdateMySQL($data, 't', 'id,v', 'v=VALUES(v)', null, [], $cap)) !== true) {
+            self::assertIsString($sql);
+            $statements[] = $sql;
+            self::assertLessThan(100, ++$guard, 'the drain loop must terminate');
+        }
+
+        self::assertGreaterThan(1, count($statements), 'the cap must have split the dataset');
+
+        $groupLength = strlen("(50,'" . str_repeat('x', 20) . "'),");
+        $emitted = [];
+        foreach ($statements as $sql) {
+            self::assertLessThan($cap + $groupLength, strlen($sql), 'soft cap: at most one group over');
+            preg_match_all('/\((\d+),/', $sql, $matches);
+            $emitted = array_merge($emitted, array_map('intval', $matches[1]));
+        }
+        self::assertSame(range(1, 50), $emitted, 'every row exactly once, in order');
+    }
+
+    public function testPrepareStillEmitsARowLargerThanTheCapOnItsOwn(): void {
+        $data = [['id' => 1, 'v' => str_repeat('y', 500)], ['id' => 2, 'v' => 'small']];
+
+        $sql = SQL::prepareInsertOrUpdateMySQL($data, 't', 'id,v', 'v=VALUES(v)', null, [], 10);
+
+        self::assertSame("INSERT INTO t (id,v) VALUES (1,'" . str_repeat('y', 500) . "') ON DUPLICATE KEY UPDATE v=VALUES(v)", $sql);
+        self::assertSame([1 => ['id' => 2, 'v' => 'small']], $data);
+    }
+
+    public function testPrepareRejectsANonPositiveByteCap(): void {
+        $data = [['id' => 1]];
+
+        $this->expectException(\InvalidArgumentException::class);
+        SQL::prepareInsertOrUpdateMySQL($data, 't', null, null, null, [], 0);
     }
 
     // ---------------------------------------------------------------- prepareInsertOrUpdateMySQL: batching cost
@@ -793,7 +892,7 @@ final class SQLTest extends TestCase {
         $sql = SQL::prepareInsertOrUpdateMySQL($data, 't', 'v', 'v=VALUES(v)');
 
         self::assertSame(
-            "INSERT INTO t (v) VALUES ('\\'; DROP TABLE t; -- ') ON DUPLICATE KEY UPDATE v=VALUES(v)",
+            "INSERT INTO t (v) VALUES ('''; DROP TABLE t; -- ') ON DUPLICATE KEY UPDATE v=VALUES(v)",
             $sql
         );
     }
@@ -824,6 +923,26 @@ final class SQLTest extends TestCase {
 
         $this->expectException(\InvalidArgumentException::class);
         SQL::prepareInsertOrUpdateMySQL($data, 't', 'id', 'id=VALUES(id)');
+    }
+
+    /**
+     * FINDING (fixed): with $insertFields omitted, a non-array FIRST row ended column derivation
+     * with no columns and the call returned false, while the same row in any other position
+     * threw — the documented outcome.
+     */
+    public function testPrepareRejectsANonArrayFirstRowTheSameWayWhenDerivingColumns(): void {
+        foreach (['scalar' => 'not-a-row', 'object' => (object) ['id' => 1]] as $label => $first) {
+            $data = [$first, ['id' => 2]];
+
+            try {
+                SQL::prepareInsertOrUpdateMySQL($data, 't');
+                self::fail("a non-array first row ($label) must throw, not return false");
+            } catch (\InvalidArgumentException $e) {
+                self::assertStringContainsString('row 0 of $data', $e->getMessage());
+            }
+
+            self::assertCount(2, $data);
+        }
     }
 
     /** Nothing was written, so nothing may be consumed. */
@@ -872,6 +991,32 @@ final class SQLTest extends TestCase {
 
         self::assertSame('INSERT INTO t (id) VALUES (1),(3) ON DUPLICATE KEY UPDATE id=VALUES(id)', $sql);
         self::assertSame([], $data, 'the skipped row is still consumed');
+    }
+
+    /**
+     * FINDING (fixed): a formatter returning null (e.g. a closure that falls off its end) was
+     * concatenated as '' and followed by ',', emitting "VALUES ,," and consuming the rows.
+     */
+    public function testPrepareThrowsWhenTheFormatterReturnsNeitherStringNorFalseAndLeavesDataUntouched(): void {
+        $data = [['id' => 1], ['id' => 2]];
+        $original = $data;
+
+        foreach ([null, 0, true, ['(1)']] as $bad) {
+            try {
+                SQL::prepareInsertOrUpdateMySQL(
+                    $data,
+                    't',
+                    'id',
+                    'id=VALUES(id)',
+                    static fn (array $row, int|string $key, array &$global): mixed => $bad
+                );
+                self::fail('a non-string formatter return must be refused: ' . get_debug_type($bad));
+            } catch (\InvalidArgumentException $e) {
+                self::assertStringContainsString('row formatter returned', $e->getMessage());
+            }
+
+            self::assertSame($original, $data);
+        }
     }
 
     public function testPrepareReturnsTrueWhenEveryRowIsSkipped(): void {

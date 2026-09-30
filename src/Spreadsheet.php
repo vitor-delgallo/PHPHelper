@@ -16,8 +16,35 @@ class Spreadsheet {
      *
      * The reader is resolved from the file's CONTENTS, not from its extension, so any format
      * phpoffice/phpspreadsheet can identify is accepted (.xlsx, .xls, .ods, .csv, .html, ...).
-     * Cells are read data-only: values are the FORMATTED strings (or null for an empty cell) with
-     * formulas calculated; styling, merges and charts are discarded.
+     *
+     * What a value looks like. Every cell comes back as a string, or null when it is empty.
+     *  - Binary/XML workbooks (.xlsx, .xls, .ods, ...) are read DATA-ONLY, and a data-only load does
+     *    not read number formats. So a value is its raw content rendered as General — NOT what
+     *    Excel displays: a date is its Excel serial number ('45322' for 2024-01-31; convert with
+     *    \PhpOffice\PhpSpreadsheet\Shared\Date::excelToDateTimeObject((float) $v)), a percentage is
+     *    its fraction ('0.125'), a currency has no symbol or separators, a boolean is 'TRUE' /
+     *    'FALSE'. A float is PhpSpreadsheet's General rendering, which round-trips through
+     *    (float) but need not be the shortest form (1234567.891234 reads '1234567.89123399998061').
+     *    Formulas are recalculated by PhpSpreadsheet (not Excel's cached result, except for
+     *    functions it does not implement), so volatile ones (NOW(), RAND()) reflect read time.
+     *  - Text formats (.csv/.txt and HTML tables) are returned VERBATIM: every cell is exactly the
+     *    text in the file. They used to go through PhpSpreadsheet's default value binder, which
+     *    treats text as typed input — "=A2&B2" was EVALUATED as a formula, "+5511987654321" (a
+     *    phone number) became "5511987654321", "1e3" became "1000", "1.50" became "1.5".
+     *    CSV encoding is detected: a BOM (UTF-8/16/32) wins, then UTF-16/32 by shape, then UTF-8
+     *    if the bytes are valid UTF-8, otherwise Windows-1252 — the encoding of Excel's own "CSV"
+     *    export on Western-European Windows, which used to come back with every accented letter
+     *    replaced by U+FFFD.
+     *  - A cell holding only whitespace may read as null (the .xls reader drops such cells, and
+     *    styled-but-empty cells are skipped by every reader — see below); both count as blank
+     *    under the $removeEmptyRows / header rules anyway.
+     * Styling, merges, images and charts are discarded.
+     *
+     * Memory. The whole workbook is loaded (every sheet, not only the one read). Cells that carry
+     * formatting but no value are NOT materialised: a sheet with borders applied down to row
+     * 100000 over one row of data used to create a cell object for every formatted cell and walk
+     * all 100000 rows. The workbook is disconnected before returning, so a loop importing many
+     * files does not accumulate PhpSpreadsheet's reference cycles.
      *
      * Failures THROW — none of them is reported as an empty return. An empty array therefore means
      * exactly one thing: the selected sheet yielded no rows. This is deliberate: the previous
@@ -55,7 +82,10 @@ class Spreadsheet {
      *                               active when the file was saved. Other formats' readers may or may
      *                               not preserve it. Pass an explicit name whenever the worksheet
      *                               matters. Every non-null value, INCLUDING '' and '0', is looked up
-     *                               by name and throws when no such tab exists.
+     *                               by name and throws when no such tab exists. The lookup is
+     *                               phpspreadsheet's: CASE-INSENSITIVE, and surrounding single
+     *                               quotes are ignored ('data' and "'Data'" both find tab "Data").
+     *                               A CSV/HTML file has one sheet, named "Worksheet".
      * @param bool $removeEmptyRows true (default): drop rows whose every cell is null, '' or
      *                              whitespace-only. Dropped rows leave no gap — the result is always
      *                              re-indexed contiguously from 0, so an array index is NOT a
@@ -78,10 +108,15 @@ class Spreadsheet {
      *                           party who can resolve it, and it costs the caller nothing, because
      *                           $withHeader = false already reads such a file losslessly.
      * @throws \PhpOffice\PhpSpreadsheet\Exception If $filePath is missing, unreadable, of an
-     *                           unidentifiable format, or corrupt. This vendor class extends
-     *                           \RuntimeException, so `catch (\RuntimeException $e)` covers every
-     *                           documented failure of this method without depending on the vendor
-     *                           type. No other exception type escapes.
+     *                           unidentifiable format, or corrupt — including a structurally valid
+     *                           container with a damaged part (e.g. a truncated sheet XML inside
+     *                           an intact .xlsx zip), and any PHP warning/notice raised while the
+     *                           file is parsed. Such a file used to print parser warnings and
+     *                           return [] — the exact "silently zero rows" this contract forbids.
+     *                           This vendor class extends \RuntimeException, so
+     *                           `catch (\RuntimeException $e)` covers every documented failure of
+     *                           this method without depending on the vendor type. No other
+     *                           exception type escapes.
      */
     public static function excelToArray(
         string $filePath,
@@ -97,15 +132,129 @@ class Spreadsheet {
             );
         }
 
-        $data = [];
+        // A damaged part inside an otherwise valid container (a truncated sheet XML in an intact
+        // .xlsx zip) makes the vendor parser log an XML error and carry on with an EMPTY sheet.
+        // Where that error goes depends on process-wide state: a PHP warning by default, but
+        // nothing at all once anything (PHPUnit, a framework) has enabled libxml's internal error
+        // buffer — so the buffer is enabled here explicitly and inspected after the load. That is
+        // the only way to tell "corrupt" from "empty".
+        $libxmlWasInternal = libxml_use_internal_errors(true);
+        $libxmlErrorsBefore = count(libxml_get_errors());
 
-        // createReaderForFile() identifies the format from the file's contents and hands back the
-        // reader it built to do so. IOFactory::identify() builds that same reader internally, throws
-        // it away and reports only its class name — which then had to be constructed a second time.
-        // Both raise the identical Reader\Exception for a missing/unreadable/unidentifiable file.
-        $reader = \PhpOffice\PhpSpreadsheet\IOFactory::createReaderForFile($filePath);
+        // Anything else the parser warns about (a damaged .xls stream, an unexpected structure)
+        // is the same silent-garbage situation, so it throws too. Deprecations are not failures
+        // and go to whichever handler was installed before.
+        $previousHandler = set_error_handler(
+            static function (int $errno, string $errstr, string $errfile = '', int $errline = 0) use ($filePath, &$previousHandler): bool {
+                if (!(error_reporting() & $errno)) {
+                    return false; // silenced with @ by the vendor on purpose
+                }
+                if ($errno === E_DEPRECATED || $errno === E_USER_DEPRECATED) {
+                    return is_callable($previousHandler)
+                        ? (bool) $previousHandler($errno, $errstr, $errfile, $errline)
+                        : false;
+                }
+
+                throw new \PhpOffice\PhpSpreadsheet\Reader\Exception(
+                    sprintf('Unable to read "%s": %s', $filePath, $errstr),
+                    0,
+                    new \ErrorException($errstr, 0, $errno, $errfile, $errline)
+                );
+            }
+        );
+
+        $spreadsheet = null;
+        try {
+            // createReaderForFile() identifies the format from the file's contents and hands back
+            // the reader it built to do so. IOFactory::identify() builds that same reader
+            // internally, throws it away and reports only its class name — which then had to be
+            // constructed a second time.
+            $reader = \PhpOffice\PhpSpreadsheet\IOFactory::createReaderForFile($filePath);
+            self::configureReader($reader);
+            $spreadsheet = $reader->load($filePath);
+
+            // HTML is recovered, not validated: libxml reports every non-HTML4 tag, and the reader
+            // already fails outright when nothing could be recovered.
+            if (!$reader instanceof \PhpOffice\PhpSpreadsheet\Reader\Html) {
+                foreach (array_slice(libxml_get_errors(), $libxmlErrorsBefore) as $error) {
+                    if ($error->level >= LIBXML_ERR_ERROR) {
+                        throw new \PhpOffice\PhpSpreadsheet\Reader\Exception(sprintf(
+                            'Unable to read "%s": malformed XML inside the file (%s at line %d), '
+                                . 'so part of it could not be parsed.',
+                            $filePath,
+                            trim($error->message),
+                            $error->line
+                        ));
+                    }
+                }
+            }
+
+            return self::sheetToArray($spreadsheet, $filePath, $withHeader, $sheetName, $removeEmptyRows);
+        } finally {
+            // Restoring "false" also empties the buffer, so no error leaks to the caller unless the
+            // caller had the buffer enabled already.
+            libxml_use_internal_errors($libxmlWasInternal);
+            restore_error_handler();
+            // Worksheets and cells reference each other; without this every imported workbook
+            // stays in memory until the cycle collector happens to run.
+            $spreadsheet?->disconnectWorksheets();
+        }
+    }
+
+    /**
+     * Applies the reading policy documented on excelToArray() to a freshly identified reader.
+     *
+     * @param \PhpOffice\PhpSpreadsheet\Reader\IReader $reader Reader returned by createReaderForFile().
+     */
+    private static function configureReader(\PhpOffice\PhpSpreadsheet\Reader\IReader $reader): void {
         $reader->setReadDataOnly(true);
-        $spreadsheet = $reader->load($filePath);
+        // Skip cells that carry formatting but no value: they are not data, and materialising a
+        // styled range costs a cell object per formatted cell plus a row walk to its bottom.
+        $reader->setReadEmptyCells(false);
+
+        if ($reader instanceof \PhpOffice\PhpSpreadsheet\Reader\Csv) {
+            $reader->setInputEncoding(\PhpOffice\PhpSpreadsheet\Reader\Csv::GUESS_ENCODING);
+            $reader->setFallbackEncoding('CP1252');
+        }
+
+        if ($reader instanceof \PhpOffice\PhpSpreadsheet\Reader\Html) {
+            // HTML in the wild is not well-formed and the DOM is recovered anyway; without this
+            // libxml's recoverable complaints surface as warnings, which excelToArray() treats as
+            // a corrupt file.
+            $reader->setSuppressLoadWarnings(true);
+        }
+
+        if (
+            $reader instanceof \PhpOffice\PhpSpreadsheet\Reader\Csv
+            || $reader instanceof \PhpOffice\PhpSpreadsheet\Reader\Html
+        ) {
+            // Text formats carry no types: the file's text IS the value. The default binder would
+            // re-type it as if a user were typing into Excel — evaluating "=..." as a formula and
+            // turning "+55 11..." or "1e3" into numbers. The StringValueBinder's defaults store
+            // every value as a string.
+            $reader->setValueBinder(new \PhpOffice\PhpSpreadsheet\Cell\StringValueBinder());
+        }
+    }
+
+    /**
+     * Extracts the selected sheet of a loaded workbook, shaped as excelToArray() documents.
+     *
+     * @param \PhpOffice\PhpSpreadsheet\Spreadsheet $spreadsheet Loaded workbook.
+     * @param string $filePath Only for exception messages.
+     * @param bool $withHeader See excelToArray().
+     * @param string|null $sheetName See excelToArray().
+     * @param bool $removeEmptyRows See excelToArray().
+     * @return array See excelToArray().
+     * @throws \RuntimeException See excelToArray().
+     */
+    private static function sheetToArray(
+        \PhpOffice\PhpSpreadsheet\Spreadsheet $spreadsheet,
+        string $filePath,
+        bool $withHeader,
+        ?string $sheetName,
+        bool $removeEmptyRows
+    ): array {
+        $data = [];
 
         // Truthiness would widen "active sheet" from null to '' and '0' as well, so a tab literally
         // named "0" would never be looked up and the caller would silently get the active sheet.

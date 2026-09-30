@@ -20,7 +20,9 @@ final class MailerTest extends TestCase
 {
     /**
      * The sink. Responds 220 / EHLO+AUTH / 334 / 235 / 250 / 354, logs every command line to
-     * "<log>" and everything between DATA and the terminating "." to "<log>.eml".
+     * "<log>" and everything between DATA and the terminating "." to "<log>.eml". It does NOT speak
+     * TLS: STARTTLS is refused with 454, and a TLS ClientHello is just a garbage line to it.
+     * $argv[2] is how long to wait for the one connection it serves.
      */
     private const SINK_SOURCE = <<<'SINK'
 <?php
@@ -29,7 +31,7 @@ $srv = stream_socket_server('tcp://127.0.0.1:0', $errno, $errstr);
 if (!$srv) { file_put_contents($log, "ERR $errstr\n"); exit(1); }
 $name = stream_socket_get_name($srv, false);
 file_put_contents($log . '.port', (string) (int) substr($name, strrpos($name, ':') + 1));
-$conn = @stream_socket_accept($srv, 5);
+$conn = @stream_socket_accept($srv, (float) ($argv[2] ?? 5));
 if (!$conn) { file_put_contents($log, "NOACCEPT\n"); exit(1); }
 $session = '';
 $data    = '';
@@ -50,6 +52,7 @@ while (($line = fgets($conn, 8192)) !== false) {
     if ($cmd === 'HELO') { fwrite($conn, "250 sink\r\n"); continue; }
     if ($cmd === 'AUTH') { $expect = (stripos($line, 'PLAIN') !== false) ? 'plain' : 'user'; fwrite($conn, "334 VXNlcm5hbWU6\r\n"); continue; }
     if ($cmd === 'DATA') { $inData = true; fwrite($conn, "354 go\r\n"); continue; }
+    if ($cmd === 'STAR') { fwrite($conn, "454 4.7.0 TLS not available\r\n"); continue; }
     if ($cmd === 'QUIT') { fwrite($conn, "221 bye\r\n"); break; }
     fwrite($conn, "250 OK\r\n");
 }
@@ -123,15 +126,20 @@ SINK;
 
     // ---------------------------------------------------------------- sink plumbing
 
-    /** Spawns the sink and returns the port it is listening on. */
-    private function startSink(): int
+    /**
+     * Spawns the sink and returns the port it is listening on.
+     *
+     * @param float $acceptTimeout How long the sink waits for a connection. A test that expects
+     *                             NOTHING to connect passes a short one, or it pays the full wait.
+     */
+    private function startSink(float $acceptTimeout = 5.0): int
     {
         $script = $this->tmpDir . DIRECTORY_SEPARATOR . 'sink.php';
         file_put_contents($script, self::SINK_SOURCE);
         $this->sinkLog = $this->tmpDir . DIRECTORY_SEPARATOR . 'session';
 
         $proc = proc_open(
-            [PHP_BINARY, $script, $this->sinkLog],
+            [PHP_BINARY, $script, $this->sinkLog, (string) $acceptTimeout],
             [['pipe', 'r'], ['pipe', 'w'], ['pipe', 'w']],
             $this->sinkPipes
         );
@@ -207,14 +215,34 @@ SINK;
     private function configs(int $port): array
     {
         return [
-            'email'  => 'from@example.com',
-            'name'   => 'From Name',
-            'user'   => 'smtp-user',
-            'pass'   => 'secret',
-            'host'   => '127.0.0.1',
-            'port'   => $port,
-            'secure' => 'none',
+            'email'   => 'from@example.com',
+            'name'    => 'From Name',
+            'user'    => 'smtp-user',
+            'pass'    => 'secret',
+            'host'    => '127.0.0.1',
+            'port'    => $port,
+            'secure'  => 'none',
+            // Bounds every SMTP wait: PHPMailer's own default is 300s, so a misbehaving exchange
+            // would stall the suite for five minutes instead of failing.
+            'timeout' => 5,
         ];
+    }
+
+    /**
+     * Calls sendMail() with only the arguments a guard test cares about, and hands back $error.
+     *
+     * The guard tests all used to point at port 1 and assert a bare FALSE — which a send that
+     * sailed PAST the guard also returns, once port 1 refuses the connection. Asserting the
+     * reason is what makes them prove the guard.
+     *
+     * @return array{0: bool, 1: string|null} [return value, $error]
+     */
+    private static function send(array $configs, array $sendTo, string $subject, string $body, array $named = []): array
+    {
+        $error = 'untouched';
+        $ok = Mailer::sendMail($configs, $sendTo, $subject, $body, ...$named, error: $error);
+
+        return [$ok, $error];
     }
 
     /** A $configs that would be valid if the named key were not removed. Never reaches the network. */
@@ -241,36 +269,73 @@ SINK;
 
     public function testSendMailReturnsFalseWhenConfigsIsEmpty(): void
     {
-        self::assertFalse(Mailer::sendMail([], [['email' => 'to@example.com']], 'Subject', 'Body'));
+        [$ok, $error] = self::send([], [['email' => 'to@example.com']], 'Subject', 'Body');
+
+        self::assertFalse($ok);
+        self::assertStringContainsString('secure', (string) $error, 'refused by the guard, not by the network');
     }
 
     /**
-     * @return array<string, array{0: string}>
+     * @return array<string, array{0: string, 1: string}>
      */
     public static function requiredConfigKeyProvider(): array
     {
         return [
-            'name is required'   => ['name'],
-            'pass is required'   => ['pass'],
-            'host is required'   => ['host'],
-            'port is required'   => ['port'],
-            'secure is required' => ['secure'],
+            'name is required'   => ['name', 'A required value is missing'],
+            'pass is required'   => ['pass', 'A required value is missing'],
+            'host is required'   => ['host', 'A required value is missing'],
+            'port is required'   => ['port', 'A required value is missing'],
+            'secure is required' => ['secure', "\$configs['secure']"],
         ];
     }
 
     /**
      * The docblock promises a bare FALSE — not an exception — for a missing required $configs key.
      *
+     * The reason is asserted because FALSE alone proves nothing here: without the guard the send
+     * goes on to port 1, is refused, and returns FALSE just the same.
      */
     #[DataProvider('requiredConfigKeyProvider')]
-    public function testSendMailReturnsFalseWhenARequiredConfigKeyIsMissing(string $key): void
+    public function testSendMailReturnsFalseWhenARequiredConfigKeyIsMissing(string $key, string $reason): void
     {
-        self::assertFalse(Mailer::sendMail(
+        [$ok, $error] = self::send(
             $this->configsWithout($key),
             [['email' => 'to@example.com', 'name' => 'To']],
             'Subject',
             '<p>Body</p>'
-        ));
+        );
+
+        self::assertFalse($ok);
+        self::assertStringContainsString($reason, (string) $error);
+    }
+
+    /**
+     * Pins the fix: a non-string $configs value reached string-typed calls (validateMail(),
+     * PHPMailer's setFrom()) and escaped as a TypeError from a function that promises bool.
+     *
+     * @return array<string, array{0: string, 1: mixed}>
+     */
+    public static function nonStringConfigProvider(): array
+    {
+        return [
+            'user as array'  => ['user', ['x']],
+            'email as array' => ['email', ['from@example.com']],
+            'pass as int'    => ['pass', 1234],
+            'timeout string' => ['timeout', '5'],
+            'timeout zero'   => ['timeout', 0],
+        ];
+    }
+
+    #[DataProvider('nonStringConfigProvider')]
+    public function testSendMailReturnsFalseForAMistypedConfigValue(string $key, mixed $value): void
+    {
+        $configs = $this->configs(1);
+        $configs[$key] = $value;
+
+        [$ok, $error] = self::send($configs, [['email' => 'to@example.com']], 'Subject', '<p>Body</p>');
+
+        self::assertFalse($ok);
+        self::assertStringContainsString("\$configs['{$key}']", (string) $error);
     }
 
     /** 'user' is documented as OPTIONAL: it defaults to 'email'. Dropping it must NOT fail the guard. */
@@ -317,12 +382,10 @@ SINK;
         unset($configs['email']);
         $configs['user'] = 'not-an-address';
 
-        self::assertFalse(Mailer::sendMail(
-            $configs,
-            [['email' => 'to@example.com', 'name' => 'To']],
-            'Subject',
-            '<p>Body</p>'
-        ));
+        [$ok, $error] = self::send($configs, [['email' => 'to@example.com', 'name' => 'To']], 'Subject', '<p>Body</p>');
+
+        self::assertFalse($ok);
+        self::assertStringContainsString('A required value is missing', (string) $error);
     }
 
     // ---------------------------------------------------------------- $configs['secure'] (closed set)
@@ -340,7 +403,8 @@ SINK;
      */
     public function testSendMailRefusesATypoInSecureInsteadOfDowngradingToCleartext(): void
     {
-        $port = $this->startSink();
+        // Nothing may connect, so a short accept window: the default 5s was pure dead time.
+        $port = $this->startSink(1.0);
         $configs = $this->configs($port);
         $configs['secure'] = 'tsl'; // the typo
 
@@ -378,18 +442,20 @@ SINK;
         ];
     }
 
+    /**
+     * Every case now asserts the REASON. The bare-FALSE version could not tell the guard's refusal
+     * from port 1 refusing the connection, so it passed with the guard deleted.
+     */
     #[DataProvider('invalidSecureProvider')]
     public function testSendMailReturnsFalseForASecureOutsideTheAcceptedSet(mixed $secure): void
     {
         $configs = $this->configs(1);
         $configs['secure'] = $secure;
 
-        self::assertFalse(Mailer::sendMail(
-            $configs,
-            [['email' => 'to@example.com', 'name' => 'To']],
-            'Subject',
-            '<p>Body</p>'
-        ));
+        [$ok, $error] = self::send($configs, [['email' => 'to@example.com', 'name' => 'To']], 'Subject', '<p>Body</p>');
+
+        self::assertFalse($ok);
+        self::assertSame("\$configs['secure'] must be exactly 'tls', 'ssl' or 'none'.", $error);
     }
 
     /** 'none' is the explicit cleartext opt-out, matched case-insensitively with the edges trimmed. */
@@ -410,52 +476,149 @@ SINK;
     }
 
     /**
-     * 'tls'/'ssl' stay accepted by the guard. They cannot reach this plaintext sink — PHPMailer
-     * fails the handshake and sendMail returns FALSE — so what this pins is that they are ACCEPTED
-     * values (unlike 'tsl', which never gets far enough to try) and that a failed handshake is a
-     * clean FALSE rather than an escaping exception.
+     * 'tls' is STARTTLS and it never falls back. The sink refuses STARTTLS (454), so the send must
+     * fail right there — with EHLO and STARTTLS on the wire and NOT ONE credential after them.
      *
-     * @return array<string, array{0: string}>
+     * The previous version of this test pointed 'tls' and 'ssl' at port 1 and asserted FALSE,
+     * which a connection refusal produces whatever the mapping is; it proved neither that the
+     * values were accepted nor what they meant.
      */
-    public static function acceptedEncryptionProvider(): array
+    public function testSendMailTlsIsStartTlsAndNeverFallsBackToCleartextAuth(): void
     {
-        return [
-            'starttls' => ['tls'],
-            'smtps'    => ['SSL'], // also pins case-insensitivity
-        ];
+        $port = $this->startSink();
+        $configs = $this->configs($port);
+        $configs['secure'] = 'TLS'; // also pins case-insensitivity
+
+        [$ok, $error] = self::send($configs, [['email' => 'to@example.com', 'name' => 'To']], 'Subject', '<p>Body</p>');
+
+        self::assertFalse($ok);
+        self::assertNotSame("\$configs['secure'] must be exactly 'tls', 'ssl' or 'none'.", $error, 'tls is an accepted value');
+
+        $session = $this->sinkCapture()['session'];
+        self::assertStringContainsString('STARTTLS', $session);
+        self::assertStringNotContainsString('AUTH', $session, 'credentials were offered after STARTTLS was refused');
+        self::assertStringNotContainsString(base64_encode('secret'), $session);
+        self::assertStringNotContainsString('MAIL FROM', $session);
     }
 
-    #[DataProvider('acceptedEncryptionProvider')]
-    public function testSendMailAcceptsTheDocumentedEncryptionKeywords(string $secure): void
+    /**
+     * 'ssl' is implicit TLS (SMTPS): the handshake starts before any SMTP command, so this
+     * plaintext sink never sees a single readable command — in particular no EHLO and no AUTH.
+     */
+    public function testSendMailSslIsImplicitTlsAndSendsNoPlaintextCommand(): void
     {
-        $configs = $this->configs(1);
-        $configs['secure'] = $secure;
+        $port = $this->startSink();
+        $configs = $this->configs($port);
+        $configs['secure'] = 'ssl';
 
-        // Port 1 refuses instantly: the value passed the guard and died at the connection, which is
-        // a different failure from the guard's flat refusal — and still a bool.
-        self::assertFalse(Mailer::sendMail(
-            $configs,
-            [['email' => 'to@example.com', 'name' => 'To']],
-            'Subject',
-            '<p>Body</p>'
-        ));
+        [$ok, $error] = self::send($configs, [['email' => 'to@example.com', 'name' => 'To']], 'Subject', '<p>Body</p>');
+
+        self::assertFalse($ok);
+        self::assertNotSame("\$configs['secure'] must be exactly 'tls', 'ssl' or 'none'.", $error, 'ssl is an accepted value');
+
+        $session = $this->sinkCapture()['session'];
+        self::assertStringNotContainsString('EHLO', $session);
+        self::assertStringNotContainsString('AUTH', $session);
+        self::assertStringNotContainsString(base64_encode('secret'), $session);
     }
 
     // ---------------------------------------------------------------- other guard branches
 
     public function testSendMailReturnsFalseWhenSendToIsEmpty(): void
     {
-        self::assertFalse(Mailer::sendMail($this->configs(1), [], 'Subject', '<p>Body</p>'));
+        [$ok, $error] = self::send($this->configs(1), [], 'Subject', '<p>Body</p>');
+
+        self::assertFalse($ok);
+        self::assertStringContainsString('A required value is missing', (string) $error);
     }
 
     public function testSendMailReturnsFalseWhenSubjectIsEmpty(): void
     {
-        self::assertFalse(Mailer::sendMail($this->configs(1), [['email' => 'to@example.com']], '', '<p>Body</p>'));
+        [$ok, $error] = self::send($this->configs(1), [['email' => 'to@example.com']], '', '<p>Body</p>');
+
+        self::assertFalse($ok);
+        self::assertStringContainsString('A required value is missing', (string) $error);
     }
 
     public function testSendMailReturnsFalseWhenBodyIsEmpty(): void
     {
-        self::assertFalse(Mailer::sendMail($this->configs(1), [['email' => 'to@example.com']], 'Subject', ''));
+        [$ok, $error] = self::send($this->configs(1), [['email' => 'to@example.com']], 'Subject', '');
+
+        self::assertFalse($ok);
+        self::assertStringContainsString('A required value is missing', (string) $error);
+    }
+
+    /** Pins the fix: empty() rejected the perfectly good subject "0". */
+    public function testSendMailAcceptsTheSubjectZero(): void
+    {
+        $port = $this->startSink();
+
+        [$ok, $error] = self::send($this->configs($port), [['email' => 'to@example.com']], '0', '<p>Body</p>');
+
+        self::assertTrue($ok, (string) $error);
+        self::assertNull($error, '$error is reset to NULL on success');
+        self::assertStringContainsString('Subject: 0', $this->sinkCapture()['eml']);
+    }
+
+    /** A body of "0" stays refused: PHPMailer itself treats it as empty ("Message body empty"). */
+    public function testSendMailRefusesTheBodyZeroUpFront(): void
+    {
+        [$ok, $error] = self::send($this->configs(1), [['email' => 'to@example.com']], 'Subject', '0');
+
+        self::assertFalse($ok);
+        self::assertStringContainsString('A required value is missing', (string) $error);
+    }
+
+    /**
+     * Pins the fix: a malformed entry reached `$to['email']` & co. and escaped as a TypeError
+     * ("Cannot access offset of type string on string") from a function that promises bool — or,
+     * for a missing key, raised an "Undefined array key" warning that a strict handler rethrows.
+     *
+     * @return array<string, array{0: array<string, mixed>, 1: string}>
+     */
+    public static function malformedEntryProvider(): array
+    {
+        return [
+            'recipient as a bare string' => [['sendTo' => ['to@example.com']], '$sendTo[0] must be an array'],
+            'recipient without email'    => [['sendTo' => [['name' => 'x']]], "\$sendTo[0]['email']"],
+            'recipient with array email' => [['sendTo' => [['email' => ['a@b.c']]]], "\$sendTo[0]['email']"],
+            'recipient with array name'  => [['sendTo' => [['email' => 'to@example.com', 'name' => ['x']]]], "\$sendTo[0]['name']"],
+            'cc as a bare string'        => [['cc' => ['cc@example.com']], '$cc[0] must be an array'],
+            'bcc without email'          => [['cco' => [[]]], "\$cco[0]['email']"],
+            'reply-to as null'           => [['reply' => [null]], '$reply[0] must be an array'],
+            'attachment as a bare path'  => [['files' => ['/etc/passwd']], '$files[0] must be an array'],
+            'attachment without file'    => [['files' => [['name' => 'x.txt']]], "\$files[0]['file']"],
+            'string attachment w/o body' => [['stringFiles' => [['name' => 'x.txt']]], "\$stringFiles[0]['string']"],
+        ];
+    }
+
+    #[DataProvider('malformedEntryProvider')]
+    public function testSendMailReturnsFalseForAMalformedEntryInsteadOfThrowing(array $arguments, string $reason): void
+    {
+        $sendTo = $arguments['sendTo'] ?? [['email' => 'to@example.com']];
+        unset($arguments['sendTo']);
+
+        [$ok, $error] = self::send($this->configs(1), $sendTo, 'Subject', '<p>Body</p>', $arguments);
+
+        self::assertFalse($ok);
+        self::assertStringContainsString($reason, (string) $error);
+    }
+
+    /** An EMPTY string attachment is a legitimate (empty) file, not a malformed entry. */
+    public function testSendMailAcceptsAnEmptyStringAttachment(): void
+    {
+        $port = $this->startSink();
+
+        [$ok, $error] = self::send(
+            $this->configs($port),
+            [['email' => 'to@example.com']],
+            'Subject',
+            '<p>Body</p>',
+            ['stringFiles' => [['string' => '', 'name' => 'empty.txt']]]
+        );
+
+        self::assertTrue($ok, (string) $error);
+        self::assertStringContainsString('empty.txt', $this->sinkCapture()['eml']);
     }
 
     // ---------------------------------------------------------------- $useConfig (closed set)
@@ -471,13 +634,38 @@ SINK;
         $configs = $this->configs(1);
         unset($configs['host'], $configs['port'], $configs['secure']);
 
-        self::assertFalse(Mailer::sendMail(
+        [$ok, $error] = self::send(
             $configs,
             [['email' => 'to@example.com', 'name' => 'To']],
             'Subject',
             '<p>Body</p>',
-            'outlook'
-        ));
+            ['useConfig' => 'outlook']
+        );
+
+        self::assertFalse($ok);
+        self::assertStringContainsString("\$configs['secure']", (string) $error, 'refused by the guard, not by the network');
+    }
+
+    /**
+     * A recognised shortcut fills in host/secure/port itself, so the guard must NOT demand them.
+     * The shortcut's real host is never contacted: the message is aborted by a malformed header
+     * AFTER the guard, which is enough to prove the guard let it through.
+     */
+    public function testSendMailAcceptsAProviderShortcutWithoutOwnHostConfig(): void
+    {
+        $configs = $this->configs(1);
+        unset($configs['host'], $configs['port'], $configs['secure']);
+
+        [$ok, $error] = self::send(
+            $configs,
+            [['email' => 'to@example.com']],
+            'Subject',
+            '<p>Body</p>',
+            ['useConfig' => 'GMAIL', 'headers' => ["X-Stop: here\r\nX-Injected: 1"]]
+        );
+
+        self::assertFalse($ok);
+        self::assertStringStartsWith('Invalid custom header', (string) $error);
     }
 
     /** ...and an unrecognised value is otherwise IGNORED: the caller's own host config still rules. */
@@ -586,29 +774,25 @@ SINK;
     {
         self::assertFalse(class_exists(\Illuminate\Support\Facades\View::class), 'the facade must start absent');
 
+        // The message deliberately quotes the SMTP password: $error must never hand it back.
         eval('namespace Illuminate\Support\Facades; class View {
             public static function exists($view) { return true; }
-            public static function make($view, $data = []) { throw new \RuntimeException("Blade compile error"); }
+            public static function make($view, $data = []) { throw new \RuntimeException("Blade compile error near secret / " . base64_encode("secret")); }
         }');
 
-        // Port 1 is never reached: rendering fails first. No exception may escape.
-        self::assertFalse(Mailer::sendMail(
+        // Port 1 is never reached: rendering fails first. No exception may escape. The reason is
+        // asserted because a render failure silently falling back to $body would ALSO end in FALSE
+        // here, once port 1 refused the connection.
+        [$ok, $error] = self::send(
             $this->configs(1),
             [['email' => 'to@example.com', 'name' => 'To']],
             'Subject',
             '<p>Body</p>',
-            null,
-            null,
-            [],
-            [],
-            0,
-            0,
-            [],
-            [],
-            [],
-            [],
-            'emails.broken'
-        ));
+            ['template' => 'emails.broken']
+        );
+
+        self::assertFalse($ok);
+        self::assertSame('The template could not be rendered: Blade compile error near [hidden] / [hidden]', $error);
     }
 
     /** The happy path of that same resolution: a view that renders becomes the body. */
@@ -1389,14 +1573,16 @@ SINK;
     #[DataProvider('unusableBaseDirProvider')]
     public function testSendMailReturnsFalseWhenEmbeddingIsRequestedWithoutAUsableBaseDir(?string $baseDir): void
     {
-        self::assertFalse(Mailer::sendMail(
+        [$ok, $error] = self::send(
             $this->configs(1),
             [['email' => 'to@example.com', 'name' => 'To']],
             'Subject',
             '<img src="logo.png">',
-            useEmbeddedImages: true,
-            embeddedImagesBaseDir: $baseDir
-        ));
+            ['useEmbeddedImages' => true, 'embeddedImagesBaseDir' => $baseDir]
+        );
+
+        self::assertFalse($ok);
+        self::assertStringContainsString('$embeddedImagesBaseDir', (string) $error, 'refused by the guard, not by the network');
     }
 
     /** A FILE is not a directory: it cannot be an allow-list. */
@@ -1404,14 +1590,63 @@ SINK;
     {
         $png = $this->makePng();
 
-        self::assertFalse(Mailer::sendMail(
+        [$ok, $error] = self::send(
             $this->configs(1),
             [['email' => 'to@example.com', 'name' => 'To']],
             'Subject',
             '<img src="dot.png">',
-            useEmbeddedImages: true,
-            embeddedImagesBaseDir: $png
-        ));
+            ['useEmbeddedImages' => true, 'embeddedImagesBaseDir' => $png]
+        );
+
+        self::assertFalse($ok);
+        self::assertStringContainsString('$embeddedImagesBaseDir', (string) $error);
+    }
+
+    /**
+     * A network src ("\\host\share\…", "//host/share/…") is refused BEFORE realpath(): on Windows
+     * realpath() opens an SMB session to that host — offering it this server's NTLM credentials —
+     * before containment is checked. Honest caveat: this can only assert the refusal, not the
+     * absence of the SMB round trip, which needs a network fixture this suite does not have.
+     *
+     * @return array<string, array{0: string}>
+     */
+    public static function networkSrcProvider(): array
+    {
+        return [
+            'UNC backslashes'      => ['\\\\attacker.invalid\\share\\logo.png'],
+            'UNC forward slashes'  => ['//attacker.invalid/share/logo.png'],
+            'mixed separators'     => ['\\/attacker.invalid/share/logo.png'],
+            'extended-length path' => ['\\\\?\\C:\\Windows\\win.ini'],
+            'device namespace'     => ['\\\\.\\pipe\\x'],
+        ];
+    }
+
+    #[DataProvider('networkSrcProvider')]
+    public function testResolveEmbeddableImageRefusesANetworkSrcOutsideTheBaseDir(string $src): void
+    {
+        $resolve = new \ReflectionMethod(Mailer::class, 'resolveEmbeddableImage');
+
+        self::assertNull($resolve->invoke(null, $src, (string) realpath($this->tmpDir)));
+    }
+
+    /** ...while a network BASE dir still embeds from inside itself. Needs the admin share. */
+    public function testResolveEmbeddableImageAllowsANetworkSrcInsideANetworkBaseDir(): void
+    {
+        $png = $this->makePng();
+        $local = (string) realpath($png);
+        if (DIRECTORY_SEPARATOR !== '\\' || preg_match('#^([A-Za-z]):\\\\#', $local, $drive) !== 1) {
+            self::markTestSkipped('Needs a Windows drive-letter path to build an admin-share UNC path.');
+        }
+
+        $uncBase = realpath('\\\\localhost\\' . $drive[1] . '$\\' . substr((string) realpath($this->tmpDir), 3));
+        if ($uncBase === false) {
+            self::markTestSkipped('The \\\\localhost\\' . $drive[1] . '$ admin share is not reachable here.');
+        }
+
+        $resolve = new \ReflectionMethod(Mailer::class, 'resolveEmbeddableImage');
+
+        self::assertNotNull($resolve->invoke(null, $uncBase . '\\dot.png', $uncBase));
+        self::assertNull($resolve->invoke(null, $uncBase . '\\..\\dot.png', $uncBase), 'no ../ in a network src');
     }
 
     /** $embeddedImagesBaseDir is inert when embedding is off — it must not become a new way to fail. */
@@ -1630,8 +1865,172 @@ SINK;
             'useConfig', 'lang', 'files', 'stringFiles', 'priority', 'wrap',
             'cc', 'cco', 'reply', 'headers', 'template', 'confirm', 'useEmbeddedImages',
             'charset', 'useAuth', 'isSMTP', 'debugMode',
-            'embeddedImagesBaseDir',
+            'embeddedImagesBaseDir', 'error',
         ], $names);
+
+        $error = (new \ReflectionMethod(Mailer::class, 'sendMail'))->getParameters()[22];
+        self::assertTrue($error->isPassedByReference(), '$error is an OUT parameter');
+        self::assertTrue($error->isOptional());
+    }
+
+    // ---------------------------------------------------------------- injection & leakage
+
+    /**
+     * Pins the fix: PHPMailer writes $charset into every MIME part header UNESCAPED (getBoundary()),
+     * so a CR/LF in it injected headers — and body text — into the message parts.
+     *
+     * @return array<string, array{0: string}>
+     */
+    public static function invalidCharsetProvider(): array
+    {
+        return [
+            'CRLF header injection' => ["UTF-8\r\nX-Evil-Part: 1\r\n\r\nINJECTED-BODY"],
+            'bare LF'               => ["UTF-8\nX-Evil: 1"],
+            'parameter smuggling'   => ['UTF-8; format=flowed'],
+            'quoted'                => ['"UTF-8"'],
+            'empty'                 => [''],
+        ];
+    }
+
+    #[DataProvider('invalidCharsetProvider')]
+    public function testSendMailRefusesACharsetThatIsNotACharsetName(string $charset): void
+    {
+        $port = $this->startSink(1.0);
+
+        [$ok, $error] = self::send(
+            $this->configs($port),
+            [['email' => 'to@example.com']],
+            'Subject',
+            '<p>ação</p>', // 8-bit, so PHPMailer really would label the parts with $charset
+            ['charset' => $charset]
+        );
+
+        self::assertFalse($ok);
+        self::assertSame('$charset must be a charset name such as UTF-8.', $error);
+        self::assertStringNotContainsString('INJECTED-BODY', $this->sinkCapture()['eml']);
+    }
+
+    /**
+     * Pins the fix: PHPMailer's Debugoutput defaults to 'echo', so $debugMode printed the SMTP
+     * transcript to STDOUT — straight into the HTTP response of a web request. It now goes to
+     * error_log(), and the AUTH exchange stays masked. beStrictAboutOutputDuringTests (phpunit.xml)
+     * is what catches any stdout here.
+     */
+    public function testSendMailDebugModeLogsTheTranscriptInsteadOfPrintingIt(): void
+    {
+        $log = $this->tmpDir . DIRECTORY_SEPARATOR . 'debug.log';
+        $previous = ini_set('error_log', $log);
+
+        try {
+            $port = $this->startSink();
+            [$ok, $error] = self::send(
+                $this->configs($port),
+                [['email' => 'to@example.com']],
+                'Subject',
+                '<p>Body</p>',
+                ['debugMode' => true]
+            );
+        } finally {
+            ini_set('error_log', $previous === false ? '' : $previous);
+        }
+
+        self::assertTrue($ok, (string) $error);
+        $this->expectOutputString('');
+
+        $transcript = (string) @file_get_contents($log);
+        self::assertStringContainsString('CLIENT -> SERVER', $transcript);
+        self::assertStringContainsString('[credentials hidden]', $transcript);
+        self::assertStringNotContainsString(base64_encode('secret'), $transcript);
+        self::assertStringNotContainsString(base64_encode('smtp-user'), $transcript);
+    }
+
+    /**
+     * A custom header carrying CR/LF is FALSE with a reason — never an exception. URL's header
+     * builder refuses such a header by THROWING, outside the PHPMailer-only catch.
+     *
+     * @return array<string, array{0: array<int|string, string>}>
+     */
+    public static function injectedHeaderProvider(): array
+    {
+        return [
+            'named, CRLF in value' => [['X-Tag' => "a\r\nBcc: victim@example.com"]],
+            'verbatim, CRLF'       => [["X-Tag: a\r\nBcc: victim@example.com"]],
+            'bad header name'      => [['X Tag' => 'a']],
+        ];
+    }
+
+    #[DataProvider('injectedHeaderProvider')]
+    public function testSendMailReturnsFalseForAnInjectedCustomHeader(array $headers): void
+    {
+        [$ok, $error] = self::send($this->configs(1), [['email' => 'to@example.com']], 'Subject', '<p>Body</p>', ['headers' => $headers]);
+
+        self::assertFalse($ok);
+        self::assertStringStartsWith('Invalid custom header', (string) $error);
+    }
+
+    /**
+     * CR/LF in a display name, the subject, or an attachment name cannot inject a header:
+     * PHPMailer strips them. Pinned so a PHPMailer upgrade that stopped doing so is noticed.
+     */
+    public function testSendMailNamesAndSubjectCannotInjectHeaders(): void
+    {
+        $port = $this->startSink();
+        $attachment = $this->tmpDir . DIRECTORY_SEPARATOR . 'a.txt';
+        file_put_contents($attachment, 'ATTACHED');
+
+        [$ok, $error] = self::send(
+            $this->configs($port),
+            [['email' => 'to@example.com', 'name' => "To\r\nBcc: evil1@example.com"]],
+            "Subject\r\nBcc: evil2@example.com",
+            '<p>Body</p>',
+            [
+                'files'       => [['file' => $attachment, 'name' => "ev\"il\r\nX-Evil: 1.txt"]],
+                'stringFiles' => [['string' => 'x', 'name' => 'relatório ção.csv']],
+            ]
+        );
+
+        self::assertTrue($ok, (string) $error);
+
+        $capture = $this->sinkCapture();
+        self::assertDoesNotMatchRegularExpression('/^(Bcc|X-Evil):/mi', $capture['eml']);
+        self::assertStringNotContainsString('evil', strtolower($capture['session']), 'no injected envelope recipient');
+        self::assertStringContainsString('filename="ev\"ilX-Evil: 1.txt"', $capture['eml']);
+        self::assertStringContainsString('=?UTF-8?Q?relat=C3=B3rio_=C3=A7=C3=A3o.csv?=', $capture['eml']);
+    }
+
+    /** An address carrying CR/LF is refused outright rather than having its break stripped. */
+    public function testSendMailRefusesAnAddressContainingALineBreak(): void
+    {
+        [$ok, $error] = self::send($this->configs(1), [['email' => "to@example.com\r\nBcc: e@example.com"]], 'Subject', '<p>Body</p>');
+
+        self::assertFalse($ok);
+        self::assertStringContainsStringIgnoringCase('address', (string) $error);
+    }
+
+    /** A missing attachment fails the WHOLE send, and $error says so. */
+    public function testSendMailReturnsFalseForAMissingAttachment(): void
+    {
+        [$ok, $error] = self::send(
+            $this->configs(1),
+            [['email' => 'to@example.com']],
+            'Subject',
+            '<p>Body</p>',
+            ['files' => [['file' => $this->tmpDir . DIRECTORY_SEPARATOR . 'missing.pdf']]]
+        );
+
+        self::assertFalse($ok);
+        self::assertStringContainsStringIgnoringCase('file', (string) $error);
+    }
+
+    /** PHPMailer's own failure reaches $error — and never the password. */
+    public function testSendMailReportsTheSmtpFailureWithoutTheCredentials(): void
+    {
+        $deadPort = 1;
+        [$ok, $error] = self::send($this->configs($deadPort), [['email' => 'to@example.com']], 'Subject', '<p>Body</p>');
+
+        self::assertFalse($ok);
+        self::assertStringContainsString('SMTP', (string) $error);
+        self::assertStringNotContainsString('secret', (string) $error);
     }
 
     // ---------------------------------------------------------------- validateMail
@@ -1671,6 +2070,12 @@ SINK;
             'no dot in domain' => ['x@b'],
             'leading hyphen'   => ['a@-b.com'],
             'double dot'       => ['a@b..com'],
+            // Pins the fix: without the D modifier `$` also matched before a final "\n", so these
+            // validated — a header-injection vector for any caller gating a header on this check.
+            'trailing LF'      => ["victim@example.com\n"],
+            'trailing CRLF'    => ["victim@example.com\r\n"],
+            'LF then header'   => ["victim@example.com\nBcc: x@example.com"],
+            'leading LF'       => ["\nvictim@example.com"],
         ];
     }
 

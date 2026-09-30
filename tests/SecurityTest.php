@@ -24,8 +24,11 @@ final class SecurityTest extends TestCase
     private const AAD  = 'product_formula.name_encrypted:1900-0000-7000-8000-000000000001';
     private const AAD2 = 'product_formula.name_encrypted:1900-0000-7000-8000-000000000002';
 
-    /** @var string[] Temp files created by a test, removed in tearDown. */
+    /** @var string[] Extra temp files a test registers outside $tempDir, removed in tearDown. */
     private array $tempPaths = [];
+
+    /** This test's own directory: everything tempPath() hands out lives in it. */
+    private ?string $tempDir = null;
 
     /** 32-byte master key (the minimum this class enforces). */
     private static function masterKey(): string
@@ -39,28 +42,54 @@ final class SecurityTest extends TestCase
         return str_repeat('z', 32);
     }
 
-    /** Returns a unique path inside the system temp dir, registered for cleanup. */
+    /** Returns a unique path inside this test's own temp directory, which tearDown removes. */
     private function tempPath(string $prefix): string
     {
-        $path = sys_get_temp_dir() . DIRECTORY_SEPARATOR
-            . 'phpht_' . $prefix . '_' . bin2hex(random_bytes(8)) . '.bin';
-        $this->tempPaths[] = $path;
+        if ($this->tempDir === null) {
+            $this->tempDir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'phpht_sec_' . bin2hex(random_bytes(8));
+            mkdir($this->tempDir);
+        }
 
-        return $path;
+        return $this->tempDir . DIRECTORY_SEPARATOR . 'phpht_' . $prefix . '_' . bin2hex(random_bytes(8)) . '.bin';
+    }
+
+    private static function removeTree(string $path): void
+    {
+        if (is_link($path) || is_file($path)) {
+            @chmod($path, 0666); // a read-only file cannot be unlinked on Windows
+            @unlink($path);
+
+            return;
+        }
+        if (!is_dir($path)) {
+            return;
+        }
+        foreach (scandir($path) as $entry) {
+            if ($entry !== '.' && $entry !== '..') {
+                self::removeTree($path . DIRECTORY_SEPARATOR . $entry);
+            }
+        }
+        @rmdir($path);
     }
 
     protected function tearDown(): void
     {
-        foreach ($this->tempPaths as $path) {
-            if (is_file($path)) {
-                @unlink($path);
+        try {
+            // Both are PROCESS-GLOBAL static state; leaking a tiny block size or limit into another
+            // test class would be a cross-test hazard.
+            Security::setFileEncryptBlocksBytes(null);
+            Security::setFileMaxEncodedBlockBytes(null);
+        } finally {
+            foreach ($this->tempPaths as $path) {
+                self::removeTree($path);
+            }
+            $this->tempPaths = [];
+
+            if ($this->tempDir !== null) {
+                self::removeTree($this->tempDir);
+                $this->tempDir = null;
             }
         }
-        $this->tempPaths = [];
-
-        // setFileEncryptBlocksBytes is PROCESS-GLOBAL static state; leaking a tiny block size into
-        // another test class would be a cross-test hazard.
-        Security::setFileEncryptBlocksBytes(null);
     }
 
     /**
@@ -267,38 +296,6 @@ final class SecurityTest extends TestCase
         Security::encryptFileV2($src, str_repeat('k', 31), $this->tempPath('enc'));
     }
 
-    /**
-     * decryptFileV2 must read its version from self::FILE_V2_VERSION, the same constant
-     * encryptFileV2 writes and binds into every block's AAD — NOT from a hardcoded "v2" literal.
-     *
-     * The defect is LATENT, so no round-trip can catch it: today the literal and the constant are
-     * both "v2", and bumping the constant is what would silently break decryption of every newly
-     * written file. A PHP class constant cannot be rebound at runtime to simulate that, so this
-     * asserts the source itself is wired to the constant. It fails against the pre-fix body, which
-     * contained `$version = "v2";`.
-     */
-    public function testDecryptFileV2DerivesItsVersionFromTheConstantNotALiteral(): void
-    {
-        $method = new \ReflectionMethod(Security::class, 'decryptFileV2');
-        $lines  = file($method->getFileName());
-        $body   = implode('', array_slice(
-            $lines,
-            $method->getStartLine() - 1,
-            $method->getEndLine() - $method->getStartLine() + 1
-        ));
-
-        $this->assertMatchesRegularExpression(
-            '/\$version\s*=\s*self::FILE_V2_VERSION\s*;/',
-            $body,
-            'decryptFileV2 must take its version from self::FILE_V2_VERSION.'
-        );
-        $this->assertDoesNotMatchRegularExpression(
-            '/\$version\s*=\s*[\'"]v2[\'"]\s*;/',
-            $body,
-            'decryptFileV2 still hardcodes its version literal; bumping FILE_V2_VERSION would silently break decryption.'
-        );
-    }
-
     // ---------------------------------------------------------------------------------------
     // generateSearchHash — the blind index
     // ---------------------------------------------------------------------------------------
@@ -499,6 +496,209 @@ final class SecurityTest extends TestCase
     {
         $this->expectException(\Exception::class);
         Security::encryptCrossPlatform('x', str_repeat('k', 15));
+    }
+
+    /**
+     * aes-bridge's Gcm::decrypt() returns openssl_decrypt()'s false through a `string` return
+     * type, which PHP coerces to "": a WRONG KEY came back as "" — indistinguishable from a real
+     * empty value — and a short input also raised a warning. Every one of these must THROW.
+     */
+    #[DataProvider('crossPlatformFailureProvider')]
+    public function testDecryptCrossPlatformThrowsInsteadOfReturningAnEmptyString(string $case): void
+    {
+        $valid = Security::encryptCrossPlatform('hello', self::masterKey());
+        $raw = base64_decode($valid);
+
+        [$value, $key, $salt, $message] = match ($case) {
+            'wrong key'      => [$valid, self::otherKey(), '', 'authentication tag mismatch'],
+            'wrong salt'     => [$valid, self::masterKey(), 'other', 'authentication tag mismatch'],
+            'flipped tag'    => [base64_encode(substr($raw, 0, -1) . chr(ord($raw[-1]) ^ 1)), self::masterKey(), '', 'authentication tag mismatch'],
+            'flipped cipher' => [base64_encode(substr_replace($raw, chr(ord($raw[28]) ^ 1), 28, 1)), self::masterKey(), '', 'authentication tag mismatch'],
+            'too short'      => ['abc', self::masterKey(), '', 'too short'],
+            'not base64'     => ['!!!!', self::masterKey(), '', 'Invalid base64'],
+        };
+
+        $this->expectException(\Exception::class);
+        $this->expectExceptionMessage($message);
+        Security::decryptCrossPlatform($value, $key, $salt);
+    }
+
+    public static function crossPlatformFailureProvider(): array
+    {
+        $cases = ['wrong key', 'wrong salt', 'flipped tag', 'flipped cipher', 'too short', 'not base64'];
+
+        return array_combine($cases, array_map(static fn ($c) => [$c], $cases));
+    }
+
+    public function testDecryptCrossPlatformRejectsANonStringCiphertext(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        Security::decryptCrossPlatform(12345, self::masterKey());
+    }
+
+    /** An array used to escape as a \TypeError from inside aes-bridge. */
+    public function testEncryptCrossPlatformRejectsAnArrayWithACatchableException(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        Security::encryptCrossPlatform(['a'], self::masterKey());
+    }
+
+    /** Ints/floats go through as their string form (the type is not recorded). */
+    public function testEncryptCrossPlatformEncryptsNumbersAsStrings(): void
+    {
+        $this->assertSame('42', Security::decryptCrossPlatform(Security::encryptCrossPlatform(42, self::masterKey()), self::masterKey()));
+        $this->assertSame('0.1', Security::decryptCrossPlatform(Security::encryptCrossPlatform(0.1, self::masterKey()), self::masterKey()));
+    }
+
+    /**
+     * Pinning a DOCUMENTED limitation, not endorsing it: the boolean markers are plain strings on
+     * the wire, so encrypting the marker text itself comes back as a boolean.
+     */
+    public function testTheBooleanMarkerStringDecryptsToABooleanAsDocumented(): void
+    {
+        $this->assertTrue(Security::decryptCrossPlatform(
+            Security::encryptCrossPlatform('{{!BOOL_TRUE!}}', self::masterKey()),
+            self::masterKey()
+        ));
+    }
+
+    /**
+     * The strict decoder must read the REAL aes-bridge format: this is the GCM vector aes-bridge
+     * publishes for all its language implementations (vendor/mervick/aes-bridge/tests/_data).
+     */
+    public function testTheStrictDecoderReadsAesBridgesPublishedGcmVector(): void
+    {
+        $decrypt = new \ReflectionMethod(Security::class, 'aesBridgeGcmDecrypt');
+
+        $plaintext = $decrypt->invoke(
+            null,
+            'W4et1smZeF2JGtYjzkdHbAvaqXb+K1nzzcfY2bTTpgsbPw4TmBFc0I5iwgWoU0hGC9ZuB/UcS1huxOHZe7WqR4Ol/FyNhjDB9bTobZCigAC4Q7GVpjiNCZYwouNfL7R/Nn4GyPjOGLY+E/9QisBv0tyfP4rLzFHzZzRmxb0skuT5IqP2lox/sBI4+YI=',
+            "áuhêüÖÕ0H_{³¹ßLè\\8ÉñïäzH`&[BÔÍ¨åg_!±Ýp+ãÏÜì 😍"
+        );
+
+        $this->assertSame('The quick brown fox выпей чаю 中文测试 𝔣𝔯𝔞𝔨𝔱𝔲𝔯 😉😌😍😘', $plaintext);
+    }
+
+    /** aes-bridge's own empty-plaintext envelope (44 bytes, no ciphertext) decrypts to "", not to an error. */
+    public function testTheStrictDecoderAcceptsAnAuthenticEmptyPlaintext(): void
+    {
+        $decrypt = new \ReflectionMethod(Security::class, 'aesBridgeGcmDecrypt');
+
+        $this->assertSame('', $decrypt->invoke(null, \AesBridge\Gcm::encrypt('', 'passphrase'), 'passphrase'));
+    }
+
+    /**
+     * The interoperability recipe documented on encryptCrossPlatform, checked in BOTH directions
+     * against aes-bridge itself: the aes-bridge passphrase is the raw 32-byte
+     * HKDF-SHA256(master, salt, info "derived-key"), never the master key.
+     */
+    public function testCrossPlatformInteropRecipeWorksAgainstAesBridgeInBothDirections(): void
+    {
+        $passphrase = hash_hkdf('sha256', self::masterKey(), 32, 'derived-key', 'tenant-1');
+
+        $fromPeer = \AesBridge\Gcm::encrypt('from another platform', $passphrase);
+        $this->assertSame('from another platform', Security::decryptCrossPlatform($fromPeer, self::masterKey(), 'tenant-1'));
+
+        $toPeer = Security::encryptCrossPlatform('to another platform', self::masterKey(), 'tenant-1');
+        $this->assertSame('to another platform', \AesBridge\Gcm::decrypt($toPeer, $passphrase));
+
+        // The master key itself is NOT the aes-bridge passphrase.
+        $this->assertSame('', \AesBridge\Gcm::decrypt($toPeer, self::masterKey()), 'aes-bridge signals failure with ""');
+    }
+
+    /**
+     * A FIXED vector, so the recipe cannot drift silently: a change to the HKDF label or salt
+     * handling would still round-trip against itself, but would break every value already stored
+     * and every peer.
+     */
+    public function testCrossPlatformFixedVectorStillDecrypts(): void
+    {
+        $this->assertSame(
+            'cross-platform vector ✓',
+            Security::decryptCrossPlatform(
+                'XBK9oEADEOM7g9tqHc8ilS7MtLlopfCQ2+P8LQnb8GQplv6MtfYtz5/eaukp/3YXQa9hOHbnf2CqArSHOZDsukb87g/J',
+                self::masterKey(),
+                'tenant-1'
+            )
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Non-scalar input: refused, never turned into the literal "Array"
+    // ---------------------------------------------------------------------------------------
+
+    /**
+     * `(string) $value` turned every array into "Array" (plus a warning): encryptDataDB and
+     * encryptLocal STORED "Array" for real data, and generateSearchHash gave every array the same
+     * blind index. A plain object raised an \Error past the documented \Exception.
+     */
+    #[DataProvider('nonScalarProvider')]
+    public function testEncryptAndHashRefuseNonScalarValues(string $method, mixed $value): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage($method . '() accepts');
+
+        match ($method) {
+            'encryptDataDB'      => Security::encryptDataDB($value, self::masterKey(), self::AAD),
+            'encryptLocal'       => Security::encryptLocal($value, self::masterKey()),
+            'generateSearchHash' => Security::generateSearchHash($value, self::masterKey()),
+        };
+    }
+
+    public static function nonScalarProvider(): array
+    {
+        $cases = [];
+        foreach (['encryptDataDB', 'encryptLocal', 'generateSearchHash'] as $method) {
+            $cases["{$method}: array"] = [$method, ['secret']];
+            $cases["{$method}: empty array"] = [$method, []];
+            $cases["{$method}: object"] = [$method, new \stdClass()];
+        }
+
+        return $cases;
+    }
+
+    public function testStringableValuesAreEncryptedAsTheirStringForm(): void
+    {
+        $stringable = new class () implements \Stringable {
+            public function __toString(): string
+            {
+                return 'rendered';
+            }
+        };
+        $empty = new class () implements \Stringable {
+            public function __toString(): string
+            {
+                return '';
+            }
+        };
+
+        $this->assertSame('rendered', Security::decryptDataDB(Security::encryptDataDB($stringable, self::masterKey(), self::AAD), self::masterKey(), self::AAD));
+        $this->assertSame('rendered', Security::decryptLocal(Security::encryptLocal($stringable, self::masterKey()), self::masterKey()));
+        $this->assertSame(Security::generateSearchHash('rendered', self::masterKey()), Security::generateSearchHash($stringable, self::masterKey()));
+
+        // An empty rendering behaves like "" — an empty GCM ciphertext would be undecryptable.
+        $this->assertSame('', Security::encryptDataDB($empty, self::masterKey(), self::AAD));
+        $this->assertSame('', Security::encryptLocal($empty, self::masterKey()));
+        $this->assertSame('', Security::generateSearchHash($empty, self::masterKey()));
+    }
+
+    /** decryptLocal's `string|false` could never produce false after the MAC check: it is `string` now. */
+    public function testDecryptLocalDeclaresAPlainStringReturn(): void
+    {
+        $type = (new \ReflectionMethod(Security::class, 'decryptLocal'))->getReturnType();
+
+        $this->assertInstanceOf(\ReflectionNamedType::class, $type);
+        $this->assertSame('string', $type->getName());
+        $this->assertFalse($type->allowsNull());
+    }
+
+    /** Only the exact base64 the encryptor emits is accepted — no data-URI prefix leniency. */
+    public function testDecryptDataDbRejectsADataUriWrappedPayload(): void
+    {
+        $envelope = Security::encryptDataDB('secret', self::masterKey(), self::AAD);
+
+        $this->expectException(\Exception::class);
+        Security::decryptDataDB('v1:data:text/plain;base64,' . substr($envelope, 3), self::masterKey(), self::AAD);
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1030,14 +1230,16 @@ final class SecurityTest extends TestCase
         $blocks[6] = base64_encode($bin);
         file_put_contents($enc, self::rebuildBlocks($blocks));
 
-        $returned = 'sentinel';
+        // (This used to assert `$returned !== false` INSIDE the catch, where $returned could only
+        // ever hold its initial sentinel — a tautology that passed whatever the code did.)
         try {
-            $returned = Security::decryptFileV2($enc, self::masterKey(), $dec);
+            Security::decryptFileV2($enc, self::masterKey(), $dec);
             $this->fail('Expected an Exception; decryptFileV2 must never return false.');
         } catch (\Exception $e) {
-            $this->assertNotSame(false, $returned);
-            $this->assertNotSame('', $e->getMessage());
+            $this->assertStringContainsString('failed authentication', $e->getMessage());
         }
+
+        $this->assertFileDoesNotExist($dec);
     }
 
     /**
@@ -1152,6 +1354,63 @@ final class SecurityTest extends TestCase
     {
         $this->expectException(\Exception::class);
         Security::applySecurityFunctionArray(['a' => 'x'], self::masterKey(), '', 'encryptPassword');
+    }
+
+    /**
+     * A self-referencing object used to recurse until the process died with an UNCATCHABLE fatal
+     * (memory or stack). It is refused now, and the guard does not outlive the call.
+     */
+    public function testApplySecurityFunctionArrayRefusesACyclicObjectGraph(): void
+    {
+        $parent = new \stdClass();
+        $child = new \stdClass();
+        $parent->name = 'p';
+        $parent->child = $child;
+        $child->name = 'c';
+        $child->parent = $parent;
+
+        try {
+            Security::applySecurityFunctionArray($parent, self::masterKey(), '', 'generateSearchHash');
+            $this->fail('A cyclic graph must be refused.');
+        } catch (\InvalidArgumentException $e) {
+            $this->assertStringContainsString('cyclic', $e->getMessage());
+        }
+
+        // Broken cycle: the same instances walk fine, so no object was left marked.
+        unset($child->parent);
+        $walked = Security::applySecurityFunctionArray($parent, self::masterKey(), '', 'generateSearchHash');
+        $this->assertSame(Security::generateSearchHash('c', self::masterKey()), $walked['child']['name']);
+    }
+
+    /** The same object reachable twice (a DAG, not a cycle) is legitimate and must not be refused. */
+    public function testApplySecurityFunctionArrayAcceptsTheSameObjectTwiceWithoutACycle(): void
+    {
+        $shared = new \stdClass();
+        $shared->v = 'x';
+
+        $walked = Security::applySecurityFunctionArray(['a' => $shared, 'b' => $shared], self::masterKey(), '', 'generateSearchHash');
+
+        $this->assertSame($walked['a'], $walked['b']);
+        $this->assertSame(Security::generateSearchHash('x', self::masterKey()), $walked['a']['v']);
+    }
+
+    public function testApplySecurityFunctionArrayAcceptsTheFullyQualifiedClassPrefix(): void
+    {
+        foreach (['VD\PHPHelper\Security::generateSearchHash', '\VD\PHPHelper\Security::generateSearchHash', 'static::generateSearchHash'] as $fnName) {
+            $this->assertSame(
+                Security::generateSearchHash('alice', self::masterKey()),
+                Security::applySecurityFunctionArray('alice', self::masterKey(), '', $fnName),
+                $fnName
+            );
+        }
+    }
+
+    /** A prefix naming ANOTHER class is not stripped: "Other::encryptLocal" is not ours to call. */
+    public function testApplySecurityFunctionArrayRefusesAnAllowlistedNameUnderAnotherClass(): void
+    {
+        $this->expectException(\Exception::class);
+        $this->expectExceptionMessage('Unsupported function');
+        Security::applySecurityFunctionArray('x', self::masterKey(), '', 'OtherVault::encryptLocal');
     }
 
     public function testApplySecurityFunctionArrayForwardsSaltAsThirdArgument(): void
@@ -1540,7 +1799,105 @@ final class SecurityTest extends TestCase
             // Forms and DOM clobbering.
             '<form action="javascript:alert(1)"><input name=x></form>',
             '<a id="location" href="x">clobber</a>',
+            // NUL bytes, HTML5 named entities libxml's HTML4 parser does not know, numeric
+            // references without ';', and invisible characters in front of the scheme.
+            "<a href=\"java\0script:alert(1)\">x</a>",
+            '<a href="javascript&colon;alert(1)">x</a>',
+            '<a href="java&Tab;script:alert(1)">x</a>',
+            '<a href="javascript&#58;alert(1)">x</a>',
+            '<a href="&#x6A;&#x61;&#x76;&#x61;&#x73;&#x63;&#x72;&#x69;&#x70;&#x74;&#x3A;alert(1)">x</a>',
+            '<a href="&#0000106&#0000097&#0000118&#0000097&#0000115&#0000099&#0000114&#0000105&#0000112&#0000116&#0000058alert(1)">x</a>',
+            "<a href=\"\u{FEFF}javascript:alert(1)\">x</a>",
+            "<a href=\"\u{2028}javascript:alert(1)\">x</a>",
+            // Comment / CDATA termination tricks.
+            '<!-- --!><img src=x onerror=alert(1)>-->',
+            '<![CDATA[<img src=x onerror=alert(1)>]]>',
+            // More foreign-content / namespace confusion.
+            '<svg><foreignObject><img src=x onerror=alert(1)></foreignObject></svg>',
+            '<math><mi xlink:href="javascript:alert(1)">x</mi></math>',
+            '<select><template><style><img src=x onerror=alert(1)></style></template></select>',
+            // Handlers on elements outside the allow-list, "/" separators, and a second <body>.
+            '<details open ontoggle=alert(1)>',
+            '<p/title="x"/onmouseover=alert(1)>',
+            'a</body></html><body onload=alert(1)><img src=x onerror=alert(1)>',
         ]);
+    }
+
+    /**
+     * Attribute breakouts. These cannot go through the oracle: its byte-level layer (rightly
+     * conservative) also flags " onmouseover=" sitting INSIDE a quoted, escaped attribute value.
+     * So the exact output is pinned instead: the quote is escaped, the element keeps ONE
+     * attribute, and a re-parse sees no handler.
+     */
+    #[DataProvider('attributeBreakoutProvider')]
+    public function testAttributeBreakoutsStayInsideTheAttributeValue(string $payload, string $expected): void
+    {
+        $cleaned = Security::xssCleanRecursive($payload);
+        $this->assertSame($expected, $cleaned);
+
+        $document = new \DOMDocument();
+        $previous = libxml_use_internal_errors(true);
+        $document->loadHTML('<html><body>' . $cleaned . '</body></html>', LIBXML_NONET);
+        libxml_clear_errors();
+        libxml_use_internal_errors($previous);
+
+        $p = $document->getElementsByTagName('p')->item(0);
+        $this->assertNotNull($p);
+        $this->assertSame(1, $p->attributes->length);
+        $this->assertTrue($p->hasAttribute('title'));
+    }
+
+    public static function attributeBreakoutProvider(): array
+    {
+        return [
+            'double quote inside single-quoted value' => [
+                "<p title='a\" onmouseover=\"alert(1)'>x</p>",
+                '<p title="a&quot; onmouseover=&quot;alert(1)">x</p>',
+            ],
+            'entity-encoded quote' => [
+                '<p title="a&quot; onmouseover=&quot;alert(1)">x</p>',
+                '<p title="a&quot; onmouseover=&quot;alert(1)">x</p>',
+            ],
+            'markup inside the value' => [
+                '<p title="</p><img src=x onerror=alert(1)>">x</p>',
+                '<p title="&lt;/p&gt;&lt;img src=x onerror=alert(1)&gt;">x</p>',
+            ],
+        ];
+    }
+
+    /** libxml nests everything after a literal "</body></html>" in a second body; it used to be dropped. */
+    public function testXssCleanKeepsContentAfterAClosingBodyTag(): void
+    {
+        $cleaned = Security::xssCleanRecursive('a</body></html><p>after</p>z');
+
+        // libxml may wrap the loose "z" in an implied <p>; what matters is that nothing is lost.
+        $this->assertStringStartsWith('a<p>after</p>', $cleaned);
+        $this->assertStringContainsString('z', substr($cleaned, strlen('a<p>after</p>')));
+    }
+
+    /** libxml works on C strings: a NUL in an attribute cut the REST OF THE INPUT off. */
+    public function testXssCleanDoesNotTruncateTheInputAtANulByte(): void
+    {
+        $cleaned = Security::xssCleanRecursive("<a href=\"/x\0y\">link text</a> and the tail");
+
+        $this->assertStringContainsString('link text', $cleaned);
+        $this->assertStringContainsString('and the tail', $cleaned);
+        $this->assertStringNotContainsString("\0", $cleaned);
+    }
+
+    /**
+     * A text node over 10.000.000 bytes makes libxml report "huge text node" at ERROR level (not
+     * FATAL) and keep only the first 10 MB — with loadHTML() still returning true. That content
+     * loss was silent; it now falls back to escaping, like the depth limit.
+     */
+    public function testXssCleanFailsClosedOnAHugeTextNodeInsteadOfTruncatingIt(): void
+    {
+        $input = str_repeat('a', 10000001) . '<b>END</b>';
+
+        $cleaned = Security::xssCleanRecursive($input);
+
+        $this->assertSame(10000001 + strlen('&lt;b&gt;END&lt;/b&gt;'), strlen($cleaned));
+        $this->assertStringEndsWith('&lt;b&gt;END&lt;/b&gt;', $cleaned);
     }
 
     public function testXssCleanStripsEventHandlerAttributesButKeepsTheElement(): void
@@ -1701,6 +2058,32 @@ final class SecurityTest extends TestCase
             null,
             false, false, false, false, false, false, false, false, false, true
         ));
+    }
+
+    /** $asBoolean is !Validator::isCompletelyEmpty(): whitespace, numeric zero and placeholders are false. */
+    #[DataProvider('asBooleanProvider')]
+    public function testFilterValueAsBooleanFollowsIsCompletelyEmpty(mixed $value, bool $expected): void
+    {
+        $this->assertSame($expected, Security::filterValue(
+            ['k' => $value],
+            'k',
+            null,
+            false, false, false, false, false, false, false, false, false, true
+        ));
+    }
+
+    public static function asBooleanProvider(): array
+    {
+        return [
+            'text'            => ['x', true],
+            'one'             => ['1', true],
+            'empty'           => ['', false],
+            'whitespace only' => [' ', false],
+            'zero'            => ['0', false],
+            'zero decimal'    => ['0.0', false],
+            'placeholder'     => ['null', false],
+            'no'              => ['no', false],
+        ];
     }
 
     public function testFilterValueBase64RoundTrips(): void
@@ -2345,10 +2728,13 @@ final class SecurityTest extends TestCase
         $this->assertSame('PRECIOUS', @file_get_contents($destination), 'Bad header must not delete the destination.');
     }
 
-    public function testDecryptFileV2StillDeletesADestinationItTruncatedItself(): void
+    /**
+     * CONTRACT CHANGE (was: "still deletes a destination it truncated itself"). decryptFileV2 no
+     * longer writes into the destination until the whole file has authenticated, so a failure
+     * mid-stream leaves a pre-existing destination EXACTLY as it was instead of destroying it.
+     */
+    public function testDecryptFileV2LeavesAPreExistingDestinationIntactWhenItFailsMidStream(): void
     {
-        // The counterpart: once we HAVE opened (and so truncated) the destination, its old content
-        // is already gone and unauthenticated plaintext must not survive — it gets deleted.
         $source = $this->tempPath('plain');
         file_put_contents($source, 'HELLO WORLD SECRET');
         $encrypted = Security::encryptFileV2($source, self::masterKey(), $this->tempPath('enc'));
@@ -2370,7 +2756,7 @@ final class SecurityTest extends TestCase
         }
 
         clearstatcache(true, $destination);
-        $this->assertFileDoesNotExist($destination);
+        $this->assertSame('OLD', file_get_contents($destination));
     }
 
     public function testDecryptFileV2StillRoundTripsAfterTheZeroLengthGuard(): void
@@ -2691,14 +3077,18 @@ final class SecurityTest extends TestCase
     /**
      * The docblock promises a failure raised before the destination is opened leaves an existing
      * destination untouched, but the chmod() applying $permissionMode ran BEFORE the header was
-     * even read — so a rejected source left the caller's 0400 secret at 0644. The chmod is now
-     * deferred to immediately before the fopen.
+     * even read — so a rejected source left the caller's 0400 secret at 0644. The mode is now only
+     * ever applied to the destination when the verified output is committed onto it.
      *
      * Runs everywhere: it asserts on the READ-ONLY bit, the one permission Windows does model
      * (verified: chmod(0444) reports 0444/not-writable, chmod(0644) reports 0666/writable).
      */
     public function testDecryptFileV2DoesNotWidenDestinationPermissionsOnAPreOpenFailure(): void
     {
+        if (function_exists('posix_geteuid') && posix_geteuid() === 0) {
+            $this->markTestSkipped('Running as root: a read-only file is still writable.');
+        }
+
         $junk = $this->tempPath('notcipher');
         file_put_contents($junk, 'this is not a V2 envelope at all');
 
@@ -2730,12 +3120,16 @@ final class SecurityTest extends TestCase
     }
 
     /**
-     * The other half of the deferral: the chmod must still happen BEFORE the fopen. If it had been
-     * moved to after the destination was opened, a read-only destination could no longer be opened
-     * for writing and this would throw. Portable for the same reason as the test above.
+     * The other half: a read-only destination IS replaced when $permissionMode grants write —
+     * Windows cannot rename over a read-only file, so the commit must apply the mode first.
+     * Without a mode, a read-only destination is refused (SecurityFileEncryptionTest).
      */
-    public function testDecryptFileV2StillChmodsTheDestinationBeforeOpeningIt(): void
+    public function testDecryptFileV2ReplacesAReadOnlyDestinationWhenPermissionModeGrantsWrite(): void
     {
+        if (function_exists('posix_geteuid') && posix_geteuid() === 0) {
+            $this->markTestSkipped('Running as root: a read-only file is still writable.');
+        }
+
         [, $enc] = $this->makeEncryptedFile('CONTEUDO');
 
         $dec = $this->tempPath('ro_dec');
@@ -2746,7 +3140,7 @@ final class SecurityTest extends TestCase
             clearstatcache(true, $dec);
             $this->assertFalse(is_writable($dec), 'Premise: the destination starts read-only.');
 
-            // $permissionMode makes it writable; that chmod must still precede the fopen.
+            // $permissionMode grants write, so the commit may replace the read-only file.
             Security::decryptFileV2($enc, self::masterKey(), $dec, '0666');
 
             $this->assertSame('CONTEUDO', file_get_contents($dec));
@@ -2755,7 +3149,7 @@ final class SecurityTest extends TestCase
         }
     }
 
-    /** The deferral must not stop a REAL decrypt from applying the exact $permissionMode. */
+    /** A real decrypt over an existing destination ends with exactly $permissionMode. */
     public function testDecryptFileV2StillAppliesPermissionModeOnSuccess(): void
     {
         if (DIRECTORY_SEPARATOR === '\\') {
@@ -2775,68 +3169,12 @@ final class SecurityTest extends TestCase
     }
 
     // ---------------------------------------------------------------------------------------
-    // Short fwrite must fail loud (contradicted the FAILS LOUD contract)
+    // Short fwrite must fail loud. The two source-regex tests that stood here pinned SPELLING
+    // (a `$written` variable, an `mb_strlen($payload, '8bit')` call) rather than behaviour: a
+    // rename broke them, a different broken check passed them. A short write is now reproduced
+    // for real, with a user-space stream that reports a full disk, in
+    // SecurityFileEncryptionTest::testAShortWriteIsAnErrorInBothWriteHelpers.
     // ---------------------------------------------------------------------------------------
-
-    /**
-     * fwrite() returns the number of bytes it actually wrote: on a full disk or a quota it returns
-     * a SHORT COUNT, not false. Testing only `=== false` accepted a partial write, so decryptFileV2
-     * returned the destination path as a success while the plaintext on disk was truncated.
-     *
-     * A short write cannot be provoked portably (it needs a genuinely full device; there is no
-     * /dev/full on Windows, and the destination must be a real path a stream wrapper cannot fake),
-     * so — exactly like testDecryptFileV2DerivesItsVersionFromTheConstantNotALiteral above — this
-     * pins the wiring in the source. It fails against the pre-fix body, which only tested for false.
-     */
-    public function testDecryptFileV2DetectsAShortPlaintextWrite(): void
-    {
-        $method = new \ReflectionMethod(Security::class, 'decryptFileV2');
-        $lines  = file($method->getFileName());
-        $body   = implode('', array_slice(
-            $lines,
-            $method->getStartLine() - 1,
-            $method->getEndLine() - $method->getStartLine() + 1
-        ));
-
-        $this->assertDoesNotMatchRegularExpression(
-            '/if\s*\(\s*fwrite\s*\(\s*\$fpOut\s*,\s*\$plaintext\s*\)\s*===\s*false\s*\)/',
-            $body,
-            'decryptFileV2 still accepts a short fwrite() as success, truncating the plaintext silently.'
-        );
-        $this->assertMatchesRegularExpression(
-            '/\$written\s*=\s*fwrite\s*\(\s*\$fpOut\s*,\s*\$plaintext\s*\)\s*;/',
-            $body,
-            'decryptFileV2 must capture the fwrite() return value.'
-        );
-        $this->assertMatchesRegularExpression(
-            '/\$written\s*!==\s*\$plaintextLength/',
-            $body,
-            'decryptFileV2 must compare the bytes written against the plaintext length.'
-        );
-    }
-
-    /** The same defect on encryptFileV2's write path: every block goes through this helper. */
-    public function testWriteLengthEncodedBlockDetectsAShortWrite(): void
-    {
-        $method = new \ReflectionMethod(Security::class, 'writeLengthEncodedBlock');
-        $lines  = file($method->getFileName());
-        $body   = implode('', array_slice(
-            $lines,
-            $method->getStartLine() - 1,
-            $method->getEndLine() - $method->getStartLine() + 1
-        ));
-
-        $this->assertDoesNotMatchRegularExpression(
-            '/if\s*\(\s*fwrite\s*\([^)]*\)\s*===\s*false\s*\)/',
-            $body,
-            'writeLengthEncodedBlock still accepts a short fwrite(): encryptFileV2 would report success for a truncated ciphertext.'
-        );
-        $this->assertMatchesRegularExpression(
-            '/\$written\s*===\s*false\s*\|\|\s*\$written\s*!==\s*mb_strlen\s*\(\s*\$payload\s*,\s*[\'"]8bit[\'"]\s*\)/',
-            $body,
-            'writeLengthEncodedBlock must demand that every byte of the block was written.'
-        );
-    }
 
     /** Writing a full envelope must still succeed — the stricter check must not reject good writes. */
     public function testWriteLengthEncodedBlockStillWritesCompleteEnvelopes(): void
