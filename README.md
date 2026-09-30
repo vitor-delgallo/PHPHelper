@@ -74,10 +74,12 @@ container, no configuration file.
 
 ```bash
 composer config repositories.phphelper vcs https://github.com/vitor-delgallo/PHPHelper
-composer require vitor-delgallo/phphelper:dev-master
+composer require vitor-delgallo/phphelper:^1.0
 ```
 
-Then require only the optional packages you use, e.g. `composer require phpmailer/phpmailer`.
+Use `dev-master` instead of `^1.0` to track the latest unreleased code. Then require only the
+optional packages you use, e.g. `composer require phpmailer/phpmailer`. Release notes are on the
+[releases page](https://github.com/vitor-delgallo/PHPHelper/releases).
 
 ---
 
