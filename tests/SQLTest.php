@@ -254,14 +254,17 @@ final class SQLTest extends TestCase {
         self::assertSame('same', SQL::decryptDataDB($b, self::KEY, 't.c:1'));
     }
 
-    public function testEncryptDataDBReturnsEmptyStringForNullAndEmptyInput(): void {
-        self::assertSame('', SQL::encryptDataDB(null, self::KEY, 't.c:1'));
-        self::assertSame('', SQL::encryptDataDB('', self::KEY, 't.c:1'));
+    public function testEncryptDataDBPassesNullThroughAndEncryptsAnEmptyString(): void {
+        self::assertNull(SQL::encryptDataDB(null, self::KEY, 't.c:1'));
+        self::assertSame('', SQL::decryptDataDB(SQL::encryptDataDB('', self::KEY, 't.c:1'), self::KEY, 't.c:1'));
     }
 
-    public function testDecryptDataDBReturnsEmptyStringForNullAndEmptyInput(): void {
-        self::assertSame('', SQL::decryptDataDB(null, self::KEY, 't.c:1'));
-        self::assertSame('', SQL::decryptDataDB('', self::KEY, 't.c:1'));
+    public function testDecryptDataDBPassesNullThroughAndRejectsABlankValue(): void {
+        self::assertNull(SQL::decryptDataDB(null, self::KEY, 't.c:1'));
+
+        $this->expectException(\Exception::class);
+        $this->expectExceptionMessage('Empty value');
+        SQL::decryptDataDB('', self::KEY, 't.c:1');
     }
 
     /** The whole point of the AAD: a ciphertext lifted from one cell must not decrypt in another. */

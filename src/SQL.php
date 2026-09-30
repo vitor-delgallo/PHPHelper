@@ -134,16 +134,16 @@ class SQL {
      *
      * Thin pass-through to {@see Security::encryptDataDB()}; see it for the envelope format.
      *
-     * @param mixed $str The string to encrypt
-     * @param string $key The encryption key
-     * @param string $aad Context to bind, e.g. "{table}.{column}:{row_id}". REQUIRED and should be
-     *                    unique per logical cell. An empty AAD is rejected to forbid an unbound value.
+     * @param mixed $str The value to encrypt; null stays null, "" is encrypted
+     * @param string|Keyring $key The encryption key, or a keyring (its current key is used)
+     * @param string $aad Context to bind — build it with Security::dbContext(). REQUIRED and unique
+     *                    per logical cell. An empty AAD is rejected to forbid an unbound value.
      * @param string|null $salt Optional per-subject salt for key derivation
      *
-     * @return string
+     * @return string|null
      * @throws \Exception
      */
-    public static function encryptDataDB(mixed $str, string $key, string $aad, ?string $salt = ""): string {
+    public static function encryptDataDB(#[\SensitiveParameter] mixed $str, #[\SensitiveParameter] string|Keyring $key, string $aad, ?string $salt = ""): ?string {
         return Security::encryptDataDB($str, $key, $aad, $salt);
     }
 
@@ -151,18 +151,18 @@ class SQL {
      * Decrypts a message after verifying its integrity using "aes-256-gcm".
      *
      * Thin pass-through to {@see Security::decryptDataDB()}. Fails loud: on a wrong key, a wrong
-     * AAD, a tampered envelope or an unknown version it THROWS — it never returns a falsy value a
-     * caller could mistake for success.
+     * AAD, a tampered or blank envelope, an unknown key id or an unknown version it THROWS — it
+     * never returns a value a caller could mistake for success. null stays null.
      *
      * @param string|null $str Encrypted message
-     * @param string $key Encryption key
+     * @param string|Keyring $key Encryption key, or a keyring holding it
      * @param string $aad The same context bound at encryption time. REQUIRED.
      * @param string|null $salt The same per-subject salt used at encryption time
      *
-     * @return string
+     * @return string|null
      * @throws \Exception
      */
-    public static function decryptDataDB(?string $str, string $key, string $aad, ?string $salt = ""): string {
+    public static function decryptDataDB(?string $str, #[\SensitiveParameter] string|Keyring $key, string $aad, ?string $salt = ""): ?string {
         return Security::decryptDataDB($str, $key, $aad, $salt);
     }
 

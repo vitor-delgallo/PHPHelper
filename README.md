@@ -33,11 +33,12 @@ container, no configuration file.
 | `File` | Directories, temp files, `.env` read/update, zip/unzip, uploads, file downloads, recursive delete (never follows links) |
 | `Formatter` | Number formatting (`R$ 1.234,56`), CPF/CNPJ/CEP masks, flat list → nested tree |
 | `HTTP` | cURL requests (`callWebService`), status headers, client IP, `Accept-Language`, JSON/XML responses, downloads |
+| `Keyring` | The keys `Security` uses: one current key plus previous keys, for key rotation |
 | `Mailer` | E-mail through PHPMailer: attachments, embedded images, provider shortcuts (Gmail, Office 365, …) |
 | `Number` | Rounding (round/floor/ceil), random decimals, parity |
 | `Parser` | Conversions: array ↔ XML/object, JSON extraction, base64/base64url, hex/binary, booleans, text lines |
 | `S3Storage` | Upload, download, copy, move, delete, list and find objects on Amazon S3 or an S3-compatible endpoint |
-| `Security` | Field, file and string encryption, blind-index hashes, passwords (Argon2id), XSS sanitizing, input filtering |
+| `Security` | Field, file and string encryption, key generation and rotation, blind-index hashes, passwords (Argon2id), XSS sanitizing, input filtering |
 | `Spreadsheet` | Reads `.xlsx` / `.xls` / `.ods` / `.csv` / `.html` into arrays |
 | `SQL` | Literal escaping and batched MySQL `INSERT … ON DUPLICATE KEY UPDATE` builder |
 | `Str` | Multibyte-safe string helpers: accents, casing, substrings, occurrences, random keys and GUIDs |
@@ -116,22 +117,33 @@ $body = HTTP::callWebService(
 
 ### Encryption
 
-Keys must be **at least 32 bytes** (e.g. `random_bytes(32)`, stored outside the database).
+Generate a key once and keep it outside the code and the database — an environment variable or a
+secrets file:
+
+```bash
+php -r "echo base64_encode(random_bytes(32)), PHP_EOL;"    # or Security::generateKey()
+```
 
 ```php
-use VD\PHPHelper\Security;
+use VD\PHPHelper\{Keyring, Security};
+
+// The current key, plus (after a rotation) the old one, still needed to read older values
+$keys = Keyring::fromBase64(getenv('APP_CRYPTO_KEY'), getenv('APP_CRYPTO_KEY_OLD'));
 
 // A database cell, bound to where it lives: moved to another row/column, it no longer decrypts
-$aad    = "customers.document:{$customerId}";
-$cipher = Security::encryptDataDB('529.982.247-25', $key, $aad);   // 'v1:…'
-$plain  = Security::decryptDataDB($cipher, $key, $aad);            // throws if tampered or moved
+$aad    = Security::dbContext('customers', 'document', $customerId);
+$cipher = Security::encryptDataDB('529.982.247-25', $keys, $aad);  // 'v2:{key id}:…'
+$plain  = Security::decryptDataDB($cipher, $keys, $aad);           // throws if tampered, moved or blanked
+
+// null stays null; '' is encrypted like any other value, and a blank column throws on decrypt
+Security::encryptDataDB(null, $keys, $aad);                        // null
 
 // Deterministic blind index, to search an encrypted column
-$hash = Security::generateSearchHash('529.982.247-25', $key);      // 64 hex chars
+$hash = Security::generateSearchHash('529.982.247-25', $keys);     // 64 hex chars
 
 // Files: streamed block by block and authenticated end to end
-Security::encryptFileV2('/data/report.pdf', $key, '/data/report.pdf.enc');
-Security::decryptFileV2('/data/report.pdf.enc', $key, '/tmp/report.pdf');
+Security::encryptFileV2('/data/report.pdf', $keys, '/data/report.pdf.enc');
+Security::decryptFileV2('/data/report.pdf.enc', $keys, '/tmp/report.pdf');
 
 // Passwords (Argon2id)
 $stored = Security::encryptPassword($password);
@@ -142,8 +154,10 @@ Security::xssCleanRecursive(['bio' => '<b>hi</b><img src=x onerror=alert(1)>']);
 // ['bio' => '<b>hi</b><img src="x" />']
 ```
 
-Read **[`SECURITY.md`](SECURITY.md)** before relying on these: it documents the exact cryptographic
-contract, the file format limits and what remains the caller's responsibility.
+A plain 32-byte string works wherever a `Keyring` does. Read **[`SECURITY.md`](SECURITY.md)** before
+relying on these: it documents the exact cryptographic contract, key rotation, how to protect a
+value against replay with `dbContext(..., $version)`, the file format limits and what remains the
+caller's responsibility.
 
 ---
 

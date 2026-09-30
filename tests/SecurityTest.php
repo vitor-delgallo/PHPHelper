@@ -152,7 +152,7 @@ final class SecurityTest extends TestCase
         $plain = 'Formula #1: NaOH 4%';
         $envelope = Security::encryptDataDB($plain, self::masterKey(), self::AAD);
 
-        $this->assertStringStartsWith('v1:', $envelope);
+        $this->assertStringStartsWith('v2:' . Security::keyId(self::masterKey()) . ':', $envelope);
         $this->assertSame($plain, Security::decryptDataDB($envelope, self::masterKey(), self::AAD));
     }
 
@@ -186,11 +186,14 @@ final class SecurityTest extends TestCase
     {
         $envelope = Security::encryptDataDB('secret', self::masterKey(), self::AAD);
 
-        $raw = base64_decode(substr($envelope, 3));
+        [$version, $keyId, $payload] = explode(':', $envelope, 3);
+        $raw = base64_decode($payload, true);
         $raw[strlen($raw) - 1] = chr(ord($raw[strlen($raw) - 1]) ^ 0x01);
 
+        // Only the ciphertext changed: the version and key id stay valid, so this reaches the tag.
         $this->expectException(\Exception::class);
-        Security::decryptDataDB('v1:' . base64_encode($raw), self::masterKey(), self::AAD);
+        $this->expectExceptionMessage('authentication tag mismatch');
+        Security::decryptDataDB("{$version}:{$keyId}:" . base64_encode($raw), self::masterKey(), self::AAD);
     }
 
     public function testDecryptDataDbRejectsUnknownEnvelopeVersion(): void
@@ -208,14 +211,14 @@ final class SecurityTest extends TestCase
 
         $this->expectException(\Exception::class);
         $this->expectExceptionMessage('missing version prefix');
-        Security::decryptDataDB(substr($envelope, 3), self::masterKey(), self::AAD);
+        Security::decryptDataDB(explode(':', $envelope, 3)[2], self::masterKey(), self::AAD);
     }
 
     public function testDecryptDataDbRejectsTooShortPayload(): void
     {
         $this->expectException(\Exception::class);
         $this->expectExceptionMessage('too short');
-        Security::decryptDataDB('v1:' . base64_encode('abc'), self::masterKey(), self::AAD);
+        Security::decryptDataDB('v2:' . Security::keyId(self::masterKey()) . ':' . base64_encode('abc'), self::masterKey(), self::AAD);
     }
 
     public function testEncryptDataDbRejectsEmptyAad(): void
@@ -234,12 +237,35 @@ final class SecurityTest extends TestCase
         Security::decryptDataDB($envelope, self::masterKey(), '');
     }
 
-    public function testEmptyValuesRoundTripToEmptyStringWithoutEncrypting(): void
+    /**
+     * null is "no value" and passes through; "" is a VALUE and is encrypted like any other, so a
+     * blank column can never be mistaken for a legitimate ciphertext (see the next test).
+     */
+    public function testNullPassesThroughAndAnEmptyStringIsEncryptedForReal(): void
     {
-        $this->assertSame('', Security::encryptDataDB('', self::masterKey(), self::AAD));
-        $this->assertSame('', Security::encryptDataDB(null, self::masterKey(), self::AAD));
-        $this->assertSame('', Security::decryptDataDB('', self::masterKey(), self::AAD));
-        $this->assertSame('', Security::decryptDataDB(null, self::masterKey(), self::AAD));
+        $this->assertNull(Security::encryptDataDB(null, self::masterKey(), self::AAD));
+        $this->assertNull(Security::decryptDataDB(null, self::masterKey(), self::AAD));
+
+        $envelope = Security::encryptDataDB('', self::masterKey(), self::AAD);
+        $this->assertStringStartsWith('v2:', $envelope);
+        $this->assertSame('', Security::decryptDataDB($envelope, self::masterKey(), self::AAD));
+
+        // Still bound to its context like any other value.
+        $this->expectException(\Exception::class);
+        $this->expectExceptionMessage('authentication tag mismatch');
+        Security::decryptDataDB($envelope, self::masterKey(), self::AAD2);
+    }
+
+    /**
+     * FINDING (item 4 of the crypto review): "" used to decrypt to "" without an error, so an
+     * attacker with write access to the database could blank a value and the application read it
+     * as a legitimately empty one. A blank envelope now throws.
+     */
+    public function testDecryptDataDbRejectsABlankValue(): void
+    {
+        $this->expectException(\Exception::class);
+        $this->expectExceptionMessage('Empty value');
+        Security::decryptDataDB('', self::masterKey(), self::AAD);
     }
 
     /** A fresh GCM nonce per call: identical plaintexts must not produce identical envelopes. */
@@ -365,12 +391,13 @@ final class SecurityTest extends TestCase
     public function testDecryptLocalRejectsTamperedPayload(): void
     {
         $encrypted = Security::encryptLocal('local secret', self::masterKey());
-        $raw = base64_decode($encrypted);
+        [$version, $keyId, $payload] = explode(':', $encrypted, 3);
+        $raw = base64_decode($payload, true);
         $raw[strlen($raw) - 1] = chr(ord($raw[strlen($raw) - 1]) ^ 0x01);
 
         $this->expectException(\Exception::class);
         $this->expectExceptionMessage('MAC does not match');
-        Security::decryptLocal(base64_encode($raw), self::masterKey());
+        Security::decryptLocal("{$version}:{$keyId}:" . base64_encode($raw), self::masterKey());
     }
 
     public function testDecryptLocalRejectsWrongKey(): void
@@ -385,7 +412,7 @@ final class SecurityTest extends TestCase
     {
         $this->expectException(\Exception::class);
         $this->expectExceptionMessage('too short');
-        Security::decryptLocal(base64_encode('short'), self::masterKey());
+        Security::decryptLocal('l1:' . Security::keyId(self::masterKey()) . ':' . base64_encode('short'), self::masterKey());
     }
 
     /**
@@ -433,12 +460,21 @@ final class SecurityTest extends TestCase
         }
     }
 
-    public function testEncryptLocalReturnsEmptyStringForNullOrEmpty(): void
+    public function testEncryptLocalPassesNullThroughAndEncryptsAnEmptyString(): void
     {
-        $this->assertSame('', Security::encryptLocal(null, self::masterKey()));
-        $this->assertSame('', Security::encryptLocal('', self::masterKey()));
-        $this->assertSame('', Security::decryptLocal(null, self::masterKey()));
-        $this->assertSame('', Security::decryptLocal('', self::masterKey()));
+        $this->assertNull(Security::encryptLocal(null, self::masterKey()));
+        $this->assertNull(Security::decryptLocal(null, self::masterKey()));
+
+        $encrypted = Security::encryptLocal('', self::masterKey());
+        $this->assertStringStartsWith('l1:' . Security::keyId(self::masterKey()) . ':', $encrypted);
+        $this->assertSame('', Security::decryptLocal($encrypted, self::masterKey()));
+    }
+
+    public function testDecryptLocalRejectsABlankValue(): void
+    {
+        $this->expectException(\Exception::class);
+        $this->expectExceptionMessage('Empty value');
+        Security::decryptLocal('', self::masterKey());
     }
 
     public function testEncryptLocalUsesFreshNoncePerCall(): void
@@ -484,12 +520,21 @@ final class SecurityTest extends TestCase
         ));
     }
 
-    public function testEncryptCrossPlatformPassesThroughNullAndEmptyUnchanged(): void
+    public function testEncryptCrossPlatformPassesNullThroughAndEncryptsAnEmptyString(): void
     {
         $this->assertNull(Security::encryptCrossPlatform(null, self::masterKey()));
-        $this->assertSame('', Security::encryptCrossPlatform('', self::masterKey()));
         $this->assertNull(Security::decryptCrossPlatform(null, self::masterKey()));
-        $this->assertSame('', Security::decryptCrossPlatform('', self::masterKey()));
+
+        $encrypted = Security::encryptCrossPlatform('', self::masterKey());
+        $this->assertNotSame('', $encrypted);
+        $this->assertSame('', Security::decryptCrossPlatform($encrypted, self::masterKey()));
+    }
+
+    public function testDecryptCrossPlatformRejectsABlankValue(): void
+    {
+        $this->expectException(\Exception::class);
+        $this->expectExceptionMessage('Empty value');
+        Security::decryptCrossPlatform('', self::masterKey());
     }
 
     public function testEncryptCrossPlatformRejectsShortKey(): void
@@ -573,7 +618,7 @@ final class SecurityTest extends TestCase
         $plaintext = $decrypt->invoke(
             null,
             'W4et1smZeF2JGtYjzkdHbAvaqXb+K1nzzcfY2bTTpgsbPw4TmBFc0I5iwgWoU0hGC9ZuB/UcS1huxOHZe7WqR4Ol/FyNhjDB9bTobZCigAC4Q7GVpjiNCZYwouNfL7R/Nn4GyPjOGLY+E/9QisBv0tyfP4rLzFHzZzRmxb0skuT5IqP2lox/sBI4+YI=',
-            "áuhêüÖÕ0H_{³¹ßLè\\8ÉñïäzH`&[BÔÍ¨åg_!±Ýp+ãÏÜì 😍"
+            ["áuhêüÖÕ0H_{³¹ßLè\\8ÉñïäzH`&[BÔÍ¨åg_!±Ýp+ãÏÜì 😍"]
         );
 
         $this->assertSame('The quick brown fox выпей чаю 中文测试 𝔣𝔯𝔞𝔨𝔱𝔲𝔯 😉😌😍😘', $plaintext);
@@ -584,7 +629,7 @@ final class SecurityTest extends TestCase
     {
         $decrypt = new \ReflectionMethod(Security::class, 'aesBridgeGcmDecrypt');
 
-        $this->assertSame('', $decrypt->invoke(null, \AesBridge\Gcm::encrypt('', 'passphrase'), 'passphrase'));
+        $this->assertSame('', $decrypt->invoke(null, \AesBridge\Gcm::encrypt('', 'passphrase'), ['passphrase']));
     }
 
     /**
@@ -676,20 +721,23 @@ final class SecurityTest extends TestCase
         $this->assertSame('rendered', Security::decryptLocal(Security::encryptLocal($stringable, self::masterKey()), self::masterKey()));
         $this->assertSame(Security::generateSearchHash('rendered', self::masterKey()), Security::generateSearchHash($stringable, self::masterKey()));
 
-        // An empty rendering behaves like "" — an empty GCM ciphertext would be undecryptable.
-        $this->assertSame('', Security::encryptDataDB($empty, self::masterKey(), self::AAD));
-        $this->assertSame('', Security::encryptLocal($empty, self::masterKey()));
+        // An empty rendering is encrypted like "" and comes back as "".
+        $this->assertSame('', Security::decryptDataDB(Security::encryptDataDB($empty, self::masterKey(), self::AAD), self::masterKey(), self::AAD));
+        $this->assertSame('', Security::decryptLocal(Security::encryptLocal($empty, self::masterKey()), self::masterKey()));
         $this->assertSame('', Security::generateSearchHash($empty, self::masterKey()));
     }
 
-    /** decryptLocal's `string|false` could never produce false after the MAC check: it is `string` now. */
-    public function testDecryptLocalDeclaresAPlainStringReturn(): void
+    /**
+     * decryptLocal's `string|false` could never produce false after the MAC check. It is `?string`:
+     * null only ever comes back for a null input.
+     */
+    public function testDecryptLocalDeclaresANullableStringReturn(): void
     {
         $type = (new \ReflectionMethod(Security::class, 'decryptLocal'))->getReturnType();
 
         $this->assertInstanceOf(\ReflectionNamedType::class, $type);
         $this->assertSame('string', $type->getName());
-        $this->assertFalse($type->allowsNull());
+        $this->assertTrue($type->allowsNull());
     }
 
     /** Only the exact base64 the encryptor emits is accepted — no data-URI prefix leniency. */
@@ -697,8 +745,11 @@ final class SecurityTest extends TestCase
     {
         $envelope = Security::encryptDataDB('secret', self::masterKey(), self::AAD);
 
+        [$version, $keyId, $payload] = explode(':', $envelope, 3);
+
         $this->expectException(\Exception::class);
-        Security::decryptDataDB('v1:data:text/plain;base64,' . substr($envelope, 3), self::masterKey(), self::AAD);
+        $this->expectExceptionMessage('Invalid base64');
+        Security::decryptDataDB("{$version}:{$keyId}:data:text/plain;base64,{$payload}", self::masterKey(), self::AAD);
     }
 
     // ---------------------------------------------------------------------------------------

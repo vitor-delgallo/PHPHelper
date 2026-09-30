@@ -2,10 +2,71 @@
 
 This document records the cryptographic contract of the library and the security-relevant behavior
 of the other helpers. Tests are the PHPUnit suite (`composer test`); the crypto tests live in
-`tests/SecurityTest.php` and `tests/SecurityFileEncryptionTest.php`.
+`tests/SecurityTest.php`, `tests/SecurityKeysTest.php` and `tests/SecurityFileEncryptionTest.php`.
 
 > **Breaking changes** were made deliberately — the library is not consumed by any production
-> project, so signatures and behavior changed wherever that closed a real weakness.
+> project, so signatures, formats and behavior changed wherever that closed a real weakness.
+
+## Keys
+
+Everything below is only as strong as the master key and where it is kept.
+
+**Make keys with `Security::generateKey()`** (base64 of 32 random bytes) and load them with
+`Security::keyFromBase64()` or `Keyring::fromBase64()`, which accept exactly 32 bytes. Every method
+also accepts any string of at least 32 bytes, but a passphrase typed by a person is weak: HKDF is
+fast and adds no strength, so it can be brute-forced offline from a single ciphertext.
+
+```bash
+php -r "echo base64_encode(random_bytes(32)), PHP_EOL;"   # same as Security::generateKey()
+```
+
+```php
+$keys = Keyring::fromBase64(getenv('APP_CRYPTO_KEY'), getenv('APP_CRYPTO_KEY_OLD'));
+```
+
+**Where to keep it**
+- In an environment variable or a file outside the web root, readable only by the application's
+  user. Never in the repository, never in the database or its backups — encryption at rest
+  protects a leaked dump or backup only while the key is not in it.
+- With an **offline copy** (a password manager or vault). A lost key means the data is lost: there
+  is no recovery.
+- Encryption at rest does **not** protect against an attacker who controls the application server:
+  the key is there. Keep the database user of the application on the least privileges it needs,
+  which also limits what an SQL injection can write (see *Replay*).
+
+**Key ids.** `Security::keyId($key)` is a 16-hex fingerprint of a key (HKDF, info `key-id`); it
+reveals nothing about the key. The DB and local envelopes carry the id of the key that wrote them.
+
+**Hygiene.** Every key and plaintext parameter is marked `#[\SensitiveParameter]`, so it is redacted
+from stack traces. A `Keyring` shows only its key ids in `var_dump()`/`print_r()` and cannot be
+serialized; do not `var_export()` it (PHP offers no hook to hide private properties there).
+
+### Key rotation — `Keyring`
+
+A `Keyring` holds one **current** key, used for every encryption, and any number of **previous**
+keys, used only to decrypt what they wrote. Every method that takes `$key` accepts a plain string
+(a keyring of one) or a `Keyring`.
+
+1. Generate a new key and deploy `Keyring::fromBase64(NEW, OLD)`. From then on everything new is
+   written under NEW and everything old still reads.
+2. Migrate what is still under OLD:
+   - **DB values** — the envelope says which key wrote it:
+     ```php
+     $rows = $db->fetchAll("SELECT id, cpf_enc FROM users WHERE cpf_enc NOT LIKE ?", ['v2:' . $keys->currentId() . ':%']);
+     foreach ($rows as $row) {
+         $aad = Security::dbContext('users', 'cpf', $row['id']);
+         $db->execute('UPDATE users SET cpf_enc = ? WHERE id = ?', [Security::reencryptDataDB($row['cpf_enc'], $keys, $aad), $row['id']]);
+     }
+     ```
+   - **Blind indexes** — recompute each row's hash with the current key (decrypt the value, then
+     `generateSearchHash`). While that runs, search with every key:
+     `WHERE email_hash IN (...Security::generateSearchHashes($email, $keys))`.
+   - **Files and cross-platform values** carry no key id: `decryptFileV2`/`decryptCrossPlatform`
+     try each key of the keyring. Re-encrypt them (decrypt with the keyring, encrypt again) and
+     keep track of which ones are done.
+   - **Local values** (`encryptLocal`) are usually short-lived tokens: let them expire, or
+     re-encrypt them like DB values.
+3. When nothing is left under OLD, remove it from the keyring and destroy it.
 
 ## Cryptographic contract
 
@@ -14,30 +75,99 @@ of the other helpers. Tests are the PHPUnit suite (`composer test`); the crypto 
   `search-hash`, …) so unrelated subsystems never share a key.
 - **Randomness fails closed.** Nonces come from `random_bytes()` with no weak fallback; if no strong
   RNG is available the call throws instead of encrypting with a predictable nonce.
-- **Decryption of a tampered/relocated value THROWS.** It never returns a falsy value a caller could
+- **Decryption of a tampered/relocated value THROWS.** It never returns a value a caller could
   mistake for success. This includes `decryptCrossPlatform` (aes-bridge itself returns `""` on an
   authentication failure; the library parses the format itself and throws instead).
+- **`null` is "no value"; `""` is a value.** `null` passes through every encrypt/decrypt method
+  unchanged. An empty string is **encrypted like any other value**, so no method ever produces
+  `""` — and decrypting `""` **throws** (`Empty value: …`). A column someone blanked out is
+  therefore detected instead of reading back as a legitimately empty value.
 - **Non-scalar input is refused.** Arrays and plain objects throw `InvalidArgumentException` instead
   of being encrypted (or blind-indexed) as the literal text `"Array"`.
-- **Empty in, empty out.** `null` and `""` are not encrypted: the encrypt functions return `""`, and
-  decrypting `""` returns `""` without an error. A ciphertext that was deleted or blanked therefore
-  reads back as an empty value, not as a failure — if an empty value is never legitimate for a
-  field, check for it yourself.
 
 ### Field encryption — `encryptDataDB` / `decryptDataDB`
 
 AES-256-GCM with a **required AAD** binding each value to its location, and a self-describing
-versioned envelope `"v1:" + base64(iv || tag || ciphertext)`. The version is folded into the AAD.
+envelope `"v2:{key id}:" + base64(iv || tag || ciphertext)`. The version, the key id and the AAD are
+all authenticated (GCM AAD `v2|{key id}|{aad}`). Envelopes of the earlier `v1` format are no longer
+read.
+
+Build the AAD with **`Security::dbContext($table, $column, $rowId, $version = null)`**: one
+canonical, unambiguous form (hand-built strings like `"a.b:c"` collide when a name contains a
+separator, and two code paths formatting the same cell differently cannot decrypt each other's
+values).
 
 ```php
-$aad = "product_formula.name_encrypted:{$rowId}";   // {table}.{column}:{row_id}
-$ct  = Security::encryptDataDB($plain, $key, $aad, $userSalt);
-$pt  = Security::decryptDataDB($ct, $key, $aad, $userSalt);
+$aad = Security::dbContext('users', 'cpf', $userId);
+$ct  = Security::encryptDataDB($cpf, $keys, $aad, $userSalt);
+$pt  = Security::decryptDataDB($ct, $keys, $aad, $userSalt);
 ```
 
 Without the AAD, a valid ciphertext could be copied from one row/column to another and still
-decrypt. An empty AAD is rejected. Use a **stable per-cell** context and the **same** salt on both
-sides. `encryption_version` (the `"v1"` prefix) allows future key/algorithm rotation.
+decrypt. An empty AAD is rejected. Use the **same** salt on both sides. The AAD must not include
+anything that changes over the row's life other than the version (not an e-mail, not a status), or
+the value stops decrypting when it changes.
+
+#### Replay — and the version in the AAD
+
+GCM proves that a value is **genuine and belongs to this cell**. It cannot prove that it is the
+**latest** value of that cell. An attacker who can write to the database — through an SQL
+injection, a leaked database account, a restored backup — but does not have the key can put back
+an **older genuine value** of the same cell, and it decrypts:
+
+1. Monday: the attacker's wallet holds R$ 1.000. Through the injection they read their own row and
+   save `balance_enc` (`v2:…:Ab3…`).
+2. Tuesday: they spend it all; the application writes a new `balance_enc` (R$ 0).
+3. Wednesday: `UPDATE wallets SET balance_enc = 'v2:…:Ab3…' WHERE id = 42`.
+4. The application decrypts it: same key, same cell, valid tag → `"1000.00"`. Repeat at will.
+
+What the attacker still cannot do: copy another user's balance into their row (another row id is
+another AAD → exception), or invent a value (no key). Replay is limited to values that already
+existed **in that cell** — and without encryption they could simply write any number. It only
+matters for fields where an old value is worth something: balances and limits, roles and
+permissions, a revoked 2FA secret, a rotated token.
+
+**Level 1 — a version in the AAD.** Keep a version column next to the protected value, increment it
+on every write, and bind it with `dbContext(..., $version)`. The version is an ordinary column of
+the same row, so you read it together with the value:
+
+```php
+// Read
+$row = $db->fetch('SELECT id, balance_enc, balance_version FROM wallets WHERE id = ?', [$id]);
+$balance = Security::decryptDataDB(
+    $row['balance_enc'], $keys,
+    Security::dbContext('wallets', 'balance', $row['id'], $row['balance_version'])
+);
+
+// Write: the next version, and only if nobody else wrote in between (optimistic locking)
+$next = $row['balance_version'] + 1;
+$enc  = Security::encryptDataDB($newBalance, $keys, Security::dbContext('wallets', 'balance', $row['id'], $next));
+$db->execute(
+    'UPDATE wallets SET balance_enc = ?, balance_version = ? WHERE id = ? AND balance_version = ?',
+    [$enc, $next, $row['id'], $row['balance_version']]
+); // 0 rows affected: someone else wrote first — reload and retry
+
+// Insert: start at version 1
+```
+
+Now step 3 above fails: the saved value was bound to version 7, the row is at version 8. Prefer one
+version column **per protected value** (`balance_version`); if several encrypted columns share one
+row version, every one of them must be re-encrypted (`Security::reencryptDataDB($value, $keys,
+$oldAad, $newAad)`) whenever it moves.
+
+**What level 1 does not stop:** an attacker who writes the old version number back as well restores
+a consistent old row, and it decrypts. Both columns live in the database they control.
+
+**Level 2 — the latest version outside the database.** Keep the latest version of each protected
+value somewhere the database attacker cannot write (a store with separate credentials) and refuse
+a row whose version is lower on read. This detects a full rollback, at the cost of keeping the two
+in step.
+
+**Level 3 — for money and permissions, do not store a value that changes.** Keep an append-only
+ledger (one encrypted row per movement, AAD bound to the movement's own id) and compute the balance
+from it; give the application's database user only `INSERT`/`SELECT` on that table. An injection can
+then neither delete a debit nor forge a credit (no key), nor re-insert an old credit (its id already
+exists, and under a new id its AAD no longer matches).
 
 ### Blind index — `generateSearchHash`
 
@@ -45,11 +175,24 @@ Keyed HMAC-SHA256 over an HKDF-derived subkey → 64 hex chars, deterministic. U
 per index domain (equal input must map to equal hash for lookup/uniqueness):
 
 ```php
-$hash = Security::generateSearchHash($normalizedEmail, $blindIndexKey); // salt "" = stable
+$hash = Security::generateSearchHash($normalizedEmail, $keys); // current key; salt "" = stable
 ```
 
 Being deterministic, it reveals which rows share a value — inherent to any blind index. Normalize
 the input (case, spaces, masks) before hashing, or equal values will not match.
+
+**A blind index is not authenticated.** Someone who can write to the database can copy the victim's
+hash into their own row, and a lookup by the victim's e-mail then returns the attacker's row. Two
+defenses, both on the application side:
+- Put a **`UNIQUE`** constraint on the hash column of a unique field (e-mail, CPF): the copy then
+  collides with the victim's row.
+- After a lookup, **decrypt the value and compare** it with what was searched:
+  ```php
+  $row = $db->fetch('SELECT id, email_enc FROM users WHERE email_hash = ?', [Security::generateSearchHash($email, $keys)]);
+  if ($row !== null && !hash_equals($email, Security::decryptDataDB($row['email_enc'], $keys, Security::dbContext('users', 'email', $row['id'])))) {
+      throw new RuntimeException('Blind index does not match the stored value');
+  }
+  ```
 
 ### Authenticated files — `encryptFileV2` / `decryptFileV2`
 
@@ -58,6 +201,8 @@ end marker binds the total block count. This defeats **truncation, reordering, d
 cross-file splicing** — all rejected on decrypt. The container encoding (`{len}-{base64}` blocks) is
 parsed strictly, so non-canonical encodings (leading zeros, `+`, whitespace, bad padding) are
 rejected too. The salt is stored in clear in the header (a salt is not a secret); the key never is.
+The format carries no key id: with a `Keyring`, `decryptFileV2` finds the key that authenticates the
+first block.
 
 Two process-global settings (reset with `null`):
 
@@ -71,23 +216,39 @@ exceed the limit — it never writes a file that `decryptFileV2` could not read 
 limit the largest usable block size is 201,326,592 bytes. A file encrypted under a raised limit
 needs that limit on the decrypting side as well; the error message names the size required.
 
+**Keep the default block size in production.** Every block uses a random 96-bit nonce under a key
+shared by all files with the same master key and salt, and the recommended ceiling for random GCM
+nonces is about 2³² blocks per key (NIST SP 800-38D). At 3.2 MB per block that is petabytes; at the
+1-byte blocks the tests use, it is 4 GiB across all files.
+
 Output is written to a hidden staging file next to the destination and renamed into place only on
 success, so a failure (wrong key, tamper, full disk, crash) never destroys an existing destination
 and never leaves unauthenticated plaintext behind. In-place operation (destination == source, by
 any spelling, symlink or hard link) is refused.
 
+What the format does not hide, and what to do about it:
+- **Size and name.** The ciphertext reveals the plaintext size (to the block), and the file name is
+  yours. Store encrypted files under random names (a UUID) and keep the real name encrypted in the
+  database (`encryptDataDB` with `dbContext('files', 'name', $fileId)`).
+- **Staging files.** A crash during decryption can leave a `.phphelper-*.part` file with partial
+  plaintext next to the destination. It is created owner-only on POSIX, but inherits the folder's
+  ACL on Windows. Decrypt into a directory outside the web root with restricted permissions, and
+  remove stale `.phphelper-*.part` files periodically.
+
 ### Local strings — `encryptLocal` / `decryptLocal`
 
-AES-256-CTR with encrypt-then-HMAC-SHA256 (verified with `hash_equals` before decrypt; a wrong key
-or any modification throws). It is **not bound to a context**: a value encrypted under the same key
-and salt decrypts wherever it is pasted. Use `encryptDataDB` with an AAD when a value must not be
-movable.
+AES-256-CTR with encrypt-then-HMAC-SHA256: envelope `"l1:{key id}:" + base64(MAC || IV ||
+ciphertext)`, the MAC covering the prefix too, verified with `hash_equals` before decrypting; a
+wrong key or any modification throws. It is **not bound to a context**: a value encrypted under the
+same key and salt decrypts wherever it is pasted. Use `encryptDataDB` with an AAD when a value must
+not be movable.
 
 ### Cross-platform — `encryptCrossPlatform` / `decryptCrossPlatform`
 
 aes-bridge GCM format. The passphrase handed to aes-bridge is **not** the master key but the raw
 32 bytes of `HKDF-SHA256(master key, salt, info "derived-key")`; a peer must derive the same bytes.
-See the method docblock for the exact recipe.
+See the method docblock for the exact recipe. The format carries no key id: with a `Keyring`,
+`decryptCrossPlatform` tries each key (one PBKDF2 run per key tried).
 
 ### Passwords — `encryptPassword` / `verifyPassword`
 
@@ -124,6 +285,11 @@ Argon2id via `password_hash`/`password_verify`. Never use the encryption helpers
 
 ## Caller responsibilities (not enforced by the library)
 
+- **The key** — generation, storage, backup and rotation, as described under *Keys*.
+- **Replay** — a version per protected value (level 1) is the application's to keep; levels 2 and 3
+  are design decisions. See *Replay*.
+- **Blind-index lookups** — verify the decrypted value after a lookup, and make unique hashes
+  `UNIQUE`. See *Blind index*.
 - **SSRF** — `HTTP::callWebService` has no private-IP/allowlist guard. Do not pass user-controlled
   URLs without an egress allowlist; never disable peer verification in production.
 - **Forwarded client IPs** — only `REMOTE_ADDR` is trustworthy; trust `X-Forwarded-For` only behind

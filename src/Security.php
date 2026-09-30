@@ -43,12 +43,28 @@ class Security {
     private const MIN_KEY_BYTES = 32;
 
     /**
-     * Version tag for the encryptDataDB/decryptDataDB envelope. Emitted as a prefix AND
-     * bound into the GCM AAD, so a value cannot be reinterpreted under another version.
+     * Version tag for the encryptDataDB/decryptDataDB envelope "v2:{key id}:{base64}". Emitted as
+     * a prefix AND bound into the GCM AAD, so a value cannot be reinterpreted under another
+     * version. v1 (no key id) is no longer read.
      *
      * @var string
      */
-    private const DB_ENVELOPE_VERSION = 'v1';
+    private const DB_ENVELOPE_VERSION = 'v2';
+
+    /**
+     * Version tag for the encryptLocal/decryptLocal envelope "l1:{key id}:{base64}". Covered by
+     * the HMAC together with the key id.
+     *
+     * @var string
+     */
+    private const LOCAL_ENVELOPE_VERSION = 'l1';
+
+    /**
+     * Raw bytes behind a key id; it is written hex-encoded (16 characters).
+     *
+     * @var int
+     */
+    private const KEY_ID_BYTES = 8;
 
     /**
      * Version tag for the encryptFileV2/decryptFileV2 authenticated file format.
@@ -107,13 +123,58 @@ class Security {
      *
      * @param string $key Master key
      *
-     * @throws \Exception
+     * @throws \InvalidArgumentException
      * @return void
      */
-    private static function assertKeyLength(string $key): void {
+    private static function assertKeyLength(#[\SensitiveParameter] string $key): void {
         if (strlen($key) < self::MIN_KEY_BYTES) {
-            throw new \Exception("Invalid encryption key. The key must be at least " . self::MIN_KEY_BYTES . " bytes long.");
+            throw new \InvalidArgumentException("Invalid encryption key. The key must be at least " . self::MIN_KEY_BYTES . " bytes long.");
         }
+    }
+
+    /**
+     * A plain key is a keyring of one; a Keyring is used as given.
+     *
+     * @param string|Keyring $key
+     *
+     * @throws \InvalidArgumentException For a key shorter than 32 bytes
+     * @return Keyring
+     */
+    private static function keyring(#[\SensitiveParameter] string|Keyring $key): Keyring {
+        return ($key instanceof Keyring ? $key : new Keyring($key));
+    }
+
+    /**
+     * Splits a "{version}:{key id}:{payload}" envelope and resolves its key in the keyring.
+     *
+     * @param string $envelope Envelope to parse
+     * @param string $version Expected version tag
+     * @param Keyring $keys Keys to resolve the key id against
+     *
+     * @throws \Exception On a malformed envelope, an unsupported version or an unknown key id
+     * @return array{0: string, 1: string, 2: string} [key id, raw master key, payload]
+     */
+    private static function openEnvelope(string $envelope, string $version, Keyring $keys): array {
+        $parts = explode(":", $envelope, 3);
+        if (count($parts) < 2) {
+            throw new \Exception("Malformed envelope: missing version prefix.");
+        }
+        if ($parts[0] !== $version) {
+            throw new \Exception("Unsupported envelope version '" . substr($parts[0], 0, 8) . "' (expected '{$version}').");
+        }
+        if (count($parts) !== 3 || !preg_match('/\A[0-9a-f]{' . (2 * self::KEY_ID_BYTES) . '}\z/', $parts[1])) {
+            throw new \Exception("Malformed envelope: missing or invalid key id.");
+        }
+
+        $key = $keys->get($parts[1]);
+        if ($key === null) {
+            throw new \Exception(
+                "No key with id {$parts[1]} in the keyring: the value was encrypted under a key that was not passed. "
+                . "After a key rotation, pass a Keyring that still holds the old key as a previous key."
+            );
+        }
+
+        return [$parts[1], $key, $parts[2]];
     }
 
     /**
@@ -128,7 +189,7 @@ class Security {
      * @throws \Exception
      * @return string
      */
-    private static function deriveKey(string $key, int $length, ?string $salt = "", string $info = 'derived-key'): string {
+    private static function deriveKey(#[\SensitiveParameter] string $key, int $length, ?string $salt = "", string $info = 'derived-key'): string {
         self::assertKeyLength($key);
 
         return hash_hkdf(
@@ -968,30 +1029,168 @@ class Security {
     }
 
     /**
+     * Generates a new random master key, base64-encoded for an environment variable or a secrets
+     * file. Decode it with keyFromBase64() (or build a Keyring with Keyring::fromBase64()).
+     *
+     * This is the way to make a key. A passphrase typed by a person is accepted by every method as
+     * long as it is 32 bytes, but HKDF is fast and adds no strength, so a guessable passphrase can
+     * be brute-forced offline from a single ciphertext.
+     *
+     * @throws \Exception When no cryptographically strong RNG is available
+     * @return string Base64 of 32 random bytes (44 characters)
+     */
+    public static function generateKey(): string {
+        return base64_encode(self::secureRandomBytes(self::MIN_KEY_BYTES));
+    }
+
+    /**
+     * Decodes a key made by generateKey(). Surrounding whitespace (a trailing newline from a
+     * secrets file) is ignored; anything else must be strict base64 of EXACTLY 32 bytes, so a
+     * truncated or mistyped variable fails here instead of silently becoming another key.
+     *
+     * @param string $encoded Base64-encoded key
+     *
+     * @throws \InvalidArgumentException When the value is not strict base64 of exactly 32 bytes
+     * @return string The raw 32-byte key
+     */
+    public static function keyFromBase64(#[\SensitiveParameter] string $encoded): string {
+        $key = base64_decode(trim($encoded), true);
+        if ($key === false || strlen($key) !== self::MIN_KEY_BYTES) {
+            throw new \InvalidArgumentException(
+                "Invalid key: expected base64 of exactly " . self::MIN_KEY_BYTES . " bytes, as Security::generateKey() produces."
+            );
+        }
+
+        return $key;
+    }
+
+    /**
+     * The id of a master key: 16 hex characters derived from the key with HKDF (info "key-id").
+     * It is written into every DB and local envelope, and it reveals nothing about the key.
+     *
+     * @param string $key Raw master key (>= 32 bytes)
+     *
+     * @throws \InvalidArgumentException For a key shorter than 32 bytes
+     * @return string 16 lowercase hex characters
+     */
+    public static function keyId(#[\SensitiveParameter] string $key): string {
+        self::assertKeyLength($key);
+
+        return bin2hex(hash_hkdf('sha256', $key, self::KEY_ID_BYTES, 'key-id'));
+    }
+
+    /**
+     * Builds the AAD (context) for encryptDataDB/decryptDataDB from where the value lives, in one
+     * canonical, unambiguous form — hand-built strings such as "a.b:c" can collide when a name
+     * contains the separator, and two code paths formatting the same cell differently can no
+     * longer decrypt each other's values.
+     *
+     * $version is the defense against REPLAY: without it, an attacker who can write to the
+     * database (but has no key) can put back an OLDER genuine value of the same cell — an old
+     * balance, an old role — and it decrypts. With a version that the application increments on
+     * every write, an old value no longer matches the row's current version. See SECURITY.md for
+     * how to keep that version and what it does not cover.
+     *
+     * ```php
+     * $aad = Security::dbContext('wallets', 'balance', $row['id'], $row['balance_version']);
+     * ```
+     *
+     * @param string $table Table name (non-empty)
+     * @param string $column Column name (non-empty)
+     * @param string|int $rowId Primary key of the row (non-empty)
+     * @param int|null $version Version of the value (>= 0), or null for a value that is not versioned
+     *
+     * @throws \InvalidArgumentException For an empty name or id, a negative version, or invalid UTF-8
+     * @return string The AAD to pass to encryptDataDB/decryptDataDB (a JSON array)
+     */
+    public static function dbContext(string $table, string $column, string|int $rowId, ?int $version = null): string {
+        $rowId = (string) $rowId;
+        if ($table === '' || $column === '' || $rowId === '') {
+            throw new \InvalidArgumentException("dbContext(): table, column and row id must be non-empty.");
+        }
+        if ($version !== null && $version < 0) {
+            throw new \InvalidArgumentException("dbContext(): version must be >= 0; {$version} given.");
+        }
+
+        $parts = ['db', $table, $column, $rowId];
+        if ($version !== null) {
+            $parts[] = $version;
+        }
+
+        try {
+            return json_encode($parts, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        } catch (\JsonException $e) {
+            throw new \InvalidArgumentException("dbContext(): names and row id must be valid UTF-8.", 0, $e);
+        }
+    }
+
+    /**
      * Generates a search hash for a given string using HMAC with a derived key.
      * This function is used to create a consistent hash for search purposes, allowing for secure comparisons without exposing the original data.
      *
      * Deterministic by design (that is what makes it searchable): equal inputs give equal hashes,
      * so it reveals equality between rows. Scalars are normalized first — true/1/"1" hash alike,
-     * as do false/0/"0" — and null/"" return "" without hashing.
+     * as do false/0/"0" — and null/"" return "" without hashing. Normalize text yourself (case,
+     * spaces, masks) before hashing, or equal values will not match.
+     *
+     * The hash is computed with the CURRENT key of a Keyring. After a key rotation, rows hashed
+     * under an old key only match generateSearchHashes() until they are re-hashed.
+     *
+     * A blind index is not authenticated: someone who can write to the database can copy another
+     * row's hash into their own row. After a lookup, decrypt the value and compare it with what
+     * was searched (see SECURITY.md).
      *
      * @param mixed $str The value to hash: a string, int, float, bool, Stringable or null
-     * @param string $key Base key to derive the search hash key from (>= 32 bytes)
+     * @param string|Keyring $key Master key (>= 32 bytes) or keyring
      * @param string|null $salt (Optional) Salt value to add randomness to the derived search hash key.
      *                          NULL and "" are the same salt.
      *
-     * @throws \Exception When the key is shorter than 32 bytes
-     * @throws \InvalidArgumentException For an array, a non-Stringable object or a resource. These
-     *                                   used to be hashed as the literal "Array" — every array
-     *                                   shared one blind index — or to raise an \Error.
+     * @throws \InvalidArgumentException When the key is shorter than 32 bytes; for an array, a
+     *                                   non-Stringable object or a resource. These used to be
+     *                                   hashed as the literal "Array" — every array shared one
+     *                                   blind index — or to raise an \Error.
      * @return string 64 lowercase hex characters, or "" for null/""
      */
-    public static function generateSearchHash(mixed $str, string $key, ?string $salt = ""): string {
+    public static function generateSearchHash(#[\SensitiveParameter] mixed $str, #[\SensitiveParameter] string|Keyring $key, ?string $salt = ""): string {
+        return self::searchHashUnder($str, self::keyring($key)->currentKey(), $salt, __FUNCTION__);
+    }
+
+    /**
+     * The search hash of $str under EVERY key of the keyring, current key first — for lookups
+     * while a key rotation is in progress: `WHERE email_hash IN (...)` finds a row whether it has
+     * been re-hashed under the new key yet or not.
+     *
+     * @param mixed $str The value to hash (see generateSearchHash())
+     * @param string|Keyring $key Master key or keyring
+     * @param string|null $salt Salt, as for generateSearchHash()
+     *
+     * @throws \InvalidArgumentException As generateSearchHash()
+     * @return array<string, string> Key id => hash; [] for null/""
+     */
+    public static function generateSearchHashes(#[\SensitiveParameter] mixed $str, #[\SensitiveParameter] string|Keyring $key, ?string $salt = ""): array {
+        $hashes = [];
+        foreach (self::keyring($key)->all() as $id => $masterKey) {
+            $hash = self::searchHashUnder($str, $masterKey, $salt, __FUNCTION__);
+            if ($hash === "") {
+                return [];
+            }
+            $hashes[$id] = $hash;
+        }
+
+        return $hashes;
+    }
+
+    /**
+     * generateSearchHash() under one given master key.
+     *
+     * @throws \InvalidArgumentException
+     */
+    private static function searchHashUnder(#[\SensitiveParameter] mixed $str, #[\SensitiveParameter] string $key, ?string $salt, string $method): string {
         if ($str === null || $str === "") {
             return "";
         }
 
-        $str = self::scalarToString($str, __FUNCTION__);
+        $str = self::scalarToString($str, $method);
         if ($str === "") {
             return "";
         }
@@ -1000,7 +1199,6 @@ class Security {
         // blind indexes. The blind index must be perfectly deterministic to match on lookup.
         $keySearch = self::deriveKey($key, 32, $salt, 'search-hash');
 
-        // hex: 64 caracteres
         return hash_hmac('sha256', $str, $keySearch);
     }
 
@@ -1037,7 +1235,8 @@ class Security {
      * irreversible if the key is mistyped or lost. Encrypt to another path and rename afterwards.
      *
      * @param string $source Path to the file to be encrypted (use tmp_name if from $_FILES)
-     * @param string $key Master key (>= 32 bytes)
+     * @param string|Keyring $key Master key (>= 32 bytes) or keyring; a keyring encrypts under
+     *                            its current key
      * @param string $destination Path where the encrypted file should be saved. MUST NOT be $source.
      *                            A missing directory is created with File::getDefaultMode().
      * @param string|null $salt Optional salt for key derivation. It is stored in the file header —
@@ -1059,7 +1258,7 @@ class Security {
      *
      * @ref https://riptutorial.com/php/example/25499/symmetric-encryption-and-decryption-of-large-files-with-openssl
      */
-    public static function encryptFileV2(string $source, string $key, string $destination, ?string $salt = null, ?string $permissionMode = null): string {
+    public static function encryptFileV2(string $source, #[\SensitiveParameter] string|Keyring $key, string $destination, ?string $salt = null, ?string $permissionMode = null): string {
         if (!extension_loaded('openssl')) {
             throw new \Exception("OpenSSL not loaded");
         }
@@ -1069,7 +1268,7 @@ class Security {
         // "" would be written as the "0-" block the reader rejects, so "no salt" is stored as "?".
         $salt = (($salt ?? "") === "" ? "?" : $salt);
         // Domain-separated key (distinct from the DB-cell / local subsystems).
-        $key = self::deriveKey($key, 32, $salt, 'file-v2');
+        $key = self::deriveKey(self::keyring($key)->currentKey(), 32, $salt, 'file-v2');
 
         // Before any path is resolved: resolving the destination may create its directory.
         $blockBytes = self::getFileEncryptBlocksBytes();
@@ -1194,8 +1393,11 @@ class Security {
      * assertDestinationIsNotSource). Decrypt to a different path and rename afterwards if needed.
      *
      * @param string $source Path to the file to be decrypted (use tmp_name when from $_FILES)
-     * @param string $key Master key (>= 32 bytes), the same one passed to encryptFileV2. The salt
-     *                    is read from the file header.
+     * @param string|Keyring $key Master key (>= 32 bytes), the same one passed to encryptFileV2, or a
+     *                            keyring holding it. The file format carries no key id, so each
+     *                            key of a keyring is tried on the first block and the one that
+     *                            authenticates it decrypts the file. The salt is read from the
+     *                            file header.
      * @param string $destination Path where the decrypted file should be saved. MUST NOT be $source.
      *                            A missing directory is created with File::getDefaultMode().
      * @param string|null $permissionMode Octal mode for the destination file (e.g. "0600"). The
@@ -1215,7 +1417,7 @@ class Security {
      *                    or on any source/destination resolution, authentication, truncation or
      *                    tamper failure.
      */
-    public static function decryptFileV2(string $source, string $key, string $destination, ?string $permissionMode = null, string $outReadMode = "w"): string {
+    public static function decryptFileV2(string $source, #[\SensitiveParameter] string|Keyring $key, string $destination, ?string $permissionMode = null, string $outReadMode = "w"): string {
         if (!extension_loaded('openssl')) {
             throw new \Exception("OpenSSL not loaded");
         }
@@ -1230,7 +1432,7 @@ class Security {
         // Everything that needs no file is validated before the destination directory can be
         // created by getRealDestination().
         $mode = self::parseFileMode($permissionMode);
-        self::assertKeyLength($key);
+        $keys = self::keyring($key);
 
         $source = self::getRealSource($source);
         $destination = self::getRealDestination($destination);
@@ -1257,7 +1459,12 @@ class Security {
 
             $salt = self::readRequiredLengthEncodedBlock($fpIn, "cipher salt");
             $fileId = self::readRequiredLengthEncodedBlock($fpIn, "file id");
-            $key = self::deriveKey($key, 32, $salt, 'file-v2');
+            // One candidate per key of the keyring; the first block decides which one is right.
+            $candidates = [];
+            foreach ($keys->all() as $masterKey) {
+                $candidates[] = self::deriveKey($masterKey, 32, $salt, 'file-v2');
+            }
+            $key = null;
 
             // Created only once the header is known good: a file that is not ours never gets as
             // far as creating anything next to the destination.
@@ -1279,6 +1486,24 @@ class Security {
                 }
 
                 $ciphertext = self::readRequiredLengthEncodedBlock($fpIn, "ciphertext");
+
+                // The first block is either data block 0 or, for an empty file, the end marker:
+                // the key it authenticates under is the file's key.
+                if ($key === null) {
+                    foreach ($candidates as $candidate) {
+                        if (openssl_decrypt($ciphertext, self::FILE_V2_CIPHER, $candidate, OPENSSL_RAW_DATA, $iv, $tag, self::fileV2Aad($fileId, "D", 0)) !== false
+                            || openssl_decrypt($ciphertext, self::FILE_V2_CIPHER, $candidate, OPENSSL_RAW_DATA, $iv, $tag, self::fileV2Aad($fileId, "F", 0)) !== false) {
+                            $key = $candidate;
+                            break;
+                        }
+                    }
+                    if ($key === null) {
+                        throw new \Exception(
+                            "Error on creating plaintext of a ciphertext: block 0 failed authentication under every key "
+                            . "(wrong key, or the file was tampered with, reordered, spliced or truncated)."
+                        );
+                    }
+                }
 
                 // Try to authenticate it as the DATA block at the expected position.
                 $plaintext = openssl_decrypt($ciphertext, self::FILE_V2_CIPHER, $key, OPENSSL_RAW_DATA, $iv, $tag, self::fileV2Aad($fileId, "D", $index));
@@ -1340,115 +1565,110 @@ class Security {
      * Encrypts a value for storage with AES-256-GCM, binding it to a caller-supplied context
      * (AAD) so a ciphertext cannot be relocated to another cell/row and still decrypt.
      *
-     * Output is a self-describing envelope: "<version>:" . base64(iv || tag || ciphertext).
-     * The version AND the caller's $aad are both fed as GCM Additional Authenticated Data, so a
-     * value cannot be reinterpreted under another version, table, column, or row.
+     * Output is a self-describing envelope: "v2:{key id}:" . base64(iv || tag || ciphertext). The
+     * version, the key id (see keyId()) AND the caller's $aad are all fed as GCM Additional
+     * Authenticated Data, so a value cannot be reinterpreted under another version, key, table,
+     * column, or row. The key id is what lets decryptDataDB() pick the right key of a Keyring after
+     * a rotation, and what a migration uses to find the values still under an old key.
+     *
+     * EMPTY IS A VALUE: "" is encrypted like any other string, so a blank column is never a
+     * legitimate ciphertext — decryptDataDB("") throws, and a value someone blanked out is
+     * detected. Only null means "no value" (null in, null out).
      *
      * @param mixed $str The value to encrypt: a string, int, float, bool (stored as "1"/"0"),
-     *                   Stringable or null. null/"" encrypt to "". Decryption always returns a
-     *                   string — the original type is not recorded.
-     * @param string $key Master key (>= 32 bytes)
-     * @param string $aad Context to bind, e.g. "{table}.{column}:{row_id}". REQUIRED and should be
-     *                     unique per logical cell. An empty AAD is rejected to forbid an unbound value.
+     *                   Stringable or null. Decryption always returns a string — the original type
+     *                   is not recorded.
+     * @param string|Keyring $key Master key (>= 32 bytes) or keyring; a keyring encrypts under its
+     *                            current key
+     * @param string $aad Context to bind — build it with dbContext() (table, column, row id and,
+     *                    against replay, a version). REQUIRED; an empty AAD is rejected.
      * @param string|null $salt Optional per-subject salt for key derivation
      *
-     * @return string
+     * @return string|null The envelope, or null for null
      * @throws \InvalidArgumentException For an array, a non-Stringable object or a resource — an
-     *                                   array used to be stored as the literal "Array".
-     * @throws \Exception
+     *                                   array used to be stored as the literal "Array" — or a key
+     *                                   shorter than 32 bytes.
+     * @throws \Exception For an empty AAD, or when encryption fails
      */
-    public static function encryptDataDB(mixed $str, string $key, string $aad, ?string $salt = ""): string {
+    public static function encryptDataDB(#[\SensitiveParameter] mixed $str, #[\SensitiveParameter] string|Keyring $key, string $aad, ?string $salt = ""): ?string {
         if (!extension_loaded('openssl')) {
             throw new \Exception("OpenSSL not loaded");
         }
 
-        if ($str === null || $str === "") {
-            return "";
+        if ($str === null) {
+            return null;
         }
-
         $str = self::scalarToString($str, __FUNCTION__);
-        if ($str === "") {
-            // A Stringable that renders "": an empty ciphertext would be rejected as too short.
-            return "";
-        }
 
         // A missing context defeats the whole point of the AAD binding.
         if ($aad === "") {
             throw new \Exception("A non-empty AAD (value context) is required for encryptDataDB.");
         }
 
-        // Domain-separated 256-bit key (distinct from the file/local subsystems).
-        $key = self::deriveKey($key, 32, $salt, 'db-cell');
+        $keys = self::keyring($key);
+        $keyId = $keys->currentId();
 
-        $cipher = "aes-256-gcm";
-        $ivLength = openssl_cipher_iv_length($cipher);
-        $tagLength = 16;
+        // Domain-separated 256-bit key (distinct from the file/local subsystems).
+        $derived = self::deriveKey($keys->currentKey(), 32, $salt, 'db-cell');
 
         // Fresh CSPRNG nonce; fails closed if no strong RNG is available.
-        $iv = self::secureRandomBytes($ivLength);
-
-        // Bind the envelope version into the AAD so a value cannot be replayed across versions.
-        $fullAad = self::DB_ENVELOPE_VERSION . "|" . $aad;
+        $iv = self::secureRandomBytes(self::GCM_IV_BYTES);
 
         $ciphertext = openssl_encrypt(
             $str,
-            $cipher,
-            $key,
+            'aes-256-gcm',
+            $derived,
             OPENSSL_RAW_DATA,
             $iv,
             $tag,
-            $fullAad,
-            $tagLength
+            self::dbAad($keyId, $aad),
+            self::GCM_TAG_BYTES
         );
 
         if ($ciphertext === false) {
             throw new \Exception("Encryption failed.");
         }
-        if (mb_strlen($tag, '8bit') !== $tagLength) {
+        if (strlen($tag) !== self::GCM_TAG_BYTES) {
             throw new \Exception("Invalid authentication tag length.");
         }
 
-        return self::DB_ENVELOPE_VERSION . ":" . base64_encode($iv . $tag . $ciphertext);
+        return self::DB_ENVELOPE_VERSION . ":" . $keyId . ":" . base64_encode($iv . $tag . $ciphertext);
     }
 
     /**
      * Decrypts a value produced by encryptDataDB, verifying the GCM tag over the SAME context
-     * (AAD). A tampered value, a wrong context (relocated ciphertext), an unknown version, or a
-     * wrong key THROWS — it never returns a falsy value a caller could mistake for success.
+     * (AAD). A tampered value, a wrong context (relocated ciphertext), an unknown version, a key id
+     * the keyring does not hold, a wrong key or a BLANK value THROWS — it never returns something
+     * a caller could mistake for success.
      *
-     * @param string|null $str Envelope produced by encryptDataDB ("" for an empty value)
-     * @param string $key Master key (>= 32 bytes)
+     * @param string|null $str Envelope produced by encryptDataDB, or null
+     * @param string|Keyring $key The master key, or a keyring holding the key the value was written
+     *                            under (its id is read from the envelope)
      * @param string $aad The identical context passed to encryptDataDB
      * @param string|null $salt The identical salt passed to encryptDataDB
      *
-     * @return string Decrypted text ("" for an empty input)
-     * @throws \Exception On decode / version / authentication failure
+     * @return string|null Decrypted text, or null for null
+     * @throws \Exception On an empty value, or a decode / version / key id / authentication failure
      */
-    public static function decryptDataDB(?string $str, string $key, string $aad, ?string $salt = ""): string {
+    public static function decryptDataDB(?string $str, #[\SensitiveParameter] string|Keyring $key, string $aad, ?string $salt = ""): ?string {
         if (!extension_loaded('openssl')) {
             throw new \Exception("OpenSSL not loaded");
         }
 
-        if ($str === null || $str === "") {
-            return "";
+        if ($str === null) {
+            return null;
+        }
+        if ($str === "") {
+            throw new \Exception(
+                "Empty value: encryptDataDB never produces \"\" (an empty string is encrypted too), so this value was blanked or never encrypted."
+            );
         }
 
         if ($aad === "") {
             throw new \Exception("A non-empty AAD (value context) is required for decryptDataDB.");
         }
 
-        // Parse and validate the self-describing version prefix ("<version>:").
-        $sep = strpos($str, ":");
-        if ($sep === false) {
-            throw new \Exception("Malformed envelope: missing version prefix.");
-        }
-        $version = substr($str, 0, $sep);
-        if ($version !== self::DB_ENVELOPE_VERSION) {
-            throw new \Exception("Unsupported envelope version.");
-        }
-        $payload = substr($str, $sep + 1);
-
-        $key = self::deriveKey($key, 32, $salt, 'db-cell');
+        [$keyId, $masterKey, $payload] = self::openEnvelope($str, self::DB_ENVELOPE_VERSION, self::keyring($key));
 
         // Native strict decode: encryptDataDB emits plain base64 and nothing else, and the GCM tag
         // authenticates the bytes, so no data-URI or other leniency is wanted here.
@@ -1457,29 +1677,19 @@ class Security {
             throw new \Exception("Failed to decode the secret message. Invalid base64.");
         }
 
-        $cipher = "aes-256-gcm";
-        $ivLength = openssl_cipher_iv_length($cipher);
-        $tagLength = 16;
-
-        if (mb_strlen($decoded, '8bit') < ($ivLength + $tagLength + 1)) {
+        // An empty plaintext has an empty ciphertext: IV + tag is the minimum.
+        if (strlen($decoded) < self::GCM_IV_BYTES + self::GCM_TAG_BYTES) {
             throw new \Exception("Encrypted payload is too short.");
         }
 
-        $iv = mb_substr($decoded, 0, $ivLength, '8bit');
-        $tag = mb_substr($decoded, $ivLength, $tagLength, '8bit');
-        $ciphertext = mb_substr($decoded, $ivLength + $tagLength, null, '8bit');
-
-        // Bind the same version + context; a mismatch fails the GCM tag below.
-        $fullAad = self::DB_ENVELOPE_VERSION . "|" . $aad;
-
         $plaintext = openssl_decrypt(
-            $ciphertext,
-            $cipher,
-            $key,
+            substr($decoded, self::GCM_IV_BYTES + self::GCM_TAG_BYTES),
+            'aes-256-gcm',
+            self::deriveKey($masterKey, 32, $salt, 'db-cell'),
             OPENSSL_RAW_DATA,
-            $iv,
-            $tag,
-            $fullAad
+            substr($decoded, 0, self::GCM_IV_BYTES),
+            substr($decoded, self::GCM_IV_BYTES, self::GCM_TAG_BYTES),
+            self::dbAad($keyId, $aad)
         );
 
         // GCM authentication failure (tamper / wrong context / wrong key) => fail LOUD.
@@ -1491,147 +1701,171 @@ class Security {
     }
 
     /**
+     * Decrypts a value and encrypts it again under the CURRENT key and, optionally, a new context.
+     * The two jobs it is for:
+     *  - a KEY ROTATION: re-encrypt values still written under an old key (their envelope does not
+     *    start with "v2:{$keyring->currentId()}:") with a Keyring holding the new and old keys;
+     *  - a VERSION BUMP: a value whose AAD includes a version (see dbContext()) must be encrypted
+     *    again under the new version when the row is written.
+     *
+     * @param string|null $str Envelope produced by encryptDataDB, or null
+     * @param string|Keyring $key Keyring (or key) that can decrypt it; the result uses its current key
+     * @param string $aad Context the value is bound to now
+     * @param string|null $newAad Context to bind it to instead (null: keep $aad)
+     * @param string|null $salt Salt, as for encryptDataDB
+     *
+     * @return string|null The new envelope, or null for null
+     * @throws \Exception As decryptDataDB()/encryptDataDB()
+     */
+    public static function reencryptDataDB(?string $str, #[\SensitiveParameter] string|Keyring $key, string $aad, ?string $newAad = null, ?string $salt = ""): ?string {
+        $keys = self::keyring($key);
+
+        return self::encryptDataDB(self::decryptDataDB($str, $keys, $aad, $salt), $keys, $newAad ?? $aad, $salt);
+    }
+
+    /**
+     * GCM AAD of the DB envelope: version, key id and the caller's context. The version and the key
+     * id have a fixed format (no "|"), so the concatenation is unambiguous.
+     */
+    private static function dbAad(string $keyId, string $aad): string {
+        return self::DB_ENVELOPE_VERSION . "|" . $keyId . "|" . $aad;
+    }
+
+    /**
      * Encrypts a string using AES-256-CTR with authentication (MAC).
      *
      * It derives two keys from the provided master key:
      * - One for encryption (encKey)
      * - One for message authentication (authKey)
      *
-     * The result is the MAC concatenated with the IV and ciphertext, encoded in Base64.
+     * Output: "l1:{key id}:" . base64(MAC || IV || ciphertext). The HMAC-SHA256 covers the prefix
+     * (version and key id) as well as the IV and ciphertext.
+     *
+     * NOT BOUND TO A CONTEXT: the value decrypts wherever it is pasted under the same key and salt.
+     * Use encryptDataDB() with an AAD when a value must not be movable.
+     *
+     * EMPTY IS A VALUE, as for encryptDataDB(): "" is encrypted, decryptLocal("") throws, and only
+     * null means "no value".
      *
      * @param mixed $str The plaintext to encrypt: a string, int, float, bool (as "1"/"0"),
-     *                   Stringable or null. null/"" encrypt to "". Decryption returns a string.
-     * @param string $key Master key of AT LEAST 32 bytes. Shorter keys are REJECTED, including
-     *                    16..31-byte ones: HKDF cannot add entropy, so a sub-32-byte master would
-     *                    never reach real 256-bit strength.
+     *                   Stringable or null. Decryption returns a string.
+     * @param string|Keyring $key Master key of AT LEAST 32 bytes, or a keyring (its current key is
+     *                            used). Shorter keys are REJECTED, including 16..31-byte ones: HKDF
+     *                            cannot add entropy, so a sub-32-byte master would never reach real
+     *                            256-bit strength.
      * @param string|null $salt Optional salt for key derivation
      *
-     * @return string Encrypted string, Base64 encoded
+     * @return string|null The envelope, or null for null
      * @throws \InvalidArgumentException For an array, a non-Stringable object or a resource — an
-     *                                   array used to be encrypted as the literal "Array".
-     * @throws \Exception If the key is shorter than 32 bytes, or secure random bytes can't be generated
+     *                                   array used to be encrypted as the literal "Array" — or a
+     *                                   key shorter than 32 bytes.
+     * @throws \Exception If secure random bytes can't be generated or encryption fails
      *
      * @link https://stackoverflow.com/questions/9262109/simplest-two-way-encryption-using-php
      */
-    public static function encryptLocal(mixed $str, string $key, ?string $salt = ""): string {
+    public static function encryptLocal(#[\SensitiveParameter] mixed $str, #[\SensitiveParameter] string|Keyring $key, ?string $salt = ""): ?string {
         if (!extension_loaded('openssl')) {
             throw new \Exception("OpenSSL not loaded");
         }
 
-        if ($str === null || $str === "") {
-            return "";
+        if ($str === null) {
+            return null;
         }
-
         $str = self::scalarToString($str, __FUNCTION__);
-        if ($str === "") {
-            return "";
-        }
 
-        // The 32-byte floor is enforced once, by deriveKey (see MIN_KEY_BYTES).
-        $key = self::deriveKey($key, 32, $salt, 'local');
-
-        // Derive encryption and authentication keys using HKDF
-        [$encKey, $authKey] = [
-            hash_hkdf("sha256", $key, 32, "local-encryption"),
-            hash_hkdf("sha256", $key, 32, "local-authentication"),
-        ];
-
-        $cipher = "aes-256-ctr";
-        $ivLength = openssl_cipher_iv_length($cipher);
+        $keys = self::keyring($key);
+        [$encKey, $authKey] = self::localKeys($keys->currentKey(), $salt);
 
         // Fresh CSPRNG nonce; fails closed if no strong RNG is available.
-        $nonce = self::secureRandomBytes($ivLength);
+        $nonce = self::secureRandomBytes(openssl_cipher_iv_length('aes-256-ctr'));
 
-        // Encrypt the plaintext using AES-256-CTR
-        $encryptedData = openssl_encrypt(
-            $str,
-            $cipher,
-            $encKey,
-            OPENSSL_RAW_DATA,
-            $nonce
-        );
-
+        $encryptedData = openssl_encrypt($str, 'aes-256-ctr', $encKey, OPENSSL_RAW_DATA, $nonce);
         if ($encryptedData === false) {
             throw new \Exception("Encryption failed.");
         }
-        
-        $payload = $nonce . $encryptedData;
-        $mac = hash_hmac("sha256", $payload, $authKey, true);
 
-        return base64_encode($mac . $payload);
+        $prefix = self::LOCAL_ENVELOPE_VERSION . ":" . $keys->currentId() . ":";
+        $payload = $nonce . $encryptedData;
+        $mac = hash_hmac("sha256", $prefix . $payload, $authKey, true);
+
+        return $prefix . base64_encode($mac . $payload);
     }
 
     /**
-     * Decrypts a Base64-encoded string encrypted with AES-256-CTR and authenticated with HMAC-SHA256.
+     * Decrypts a value produced by encryptLocal, verifying its HMAC (constant-time) before
+     * decrypting. Every failure THROWS, including a blank value.
      *
-     * It verifies the MAC (constant-time) before attempting decryption. Every failure THROWS.
-     *
-     * @param string|null $str The encrypted string, Base64 encoded ("" for an empty value)
-     * @param string $key Master key of AT LEAST 32 bytes — the same one passed to encryptLocal.
-     *                    Shorter keys are REJECTED (see encryptLocal).
+     * @param string|null $str The envelope, or null
+     * @param string|Keyring $key The master key passed to encryptLocal, or a keyring holding it (its
+     *                            id is read from the envelope). Shorter keys are REJECTED.
      * @param string|null $salt Optional salt for key derivation
      *
-     * @return string Decrypted string ("" for an empty input). The return type used to include
-     *                false, which no path could produce after the MAC check; it is now `string`.
-     * @throws \Exception If the key is shorter than 32 bytes, Base64 is malformed, or MAC verification fails
+     * @return string|null Decrypted string, or null for null
+     * @throws \Exception On an empty value, a malformed envelope, an unknown key id, invalid Base64
+     *                    or a MAC mismatch
      *
      * @link https://stackoverflow.com/questions/9262109/simplest-two-way-encryption-using-php
      */
-    public static function decryptLocal(?string $str, string $key, ?string $salt = ""): string {
+    public static function decryptLocal(?string $str, #[\SensitiveParameter] string|Keyring $key, ?string $salt = ""): ?string {
         if (!extension_loaded('openssl')) {
             throw new \Exception("OpenSSL not loaded");
         }
 
-        if ($str === null || $str === "") {
-            return "";
+        if ($str === null) {
+            return null;
+        }
+        if ($str === "") {
+            throw new \Exception(
+                "Empty value: encryptLocal never produces \"\" (an empty string is encrypted too), so this value was blanked or never encrypted."
+            );
         }
 
-        // The 32-byte floor is enforced once, by deriveKey (see MIN_KEY_BYTES).
-        $key = self::deriveKey($key, 32, $salt, 'local');
-
-        // Derive encryption and authentication keys using HKDF
-        [$encKey, $authKey] = [
-            hash_hkdf("sha256", $key, 32, "local-encryption"),
-            hash_hkdf("sha256", $key, 32, "local-authentication"),
-        ];
+        [$keyId, $masterKey, $encoded] = self::openEnvelope($str, self::LOCAL_ENVELOPE_VERSION, self::keyring($key));
+        [$encKey, $authKey] = self::localKeys($masterKey, $salt);
 
         // Native strict decode: encryptLocal emits plain base64, and the MAC authenticates the bytes.
-        $decoded = base64_decode($str, true);
+        $decoded = base64_decode($encoded, true);
         if ($decoded === false) {
             throw new \Exception("Failed to decode encrypted message. Invalid Base64.");
         }
 
-        $cipher = "aes-256-ctr";
-        $ivLength = openssl_cipher_iv_length($cipher);
+        $ivLength = openssl_cipher_iv_length('aes-256-ctr');
         $macSize = 32;
 
-        if (mb_strlen($decoded, '8bit') < ($macSize + $ivLength + 1)) {
+        // An empty plaintext has an empty ciphertext: MAC + IV is the minimum.
+        if (strlen($decoded) < $macSize + $ivLength) {
             throw new \Exception("Encrypted payload is too short.");
         }
 
-        $mac = mb_substr($decoded, 0, $macSize, '8bit');
-        $payload = mb_substr($decoded, $macSize, null, '8bit');
+        $mac = substr($decoded, 0, $macSize);
+        $payload = substr($decoded, $macSize);
 
-        $calculatedMac = hash_hmac("sha256", $payload, $authKey, true);
-        if (!hash_equals($calculatedMac, $mac)) {
+        $prefix = self::LOCAL_ENVELOPE_VERSION . ":" . $keyId . ":";
+        if (!hash_equals(hash_hmac("sha256", $prefix . $payload, $authKey, true), $mac)) {
             throw new \Exception("Provided MAC does not match the calculated MAC.");
         }
 
-        $nonce = mb_substr($payload, 0, $ivLength, '8bit');
-        $encryptedPayload = mb_substr($payload, $ivLength, null, '8bit');
-
-        $plaintext = openssl_decrypt(
-            $encryptedPayload,
-            $cipher,
-            $encKey,
-            OPENSSL_RAW_DATA,
-            $nonce
-        );
+        $plaintext = openssl_decrypt(substr($payload, $ivLength), 'aes-256-ctr', $encKey, OPENSSL_RAW_DATA, substr($payload, 0, $ivLength));
         if ($plaintext === false) {
             throw new \Exception("Decryption failed.");
         }
 
         return $plaintext;
+    }
+
+    /**
+     * Encryption and MAC keys of the local envelope, both derived from the master key and salt.
+     *
+     * @return array{0: string, 1: string} [encryption key, authentication key]
+     */
+    private static function localKeys(#[\SensitiveParameter] string $masterKey, ?string $salt): array {
+        // The 32-byte floor is enforced once, by deriveKey (see MIN_KEY_BYTES).
+        $key = self::deriveKey($masterKey, 32, $salt, 'local');
+
+        return [
+            hash_hkdf("sha256", $key, 32, "local-encryption"),
+            hash_hkdf("sha256", $key, 32, "local-authentication"),
+        ];
     }
 
     /**
@@ -1646,25 +1880,30 @@ class Security {
      * aes-bridge GCM implementation that accepts a BINARY passphrase can decrypt it once it has
      * derived the same 32 bytes. Passing the master key to aes-bridge directly will NOT work.
      *
+     * The format is aes-bridge's, so it carries NO key id: decryptCrossPlatform() tries each key
+     * of a keyring in turn (one PBKDF2 run per key tried).
+     *
      * Booleans are encoded as the marker strings "{{!BOOL_TRUE!}}" / "{{!BOOL_FALSE!}}" (a
      * non-PHP peer sees those strings), and decryptCrossPlatform turns those exact strings back
      * into booleans — so encrypting the literal string "{{!BOOL_TRUE!}}" decrypts to true.
      * Ints/floats are encrypted as their string form and come back as strings.
      *
+     * EMPTY IS A VALUE: "" is encrypted, and only null means "no value" (null in, null out).
+     *
      * @param mixed $var Value to be encrypted: string, int, float, bool, Stringable or null.
-     *                   null and "" are returned unchanged, unencrypted.
-     * @param string $key Master key of AT LEAST 32 bytes. Shorter keys are REJECTED (HKDF cannot
-     *                    add entropy).
+     * @param string|Keyring $key Master key of AT LEAST 32 bytes, or a keyring (its current key is
+     *                            used). Shorter keys are REJECTED (HKDF cannot add entropy).
      * @param string|null $salt Salt for key derivation. NULL and "" are the same salt.
      *
-     * @return string|null
+     * @return string|null The base64 value, or null for null
      * @throws \InvalidArgumentException For an array, a non-Stringable object or a resource (these
-     *                                   used to escape as a \TypeError from aes-bridge)
+     *                                   used to escape as a \TypeError from aes-bridge), or a key
+     *                                   shorter than 32 bytes
      * @throws \Exception
      *
      * @ref https://github.com/mervick/aes-bridge-php
      */
-    public static function encryptCrossPlatform(mixed $var, string $key, ?string $salt = ""): ?string {
+    public static function encryptCrossPlatform(#[\SensitiveParameter] mixed $var, #[\SensitiveParameter] string|Keyring $key, ?string $salt = ""): ?string {
         if (!extension_loaded('openssl')) {
             throw new \Exception("OpenSSL not loaded");
         }
@@ -1672,8 +1911,8 @@ class Security {
             throw new \Exception("Class '\AesBridge\Gcm' not found");
         }
 
-        if ($var === null || $var === "") {
-            return $var;
+        if ($var === null) {
+            return null;
         }
 
         if ($var === true) {
@@ -1685,7 +1924,7 @@ class Security {
         }
 
         // The 32-byte floor is enforced once, by deriveKey (see MIN_KEY_BYTES).
-        $passphrase = self::deriveKey($key, 32, $salt);
+        $passphrase = self::deriveKey(self::keyring($key)->currentKey(), 32, $salt);
 
         return \AesBridge\Gcm::encrypt($var, $passphrase);
     }
@@ -1698,22 +1937,23 @@ class Security {
      * `string` return type, which PHP coerces to "" — so a WRONG KEY or a TAMPERED value used to
      * come back as "" (plus a warning for a short input), indistinguishable from a real empty
      * value. The format is therefore parsed here, with aes-bridge's own key derivation, and every
-     * failure throws.
+     * failure throws — including a blank value, which encryptCrossPlatform never produces.
      *
      * @param mixed $encrypted Base64 value produced by encryptCrossPlatform or any aes-bridge GCM
-     *                         implementation. null and "" are returned unchanged.
-     * @param string $key Master key of AT LEAST 32 bytes — the same one passed to
-     *                    encryptCrossPlatform. Shorter keys are REJECTED.
+     *                         implementation, or null.
+     * @param string|Keyring $key Master key of AT LEAST 32 bytes — the same one passed to
+     *                            encryptCrossPlatform — or a keyring holding it; each of its keys is
+     *                            tried, as the format carries no key id. Shorter keys are REJECTED.
      * @param string|null $salt Salt for key derivation
      *
-     * @return mixed The decrypted string; true/false for the boolean markers; null/"" unchanged
+     * @return mixed The decrypted string; true/false for the boolean markers; null for null
      * @throws \InvalidArgumentException When $encrypted is not a string (or null)
-     * @throws \Exception On invalid base64, a too-short value, or authentication failure (wrong
-     *                    key/salt, tampered value)
+     * @throws \Exception On an empty value, invalid base64, a too-short value, or authentication
+     *                    failure under every key (wrong key/salt, tampered value)
      *
      * @ref https://github.com/mervick/aes-bridge-php
      */
-    public static function decryptCrossPlatform(mixed $encrypted, string $key, ?string $salt = ""): mixed {
+    public static function decryptCrossPlatform(mixed $encrypted, #[\SensitiveParameter] string|Keyring $key, ?string $salt = ""): mixed {
         if (!extension_loaded('openssl')) {
             throw new \Exception("OpenSSL not loaded");
         }
@@ -1721,17 +1961,25 @@ class Security {
             throw new \Exception("Class '\AesBridge\Gcm' not found");
         }
 
-        if ($encrypted === null || $encrypted === "") {
-            return $encrypted;
+        if ($encrypted === null) {
+            return null;
         }
         if (!is_string($encrypted)) {
             throw new \InvalidArgumentException("decryptCrossPlatform() expects a base64 string; " . get_debug_type($encrypted) . " given.");
         }
+        if ($encrypted === "") {
+            throw new \Exception(
+                "Empty value: encryptCrossPlatform never produces \"\" (an empty string is encrypted too), so this value was blanked or never encrypted."
+            );
+        }
 
         // The 32-byte floor is enforced once, by deriveKey (see MIN_KEY_BYTES).
-        $passphrase = self::deriveKey($key, 32, $salt);
+        $passphrases = [];
+        foreach (self::keyring($key)->all() as $masterKey) {
+            $passphrases[] = self::deriveKey($masterKey, 32, $salt);
+        }
 
-        $ret = self::aesBridgeGcmDecrypt($encrypted, $passphrase);
+        $ret = self::aesBridgeGcmDecrypt($encrypted, $passphrases);
         if ($ret === "{{!BOOL_TRUE!}}") {
             return true;
         }
@@ -1750,12 +1998,12 @@ class Security {
      * \AesBridge\Gcm), so its PBKDF2 parameters cannot drift from what Gcm::encrypt() used.
      *
      * @param string $encoded Base64 envelope
-     * @param string $passphrase Passphrase given to aes-bridge (the derived key)
+     * @param string[] $passphrases Passphrases given to aes-bridge (derived keys), tried in order
      *
      * @throws \Exception
      * @return string
      */
-    private static function aesBridgeGcmDecrypt(string $encoded, string $passphrase): string {
+    private static function aesBridgeGcmDecrypt(string $encoded, #[\SensitiveParameter] array $passphrases): string {
         $saltBytes = 16;
         $nonceBytes = 12;
         $tagBytes = 16;
@@ -1771,20 +2019,22 @@ class Security {
             throw new \Exception("Function '\AesBridge\derive_key' not found");
         }
 
-        $aesKey = \AesBridge\derive_key($passphrase, substr($data, 0, $saltBytes));
-        $plaintext = openssl_decrypt(
-            substr($data, $saltBytes + $nonceBytes, -$tagBytes),
-            'aes-256-gcm',
-            $aesKey,
-            OPENSSL_RAW_DATA,
-            substr($data, $saltBytes, $nonceBytes),
-            substr($data, -$tagBytes)
-        );
-        if ($plaintext === false) {
-            throw new \Exception("Decryption failed: authentication tag mismatch.");
+        foreach ($passphrases as $passphrase) {
+            $aesKey = \AesBridge\derive_key($passphrase, substr($data, 0, $saltBytes));
+            $plaintext = openssl_decrypt(
+                substr($data, $saltBytes + $nonceBytes, -$tagBytes),
+                'aes-256-gcm',
+                $aesKey,
+                OPENSSL_RAW_DATA,
+                substr($data, $saltBytes, $nonceBytes),
+                substr($data, -$tagBytes)
+            );
+            if ($plaintext !== false) {
+                return $plaintext;
+            }
         }
 
-        return $plaintext;
+        throw new \Exception("Decryption failed: authentication tag mismatch.");
     }
 
     /**
@@ -1817,9 +2067,9 @@ class Security {
      *                    leaf; an object is converted to an array — `(array)` semantics, so private
      *                    and protected properties are included under their mangled keys — and
      *                    RETURNED AS AN ARRAY. The leaf methods' own conversions apply: e.g.
-     *                    encryptLocal turns null into "" and ints into strings, so a round trip
-     *                    does not restore types.
-     * @param string $key Master key, forwarded as the 2nd argument to $fnName
+     *                    encryptLocal keeps null as null but turns ints into strings, so a round
+     *                    trip does not restore types.
+     * @param string|Keyring $key Master key or keyring, forwarded as the 2nd argument to $fnName
      * @param string|null $salt Optional salt for key derivation, forwarded as the THIRD argument
      * @param string $fnName Name of one of the five allowlisted methods above. A class prefix of
      *                       "self::", "static::", "class::", "Security::" or the fully-qualified
@@ -1834,7 +2084,7 @@ class Security {
      * @return mixed The walked structure; arrays/objects come back as arrays, a scalar comes back
      *               as $fnName's return value.
      */
-    public static function applySecurityFunctionArray(mixed $item, string $key, ?string $salt, string $fnName): mixed {
+    public static function applySecurityFunctionArray(#[\SensitiveParameter] mixed $item, #[\SensitiveParameter] string|Keyring $key, ?string $salt, string $fnName): mixed {
         if(empty($fnName)) {
             return $item;
         }
@@ -2689,7 +2939,7 @@ class Security {
      *                    Also when this PHP build has no Argon2 support.
      * @return string Argon2id hash, always non-empty
      */
-    public static function encryptPassword(?string $password): string {
+    public static function encryptPassword(#[\SensitiveParameter] ?string $password): string {
         // Strict test, matching this file's null/"" idiom elsewhere: empty() would also swallow the
         // legitimate password "0".
         if ($password === null || $password === "") {
@@ -2721,7 +2971,7 @@ class Security {
      * @return bool True only if $password matches $hash. False for a wrong password AND for any
      *              malformed/empty $hash — a false is never proof the hash was valid.
      */
-    public static function verifyPassword(string $password, string $hash): bool {
+    public static function verifyPassword(#[\SensitiveParameter] string $password, string $hash): bool {
         return password_verify($password, $hash);
     }
 }
