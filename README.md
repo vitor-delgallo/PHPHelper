@@ -1,106 +1,191 @@
 # PHPHelper by VD
 
-A modern, modular and extensible utility library for PHP 8.2+, built for real-world applications. This library provides reliable helpers for strings, dates, arrays, numbers, HTTP, system operations, encryption, parsing, email, spreadsheet handling, and more.
+A collection of static helper classes for PHP 8.2+: strings, dates, numbers, Brazilian documents
+(CPF / CNPJ / CEP), files and zip archives, HTTP, e-mail, spreadsheets, Amazon S3 and authenticated
+encryption.
 
-> Clean, stateless, and built to work in any PHP environment.
-
----
-
-## ✅ Features
-
-- 📦 Organized into static utility classes under the namespace `VD\PHPHelper`
-- 🔒 Secure-by-default implementations for encryption, encoding, validation, and parsing
-- 💡 Clear and fully-documented functions with modern PHP 8 syntax
-- ⚙️ Optional integrations with popular libraries (PHPMailer, PhpSpreadsheet, etc.)
-- 🧩 Easy to include in legacy or modern applications (Composer-ready)
+Everything lives under the `VD\PHPHelper` namespace and is called statically — no instances, no
+container, no configuration file.
 
 ---
 
-## 📂 Available Classes
+## ✅ Highlights
 
-These classes are auto-loaded under the namespace `VD\PHPHelper`:
+- 🔒 **Secure by default** — AES-256-GCM with context binding (AAD), HKDF per-domain keys, streamed
+  and authenticated file encryption, CR/LF-safe headers, zip-slip and symlink-safe file operations.
+- 📣 **Fails loudly** — invalid input throws (usually `InvalidArgumentException`) instead of
+  producing a plausible-looking wrong result. Each method's docblock states exactly what it returns
+  and when it throws.
+- 🇧🇷 **Brazil-ready** — CPF and CNPJ (including the alphanumeric CNPJ), CEP, `R$ 1.234,56`
+  formatting, pt-BR date texts, Windows-1252 CSV files.
+- 🧩 **Pay for what you use** — PHPMailer, PhpSpreadsheet, the AWS SDK and aes-bridge are only
+  needed by the class that uses them.
+- 🧪 **Tested** — about 2,400 PHPUnit tests, run on Windows and Linux.
 
-- `DateTime` – date formatting, age calculation, diff tools
-- `DBF` – legacy DBF file support
-- `File` – file handling and utility helpers
-- `Formatter` – number, mask, and data formatting
-- `HTTP` – HTTP requests and header helpers
-- `Mailer` – abstraction for PHPMailer integration
-- `Number` – numeric manipulation and memory unit helpers
-- `Parser` – data sanitization and filtering
-- `S3Storage` – data storage on s3 services
-- `Security` – hashing, encryption (AES, GCM), secure encoding
-- `Spreadsheet` – Excel and CSV utilities (via PhpSpreadsheet)
-- `SQL` – safe SQL snippet generators and query formatters
-- `Str` – string manipulation and pattern helpers
-- `System` – CLI detection, environment tools
-- `URL` – URL formating/encoding and query params appending
-- `Validator` – validation tools for CPF, CNPJ, dates, etc.
+---
+
+## 📂 Classes
+
+| Class | What it does |
+|---|---|
+| `DateTime` | Strict date parsing/validation, format and timezone conversion, intervals with month-end clamping, date ranges, age, durations (`HH:mm:ss` ↔ seconds), pt-BR texts |
+| `DBF` | Reads dBase (`.dbf`) files, with a configurable text encoding |
+| `File` | Directories, temp files, `.env` read/update, zip/unzip, uploads, file downloads, recursive delete (never follows links) |
+| `Formatter` | Number formatting (`R$ 1.234,56`), CPF/CNPJ/CEP masks, flat list → nested tree |
+| `HTTP` | cURL requests (`callWebService`), status headers, client IP, `Accept-Language`, JSON/XML responses, downloads |
+| `Mailer` | E-mail through PHPMailer: attachments, embedded images, provider shortcuts (Gmail, Office 365, …) |
+| `Number` | Rounding (round/floor/ceil), random decimals, parity |
+| `Parser` | Conversions: array ↔ XML/object, JSON extraction, base64/base64url, hex/binary, booleans, text lines |
+| `S3Storage` | Upload, download, copy, move, delete, list and find objects on Amazon S3 or an S3-compatible endpoint |
+| `Security` | Field, file and string encryption, blind-index hashes, passwords (Argon2id), XSS sanitizing, input filtering |
+| `Spreadsheet` | Reads `.xlsx` / `.xls` / `.ods` / `.csv` / `.html` into arrays |
+| `SQL` | Literal escaping and batched MySQL `INSERT … ON DUPLICATE KEY UPDATE` builder |
+| `Str` | Multibyte-safe string helpers: accents, casing, substrings, occurrences, random keys and GUIDs |
+| `System` | Memory units and usage, server memory, seeds, timers |
+| `URL` | HTTP header arrays, URL encoding and normalization, appending query parameters |
+| `Validator` | CPF, CNPJ, e-mail, password rules, JSON, XML, HTML, base64, dates, emptiness checks |
 
 ---
 
 ## 🧪 Requirements
 
-- PHP **>= 8.2**
-- Extensions:
-    - `ext-mbstring`
-    - `ext-json`
+- PHP **>= 8.2** with `ext-mbstring` and `ext-json`.
+- Anything else is needed only by the classes listed below:
 
----
+| Dependency | Needed by |
+|---|---|
+| `ext-openssl` | `Security` encryption (and `SQL::encryptDataDB`, which delegates to it) |
+| `ext-dom`, `ext-libxml`, `ext-simplexml` | `Security::xssCleanRecursive`, `Parser` XML helpers, `Validator::validateXml`, `Mailer` embedded images |
+| `ext-curl` | `HTTP::callWebService` |
+| `ext-zip` | `File` zip/unzip helpers |
+| `ext-intl` | *(optional)* `URL` — converts internationalized hosts (`münchen.de`) to punycode |
+| `ext-fileinfo` | *(optional)* `S3Storage` — content-type detection on upload |
+| `ext-iconv` | *(optional)* `DBF` — code pages mbstring lacks (CP437, CP852, CP1250) |
+| `phpmailer/phpmailer` | `Mailer` |
+| `phpoffice/phpspreadsheet` | `Spreadsheet` |
+| `aws/aws-sdk-php` | `S3Storage` |
+| `mervick/aes-bridge` | `Security::encryptCrossPlatform` / `decryptCrossPlatform` |
 
-## 🔌 Optional Dependencies
-
-The following packages are **only required if you use the related functionality**:
-
-| Package                         | Purpose                                    |
-|---------------------------------|--------------------------------------------|
-| `phpmailer/phpmailer`           | Required for email sending via `Mailer`    |
-| `phpoffice/phpspreadsheet`      | Required for Excel/CSV operations          |
-| `mervick/aes-bridge`            | Optional cross-platform AES encryption     |
-| `rebasedata/php-client`         | Required for file format conversions       |
-| `ext-curl`                      | Required for external HTTP requests        |
-| `ext-simplexml`                 | Required for XML manipulation              |
-| `ext-openssl`                   | Required for GCM/SSL encryption            |
-| `ext-dom`                       | Required for DOM and HTML/XML handling     |
-| `ext-ctype`                     | Required for type validation               |
-| `ext-calendar`                  | Required for date/calendar features        |
-| `ext-zip`                       | Required for working with `.zip` files     |
-| `ext-libxml`                    | Required for parsing and validation of XML |
+`Security::encryptPassword` also needs a PHP build with Argon2 support (`PASSWORD_ARGON2ID`).
 
 ---
 
 ## 📦 Installation
-
-You can include this library directly or via Composer (if structured as a package):
 
 ```bash
 composer config repositories.phphelper vcs https://github.com/vitor-delgallo/PHPHelper
 composer require vitor-delgallo/phphelper:dev-master
 ```
 
+Then require only the optional packages you use, e.g. `composer require phpmailer/phpmailer`.
+
 ---
 
-## 🔒 Security
+## 🚀 Quick start
 
-This library encrypts sensitive data. Read **[`SECURITY.md`](SECURITY.md)** for the cryptographic
-contract (AES-256-GCM with **required AAD** context binding, HKDF per-domain keys, keyed HMAC blind
-indexes, authenticated files) and for caller responsibilities (SSRF, XSS output-encoding,
-parameterized SQL). Encryption keys must be **>= 32 bytes**.
+```php
+use VD\PHPHelper\{DateTime, Formatter, HTTP, Security, Str, URL, Validator};
+
+// Brazilian documents and money
+Validator::validateCpf('529.982.247-25');                          // true
+Validator::validateCnpj('12.ABC.345/01DE-35');                     // true (alphanumeric CNPJ)
+Formatter::formatCpf('52998224725');                               // '529.982.247-25'
+Formatter::formatNumber('1234.5', '.', ',', '.', 'R$', '', 2);      // 'R$ 1.234,50'
+
+// Dates
+DateTime::convertDateToFormat('31/01/2024', 'Y-m-d', 'd/m/Y');      // '2024-01-31'
+DateTime::applyInterval('P1M', '2024-01-31', true, 'Y-m-d', 'Y-m-d'); // '2024-02-29' (clamped)
+
+// Strings and URLs
+Str::removeAccents('Ação Coração');                                // 'Acao Coracao'
+Str::generateGuid();                                               // random v4 UUID
+URL::appendParamsToUrl('https://example.com/search#top', ['q' => 'café']);
+// 'https://example.com/search?q=caf%C3%A9#top'
+
+// HTTP: returns the raw 2xx body, or a JSON error envelope for any failure / non-2xx status
+$body = HTTP::callWebService(
+    'https://api.example.com/orders',
+    'POST',
+    postData: ['id' => 1],
+    useRaw: true,                                   // send $postData as a JSON body
+    headers: ['Authorization' => 'Bearer <token>'],
+);
+```
+
+### Encryption
+
+Keys must be **at least 32 bytes** (e.g. `random_bytes(32)`, stored outside the database).
+
+```php
+use VD\PHPHelper\Security;
+
+// A database cell, bound to where it lives: moved to another row/column, it no longer decrypts
+$aad    = "customers.document:{$customerId}";
+$cipher = Security::encryptDataDB('529.982.247-25', $key, $aad);   // 'v1:…'
+$plain  = Security::decryptDataDB($cipher, $key, $aad);            // throws if tampered or moved
+
+// Deterministic blind index, to search an encrypted column
+$hash = Security::generateSearchHash('529.982.247-25', $key);      // 64 hex chars
+
+// Files: streamed block by block and authenticated end to end
+Security::encryptFileV2('/data/report.pdf', $key, '/data/report.pdf.enc');
+Security::decryptFileV2('/data/report.pdf.enc', $key, '/tmp/report.pdf');
+
+// Passwords (Argon2id)
+$stored = Security::encryptPassword($password);
+Security::verifyPassword($password, $stored);                      // true
+
+// XSS: allowlist sanitizer, walks arrays and plain objects
+Security::xssCleanRecursive(['bio' => '<b>hi</b><img src=x onerror=alert(1)>']);
+// ['bio' => '<b>hi</b><img src="x" />']
+```
+
+Read **[`SECURITY.md`](SECURITY.md)** before relying on these: it documents the exact cryptographic
+contract, the file format limits and what remains the caller's responsibility.
+
+---
+
+## ⚙️ Process-wide settings
+
+The classes are static, so these settings last for the whole PHP process — on a long-lived worker
+(FPM, queue workers, Swoole) they carry over between requests until changed. The two `Security`
+setters and `File::setDownloadBlockSize()` accept `null` to restore their default.
+
+| Setting | Default |
+|---|---|
+| `Security::setFileEncryptBlocksBytes()` — plaintext bytes per encrypted file block | 3,200,000 |
+| `Security::setFileMaxEncodedBlockBytes()` — largest encoded block accepted when encrypting and decrypting files | 256 MiB |
+| `DateTime::setDefaultTimezone()` / `setDefaultFormat()` | PHP's default timezone / `Y-m-d` |
+| `File::setDefaultMode()` / `setDownloadBlockSize()` | `0755` / 3 MiB |
+| `S3Storage::setKey()`, `setSecret()`, `setRegion()`, `setBucket()`, `setEndpoint()` … (`reset()` clears them) | — |
 
 ---
 
 ## 🧪 Testing
 
 ```bash
-php tests/SecurityCryptoTest.php
+composer install
+composer test                               # the whole suite
+vendor/bin/phpunit --exclude-group slow     # skips the exhaustive bit-flip and 64 MiB file tests
+vendor/bin/phpunit tests/SecurityFileEncryptionTest.php
 ```
+
+- The dev dependencies need `ext-zip` enabled.
+- No test touches the network: HTTP and Mailer run against loopback servers, and S3 runs on the AWS
+  SDK's `MockHandler`.
+- `tests/SQLEngineTest.php` checks the SQL escaping against a real SQLite (`pdo_sqlite`), and
+  against a live MySQL only when `VDPH_TEST_MYSQL_DSN` (plus `_USER` / `_PASSWORD`) is set.
+- Tests that need something the platform lacks (symlink privilege, POSIX permissions, a locale) are
+  skipped with the reason.
 
 ---
 
 ## 🤝 Contributing
-If you want to contribute, feel free to open **issues** and **pull requests** in the repository!
+
+Issues and pull requests are welcome.
 
 ---
 
 ## 📜 License
-This project is licensed under the **MIT** license.
+
+This project is licensed under the **MIT** license — see [`LICENSE`](LICENSE).

@@ -19,6 +19,10 @@ of the other helpers. Tests are the PHPUnit suite (`composer test`); the crypto 
   authentication failure; the library parses the format itself and throws instead).
 - **Non-scalar input is refused.** Arrays and plain objects throw `InvalidArgumentException` instead
   of being encrypted (or blind-indexed) as the literal text `"Array"`.
+- **Empty in, empty out.** `null` and `""` are not encrypted: the encrypt functions return `""`, and
+  decrypting `""` returns `""` without an error. A ciphertext that was deleted or blanked therefore
+  reads back as an empty value, not as a failure — if an empty value is never legitimate for a
+  field, check for it yourself.
 
 ### Field encryption — `encryptDataDB` / `decryptDataDB`
 
@@ -44,13 +48,16 @@ per index domain (equal input must map to equal hash for lookup/uniqueness):
 $hash = Security::generateSearchHash($normalizedEmail, $blindIndexKey); // salt "" = stable
 ```
 
+Being deterministic, it reveals which rows share a value — inherent to any blind index. Normalize
+the input (case, spaces, masks) before hashing, or equal values will not match.
+
 ### Authenticated files — `encryptFileV2` / `decryptFileV2`
 
 Streaming AES-256-GCM. Each block's AAD binds `fileId | version | "D" | index`, and an authenticated
 end marker binds the total block count. This defeats **truncation, reordering, duplication, and
 cross-file splicing** — all rejected on decrypt. The container encoding (`{len}-{base64}` blocks) is
 parsed strictly, so non-canonical encodings (leading zeros, `+`, whitespace, bad padding) are
-rejected too.
+rejected too. The salt is stored in clear in the header (a salt is not a secret); the key never is.
 
 Two process-global settings (reset with `null`):
 
@@ -71,7 +78,10 @@ any spelling, symlink or hard link) is refused.
 
 ### Local strings — `encryptLocal` / `decryptLocal`
 
-AES-256-CTR with encrypt-then-HMAC-SHA256 (verified with `hash_equals` before decrypt).
+AES-256-CTR with encrypt-then-HMAC-SHA256 (verified with `hash_equals` before decrypt; a wrong key
+or any modification throws). It is **not bound to a context**: a value encrypted under the same key
+and salt decrypts wherever it is pasted. Use `encryptDataDB` with an AAD when a value must not be
+movable.
 
 ### Cross-platform — `encryptCrossPlatform` / `decryptCrossPlatform`
 
@@ -85,9 +95,11 @@ Argon2id via `password_hash`/`password_verify`. Never use the encryption helpers
 
 ## Security-relevant behavior of the other helpers
 
-- **SQL** — `SQL::escapeString` doubles the quote (`''`) and the backslash, and writes NUL as `\0`.
-  That is safe under MySQL in both `sql_mode`s, standard-conforming PostgreSQL and SQLite; it is
-  **not** safe on big5/cp932/gbk/gb18030/sjis connections. Prefer prepared statements.
+- **SQL** — `SQL::escapeString` returns a quoted literal: it doubles the quote (`''`) and the
+  backslash, and writes NUL as `\0`. No value can leave its literal under MySQL (either `sql_mode`),
+  standard-conforming PostgreSQL or SQLite; outside MySQL's default mode a backslash or NUL is stored
+  doubled, so the value changes but nothing is injected. It is **not** safe on
+  big5/cp932/gbk/gb18030/sjis connections. Prefer prepared statements.
 - **XSS** — `Security::xssCleanRecursive` is a DOM-based **allowlist** sanitizer (elements,
   attributes and URL schemes). Array keys and private/protected object state are not walked;
   escape them on output.
@@ -116,7 +128,8 @@ Argon2id via `password_hash`/`password_verify`. Never use the encryption helpers
   URLs without an egress allowlist; never disable peer verification in production.
 - **Forwarded client IPs** — only `REMOTE_ADDR` is trustworthy; trust `X-Forwarded-For` only behind
   a known proxy.
-- **`filterValue(addSlashes/escapeDB)`** is not safe SQL escaping — use prepared statements.
+- **`filterValue(addSlashes: true)`** is not SQL escaping. `filterValue(escapeDB: true)` delegates to
+  `SQL::escapeString` and has the same limits. Use prepared statements.
 - **S3 uploads** — `S3Storage::upload` detects the content type from the file's bytes; pass an
   explicit `ContentType` for user uploads if the bucket is served from a trusted domain.
 - **Seeds** — `System::makeSeed` produces a seed for `mt_rand`-style generators, not a secret.

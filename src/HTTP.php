@@ -75,6 +75,11 @@ class HTTP {
     /**
      * Sends an HTTP request using cURL and returns the response body.
      *
+     * Static like the rest of the class (it holds no state). It used to be the one instance method,
+     * so HTTP::callWebService() died with "Non-static method cannot be called statically"; the old
+     * (new HTTP())->callWebService() form still works, since PHP allows calling a static method
+     * through an instance.
+     *
      * The URL is requested EXACTLY as supplied: no scheme, host, "www." or trailing slash is
      * ever added or removed. Only $queryParams is appended to it.
      *
@@ -176,7 +181,7 @@ class HTTP {
      *                                   or if $useRaw is set and $postData cannot be JSON-encoded
      *                                   (e.g. invalid UTF-8, NAN) — that used to send an EMPTY body.
      */
-    public function callWebService(
+    public static function callWebService(
         string $url,
         string $requestType = 'GET',
         array $queryParams = [],

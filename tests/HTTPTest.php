@@ -315,7 +315,8 @@ final class HTTPTest extends TestCase
 
     private function http(): HTTP
     {
-        // callWebService() is the one non-static method on the class.
+        // callWebService() is static; the suite keeps calling it through an instance so the
+        // pre-existing (new HTTP())->callWebService() form stays covered.
         return new HTTP();
     }
 
@@ -327,6 +328,20 @@ final class HTTPTest extends TestCase
 
         self::assertSame('GET', $echo['method']);
         self::assertSame('/echo', $echo['uri']);
+    }
+
+    /**
+     * FINDING (low): callWebService() was the only instance method of an otherwise static class,
+     * so the natural HTTP::callWebService() call died with "Non-static method cannot be called
+     * statically". It is static now; this pins the static form.
+     */
+    public function testCallWebServiceCanBeCalledStatically(): void
+    {
+        self::assertTrue((new \ReflectionMethod(HTTP::class, 'callWebService'))->isStatic());
+
+        $echo = $this->decodeEcho(HTTP::callWebService(self::$baseUrl . '/echo'));
+
+        self::assertSame('GET', $echo['method']);
     }
 
     /**
