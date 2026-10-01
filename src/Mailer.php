@@ -502,7 +502,10 @@ class Mailer {
                 $mail->Body = $rebuilt;
             }
 
-            $mail->AltBody = strip_tags($mail->Body);
+            // The text/plain part. PHPMailer's own converter drops <head>, <title>, <style> and
+            // <script> before stripping tags and decodes entities; a bare strip_tags() used to
+            // leave the stylesheet and script text in the plain part and "&amp;" encoded.
+            $mail->AltBody = $mail->html2text($mail->Body);
 
             $ret = $mail->send();
             if (!$ret) {

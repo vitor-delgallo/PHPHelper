@@ -759,6 +759,42 @@ SINK;
     }
 
     /**
+     * FINDING (fixed): the AltBody was strip_tags() of the whole body, so the CSS of a <style>
+     * block, a <script> and the <title> all landed in the text/plain part, and entities stayed
+     * encoded ("&amp;"). PHPMailer's own html2text() drops those elements and decodes.
+     */
+    public function testSendMailAltBodyLeavesStylesScriptsAndEntitiesOut(): void
+    {
+        $port = $this->startSink();
+
+        self::assertTrue(Mailer::sendMail(
+            $this->configs($port),
+            [['email' => 'to@example.com', 'name' => 'To']],
+            'Subject',
+            '<html><head><title>page title</title><style>.wrap{color:#B08D57}</style></head>'
+            . '<body><script>alert(1)</script><p>Tom &amp; Jerry &lt;3</p></body></html>'
+        ));
+
+        $plain = self::plainPart($this->sinkCapture()['eml']);
+        self::assertStringContainsString('Tom & Jerry <3', $plain);
+        self::assertStringNotContainsString('color:#B08D57', $plain, 'no stylesheet in the text part');
+        self::assertStringNotContainsString('alert(1)', $plain, 'no script in the text part');
+        self::assertStringNotContainsString('page title', $plain, 'no <title> in the text part');
+    }
+
+    /** The text/plain part of a multipart message as the sink captured it. */
+    private static function plainPart(string $eml): string
+    {
+        $start = strpos($eml, 'Content-Type: text/plain');
+        self::assertNotFalse($start, 'the message has a text/plain part');
+        $part = substr($eml, $start);
+        $end = strpos($part, "
+--", 1);
+
+        return $end === false ? $part : substr($part, 0, $end);
+    }
+
+    /**
      * FINDING (fixed): View::make()->render() sat OUTSIDE every try block, so a Blade compile error
      * — an ErrorException/ViewException, which the PHPMailer-only catch would not have held anyway —
      * escaped a function whose signature promises bool.
