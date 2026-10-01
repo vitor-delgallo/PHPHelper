@@ -67,22 +67,15 @@ class Security {
     private const KEY_ID_BYTES = 8;
 
     /**
-     * File format written by encryptFile(): a key per file, counter nonces, key id in the header.
+     * The file format encryptFile() writes and decryptFile() reads — the only one: a key per file,
+     * counter nonces, key id in the header. Earlier formats (v1, v2) are refused.
      *
      * @var string
      */
     private const FILE_VERSION = 'v3';
 
     /**
-     * Legacy file format: one key for every file under a master key and salt, random nonces.
-     * decryptFile() still reads it; nothing writes it any more.
-     *
-     * @var string
-     */
-    private const FILE_V2_VERSION = 'v2';
-
-    /**
-     * Cipher of both file formats; also written as the file's first header block.
+     * Cipher of the file format; also written as the file's first header block.
      *
      * @var string
      */
@@ -253,11 +246,11 @@ class Security {
 
     /**
      * The smallest usable max-encoded-block limit: the encoded size of the largest FIXED-size block
-     * every file contains — the hex file id, 44 bytes, in both formats. Below it not even an empty
-     * file could be written or read. The other fixed blocks are smaller: cipher name (16), version
-     * (4), v3 key id (24), v2 IV (16) and tag (24), and the smallest v3 block, one byte of
-     * ciphertext plus its tag (24). The v3 end marker holds the block count plus a tag, so a 44-byte
-     * limit still fits the end marker of any file of fewer than 10^17 blocks.
+     * every file contains — the hex file id, 44 bytes. Below it not even an empty file could be
+     * written or read. The other fixed blocks are smaller: cipher name (16), version (4), key id
+     * (24), and the smallest data block, one byte of ciphertext plus its tag (24). The end marker
+     * holds the block count plus a tag, so a 44-byte limit still fits the end marker of any file of
+     * fewer than 10^17 blocks.
      *
      * @return int
      */
@@ -267,9 +260,7 @@ class Security {
             self::encodedBlockBytes(strlen(self::FILE_VERSION)),
             self::encodedBlockBytes(2 * self::KEY_ID_BYTES),
             self::encodedBlockBytes(2 * self::FILE_ID_BYTES),
-            self::encodedBlockBytes(1 + self::GCM_TAG_BYTES),
-            self::encodedBlockBytes(self::GCM_IV_BYTES),
-            self::encodedBlockBytes(self::GCM_TAG_BYTES)
+            self::encodedBlockBytes(1 + self::GCM_TAG_BYTES)
         );
     }
 
@@ -499,15 +490,14 @@ class Security {
      * "F" end marker) and its position, so reorder, duplication, cross-file splice and header
      * tamper all fail authentication. Shared by both directions so they cannot drift apart.
      *
-     * @param string $version Format version, "v3" or "v2"
      * @param string $fileId Per-file id, as written in the header
      * @param string $kind "D" or "F"
      * @param int $index Position of a data block; the block count for the end marker
      *
      * @return string
      */
-    private static function fileAad(string $version, string $fileId, string $kind, int $index): string {
-        return $fileId . "|" . $version . "|" . $kind . "|" . $index;
+    private static function fileAad(string $fileId, string $kind, int $index): string {
+        return $fileId . "|" . self::FILE_VERSION . "|" . $kind . "|" . $index;
     }
 
     /**
@@ -545,7 +535,7 @@ class Security {
             OPENSSL_RAW_DATA,
             self::fileV3Nonce($index),
             $tag,
-            self::fileAad(self::FILE_VERSION, $fileId, $kind, $index),
+            self::fileAad($fileId, $kind, $index),
             self::GCM_TAG_BYTES
         );
 
@@ -1242,8 +1232,8 @@ class Security {
     /**
      * Encrypts a file with AES-256-GCM into the authenticated, chunked v3 format.
      *
-     * Replaces encryptFileV2(), which was removed: the suffix named a file format, and the format
-     * this method writes is v3. decryptFile() reads both v3 and the older v2 files.
+     * Replaces encryptFileV2(), which was removed along with the v2 format it wrote: v3 is the only
+     * file format this library writes or reads.
      *
      * FORMAT v3 (stable). A sequence of length-encoded blocks, "{decimal length}-{base64}":
      *   header:   "aes-256-gcm", "v3", key id (keyId() of the key used), salt, file id (32 hex
@@ -1406,9 +1396,9 @@ class Security {
     }
 
     /**
-     * Decrypts a file produced by encryptFile (format v3) or by the former encryptFileV2 (format
-     * v2), verifying the GCM tag of every block. Replaces decryptFileV2(), which was removed along
-     * with encryptFileV2().
+     * Decrypts a file produced by encryptFile (format v3), verifying the GCM tag of every block.
+     * Replaces decryptFileV2(), which was removed along with encryptFileV2(). Files in the earlier
+     * v1/v2 formats are REFUSED (unsupported version) — v3 is the only format read.
      *
      * FAILS LOUD — this function NEVER returns false. Every failure mode (unreadable source,
      * unresolvable destination, a key the keyring does not hold, wrong key, tampered/reordered/
@@ -1439,9 +1429,8 @@ class Security {
      *
      * @param string $source Path to the file to be decrypted (use tmp_name when from $_FILES)
      * @param string|Keyring $key The master key the file was encrypted under, or a keyring holding
-     *                            it. A v3 file names its key in the header; a v2 file does not, so
-     *                            each key of the keyring is tried on its first block. The salt is
-     *                            read from the file header.
+     *                            it: the file names its key in the header, and decryption goes
+     *                            straight to it. The salt is read from the file header.
      * @param string $destination Path where the decrypted file should be saved. MUST NOT be $source.
      *                            A missing directory is created with File::getDefaultMode().
      * @param string|null $permissionMode Octal mode for the destination file (e.g. "0600"). The
@@ -1496,14 +1485,17 @@ class Security {
                 throw new \Exception("Cipher type does not match with the one used in function");
             }
 
-            // The rest of the header depends on the format; each reader validates it in full and
-            // resolves the key before anything is created next to the destination.
             $fVersion = self::readRequiredLengthEncodedBlock($fpIn, "cipher version");
-            $decryptBody = match ($fVersion) {
-                self::FILE_VERSION => self::fileV3BodyDecryptor($fpIn, $keys),
-                self::FILE_V2_VERSION => self::fileV2BodyDecryptor($fpIn, $keys),
-                default => throw new \Exception("Cipher version does not match with the one used in function (unsupported file format version)."),
-            };
+            if ($fVersion !== self::FILE_VERSION) {
+                throw new \Exception(
+                    "Cipher version does not match with the one used in function: only file format v3 is supported "
+                    . "(files written by the removed encryptFileV2 are v2 and can no longer be decrypted)."
+                );
+            }
+
+            // The rest of the header is validated in full, and the key resolved, before anything is
+            // created next to the destination.
+            $decryptBody = self::fileV3BodyDecryptor($fpIn, $keys);
 
             [$stagingPath, $fpOut] = self::openStagingFile($destination);
             $decryptBody($fpOut);
@@ -1555,10 +1547,10 @@ class Security {
      *
      * @param string $path Encrypted file
      *
-     * @throws \Exception When the file cannot be read or is not an encrypted file
-     * @return string|null The key id of a v3 file; null for a legacy v2 file, which records none
+     * @throws \Exception When the file cannot be read or is not an encrypted file (v3)
+     * @return string The key id (16 hex characters)
      */
-    public static function fileKeyId(string $path): ?string {
+    public static function fileKeyId(string $path): string {
         $source = self::getRealSource($path);
         $fp = @fopen($source, 'rb');
         if ($fp === false) {
@@ -1570,12 +1562,8 @@ class Security {
                 throw new \Exception("Cipher type does not match with the one used in function");
             }
 
-            $version = self::readRequiredLengthEncodedBlock($fp, "cipher version");
-            if ($version === self::FILE_V2_VERSION) {
-                return null;
-            }
-            if ($version !== self::FILE_VERSION) {
-                throw new \Exception("Cipher version does not match with the one used in function (unsupported file format version).");
+            if (self::readRequiredLengthEncodedBlock($fp, "cipher version") !== self::FILE_VERSION) {
+                throw new \Exception("Cipher version does not match with the one used in function: only file format v3 is supported.");
             }
 
             $keyId = self::readRequiredLengthEncodedBlock($fp, "key id");
@@ -1637,96 +1625,18 @@ class Security {
                 $block = null;
 
                 // Try to authenticate it as the DATA block at the expected position.
-                $plaintext = openssl_decrypt($ciphertext, self::FILE_CIPHER, $fileKey, OPENSSL_RAW_DATA, $nonce, $tag, self::fileAad(self::FILE_VERSION, $fileId, "D", $index));
+                $plaintext = openssl_decrypt($ciphertext, self::FILE_CIPHER, $fileKey, OPENSSL_RAW_DATA, $nonce, $tag, self::fileAad($fileId, "D", $index));
                 if ($plaintext !== false) {
                     self::writeAll($fpOut, $plaintext, "plaintext");
                     continue;
                 }
 
                 // Otherwise it must be the authenticated end marker for exactly $index blocks.
-                $count = openssl_decrypt($ciphertext, self::FILE_CIPHER, $fileKey, OPENSSL_RAW_DATA, $nonce, $tag, self::fileAad(self::FILE_VERSION, $fileId, "F", $index));
+                $count = openssl_decrypt($ciphertext, self::FILE_CIPHER, $fileKey, OPENSSL_RAW_DATA, $nonce, $tag, self::fileAad($fileId, "F", $index));
                 if ($count === false || $count !== (string) $index) {
                     throw new \Exception(
                         "Error on creating plaintext of a ciphertext: block {$index} failed authentication "
                         . "(the file was tampered with, reordered, spliced or truncated)."
-                    );
-                }
-
-                return;
-            }
-        };
-    }
-
-    /**
-     * Reads the rest of a LEGACY v2 header (salt, file id) and returns the function that decrypts
-     * the [iv][tag][ciphertext] triples that follow into a stream. v2 files carry no key id, so the
-     * first triple decides which key of the keyring is the file's.
-     *
-     * @param resource $fpIn Source, positioned after the version block
-     * @param Keyring $keys Keys to try
-     *
-     * @throws \Exception On a malformed header
-     * @return \Closure(resource): void
-     */
-    private static function fileV2BodyDecryptor($fpIn, Keyring $keys): \Closure {
-        $salt = self::readRequiredLengthEncodedBlock($fpIn, "cipher salt");
-        $fileId = self::readRequiredLengthEncodedBlock($fpIn, "file id");
-
-        // One candidate per key of the keyring; the first block decides which one is right.
-        $candidates = [];
-        foreach ($keys->all() as $masterKey) {
-            $candidates[] = self::deriveKey($masterKey, 32, $salt, 'file-v2');
-        }
-
-        return static function ($fpOut) use ($fpIn, $candidates, $fileId): void {
-            $key = null;
-            for ($index = 0; ; $index++) {
-                $iv = self::readLengthEncodedBlock($fpIn, "IV ciphertext");
-                if ($iv === null) {
-                    throw new \Exception("Encrypted file is truncated (missing authenticated end marker)");
-                }
-                if (strlen($iv) !== self::GCM_IV_BYTES) {
-                    throw new \Exception("Error on validating iv length");
-                }
-
-                $tag = self::readRequiredLengthEncodedBlock($fpIn, "tag ciphertext");
-                if (strlen($tag) !== self::GCM_TAG_BYTES) {
-                    throw new \Exception("Error on validating tag length");
-                }
-
-                $ciphertext = self::readRequiredLengthEncodedBlock($fpIn, "ciphertext");
-
-                // The first block is either data block 0 or, for an empty file, the end marker:
-                // the key it authenticates under is the file's key.
-                if ($key === null) {
-                    foreach ($candidates as $candidate) {
-                        if (openssl_decrypt($ciphertext, self::FILE_CIPHER, $candidate, OPENSSL_RAW_DATA, $iv, $tag, self::fileAad(self::FILE_V2_VERSION, $fileId, "D", 0)) !== false
-                            || openssl_decrypt($ciphertext, self::FILE_CIPHER, $candidate, OPENSSL_RAW_DATA, $iv, $tag, self::fileAad(self::FILE_V2_VERSION, $fileId, "F", 0)) !== false) {
-                            $key = $candidate;
-                            break;
-                        }
-                    }
-                    if ($key === null) {
-                        throw new \Exception(
-                            "Error on creating plaintext of a ciphertext: block 0 failed authentication under every key "
-                            . "(wrong key, or the file was tampered with, reordered, spliced or truncated)."
-                        );
-                    }
-                }
-
-                // Try to authenticate it as the DATA block at the expected position.
-                $plaintext = openssl_decrypt($ciphertext, self::FILE_CIPHER, $key, OPENSSL_RAW_DATA, $iv, $tag, self::fileAad(self::FILE_V2_VERSION, $fileId, "D", $index));
-                if ($plaintext !== false) {
-                    self::writeAll($fpOut, $plaintext, "plaintext");
-                    continue;
-                }
-
-                // Otherwise it must be the authenticated end marker for exactly $index blocks.
-                $count = openssl_decrypt($ciphertext, self::FILE_CIPHER, $key, OPENSSL_RAW_DATA, $iv, $tag, self::fileAad(self::FILE_V2_VERSION, $fileId, "F", $index));
-                if ($count === false || $count !== (string) $index) {
-                    throw new \Exception(
-                        "Error on creating plaintext of a ciphertext: block {$index} failed authentication "
-                        . "(wrong key, or the file was tampered with, reordered, spliced or truncated)."
                     );
                 }
 

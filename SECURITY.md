@@ -63,8 +63,7 @@ keys, used only to decrypt what they wrote. Every method that takes `$key` accep
      `WHERE email_hash IN (...Security::generateSearchHashes($email, $keys))`.
    - **Files** — a v3 file names its key in its header: `Security::fileKeyId($path)` reads it
      without decrypting. Re-encrypt every file whose id is not `$keys->currentId()`
-     (`decryptFile` with the keyring, then `encryptFile`). Legacy v2 files record no key id
-     (`fileKeyId()` returns `null`): `decryptFile` tries each key on them; re-encrypt them all.
+     (`decryptFile` with the keyring, then `encryptFile`).
    - **Cross-platform values** carry no key id (the format is aes-bridge's): `decryptCrossPlatform`
      tries each key of the keyring. Re-encrypt them and keep track of which ones are done.
    - **Local values** (`encryptLocal`) are usually short-lived tokens: let them expire, or
@@ -74,7 +73,7 @@ keys, used only to decrypt what they wrote. Every method that takes `$key` accep
 ## Cryptographic contract
 
 - **Keys are >= 32 bytes.** HKDF cannot add entropy, so the AES-256 paths require a 32-byte master
-  key. Derivation is HKDF-SHA256 with **per-domain** `info` labels (`db-cell`, `file-v2`, `local`,
+  key. Derivation is HKDF-SHA256 with **per-domain** `info` labels (`db-cell`, `file-v3`, `local`,
   `search-hash`, …) so unrelated subsystems never share a key.
 - **Randomness fails closed.** Nonces come from `random_bytes()` with no weak fallback; if no strong
   RNG is available the call throws instead of encrypting with a predictable nonce.
@@ -199,9 +198,10 @@ defenses, both on the application side:
 
 ### Authenticated files — `encryptFile` / `decryptFile`
 
-Streaming AES-256-GCM in the **v3** format. `encryptFile` writes v3; `decryptFile` reads v3 and the
-legacy v2 files of the former `encryptFileV2` (that method and `decryptFileV2` were removed: their
-suffix named a format, and the format written is now v3).
+Streaming AES-256-GCM in the **v3** format — the only file format: `encryptFile` writes it and
+`decryptFile` reads nothing else. Files in the earlier v1/v2 formats (the removed
+`encryptFileV1`/`encryptFileV2`) are refused with an "only file format v3 is supported" error;
+decrypt them with the library version that wrote them and encrypt them again with this one.
 
 ```
 header:      "aes-256-gcm", "v3", key id, salt, file id (16 random bytes, hex)
@@ -213,18 +213,17 @@ AAD       = "{file id}|v3|D|{i}"   ("{file id}|v3|F|{n}" for the end marker)
 ```
 
 - **No nonce can repeat, at any block size or volume.** Every file has its own key, and within a
-  file the nonce is the block number. (v2 drew a random nonce per block under one key shared by
-  every file with the same master key and salt, which caps the safe volume at about 2³² blocks per
-  key — 4 GiB of data at 1-byte blocks.) Nothing per block is stored but the tag, so files are also
-  smaller: at 1-byte blocks, about half the size of v2.
+  file the nonce is the block number. (The removed v2 format drew a random nonce per block under
+  one key shared by every file with the same master key and salt, which capped the safe volume at
+  about 2³² blocks per key — 4 GiB of data at 1-byte blocks.) Nothing per block is stored but the
+  tag, so files are also smaller: at 1-byte blocks, about half the size v2 needed.
 - **Truncation, reordering, duplication and cross-file splicing** are all rejected: the end marker
   authenticates the block count, and every block is bound to its position by its nonce and AAD,
   and to its file by the file key.
 - **The header names the key.** With a `Keyring`, `decryptFile` goes straight to the key with that
   id; an id the keyring does not hold fails with an error naming it. Rewriting the id to another key
   of the keyring makes every block fail. `Security::fileKeyId($path)` reads the id without
-  decrypting (see *Key rotation*). Legacy v2 files carry no id: each key is tried on the first
-  block.
+  decrypting (see *Key rotation*).
 - The header is not authenticated on its own, but every field of it selects the key (key id, salt,
   file id) or is checked for equality (cipher, version), so tampering with it fails every block.
   The container encoding (`{len}-{base64}` blocks) is parsed strictly, so non-canonical encodings

@@ -12,8 +12,8 @@ use VD\PHPHelper\Security;
  * encryptFile / decryptFile end to end: exact round trips around every block boundary, the
  * configurable max-encoded-block limit on both sides, streaming memory, and an adversarial decrypt
  * battery — for the v3 format encryptFile writes (a key per file, counter nonces, key id in the
- * header), checked against an independent implementation of it, plus the legacy v2 format
- * decryptFile still reads.
+ * header), checked against an independent implementation of it — and the refusal of the earlier
+ * v2 format, which is no longer read.
  *
  * Every test runs in its own directory, so "nothing was left behind" is checked as "the directory
  * holds exactly the files the test created" — which also catches a stray staging (.part) file.
@@ -45,10 +45,10 @@ final class SecurityFileEncryptionTest extends TestCase
 
     /**
      * A LEGACY v2 file, written by the former encryptFileV2 before the reader/writer rewrite (block
-     * size 16, key 'L' x 32, salt 'legacy-salt'). decryptFile must keep reading it.
+     * size 16, key 'L' x 32, salt 'legacy-salt'). v3 is the only format read: decryptFile must
+     * refuse it, loudly and without leaving anything behind.
      */
     private const LEGACY_KEY = 'LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL';
-    private const LEGACY_PAYLOAD_B64 = 'TGVnYWN5IFYyIHZlY3RvcjogMDEyMzQ1Njc4OS1BQkMA/w0KGiBlbmQ=';
     private const LEGACY_FILE_B64 = 'MTYtWVdWekxUSTFOaTFuWTIwPTQtZGpJPTE2LWJHVm5ZV041TFhOaGJIUT00NC1ZekJtWlRVeU16YzJNREU1WkRFd1lqSXdOR1ZpTWpNNVkySTFORFE0TjJVPTE2LWw0eXViRjQ5eXFlZHRPK0cyNC1JZzhzZloyWmZCbzJMS3JJeFBHNjl3PT0yNC1MeW1aMHIxaGlqQkJLbWN4TUNXVjJnPT0xNi1BVzRKNm9WZU4vQzJQaHdyMjQtbkhpNENZaDhrTnhnMDZBNUk1R2hsQT09MjQtN0phcTZuU1Y4alo3TVZMS0pEQkNIZz09MTYtdGdXMkhTNHM4MGowalhnazI0LTNQaWc5RmRsSmZkaWsyV0wzSWxscnc9PTEyLWZyZWFnTVgybWtZTzE2LVd1N1lweTFIWUVZVGViVVkyNC1UR1Ayclk4c2ZEODFOT1gzLzVyQnFBPT00LVFRPT0=';
 
     private string $dir;
@@ -723,16 +723,23 @@ final class SecurityFileEncryptionTest extends TestCase
         }
     }
 
-    /** LEGACY: v2 files built by the independent v2 encoder still decrypt — through a keyring too. */
-    public function testLegacyV2FilesStillDecrypt(): void
+    /**
+     * Only v3 is read: a genuine v2 file — built by the independent v2 encoder under the right key —
+     * is refused on its version, before any key is tried or anything is created.
+     */
+    public function testV2FilesAreRefusedEvenUnderTheRightKey(): void
     {
-        foreach ([[0, 16], [1, 16], [16, 16], [17, 16], [1000, 7]] as [$size, $block]) {
-            $payload = self::bytes($size, "v2-{$size}");
-            $crafted = $this->write("v2-{$size}.enc", self::referenceEncryptV2($payload, self::KEY, 'v2-salt', $block));
+        foreach ([[0, 16], [1, 16], [1000, 7]] as [$size, $block]) {
+            $crafted = $this->write("v2-{$size}.enc", self::referenceEncryptV2(self::bytes($size, "v2-{$size}"), self::KEY, 'v2-salt', $block));
+            $before = $this->dirEntries();
 
-            $dec = Security::decryptFile($crafted, new Keyring(self::OTHER_KEY, self::KEY), $this->path("v2-{$size}.dec"));
-
-            $this->assertTrue($payload === file_get_contents($dec), "size {$size}");
+            try {
+                Security::decryptFile($crafted, new Keyring(self::OTHER_KEY, self::KEY), $this->path("v2-{$size}.dec"));
+                $this->fail("size {$size}: a v2 file must be refused.");
+            } catch (\Exception $e) {
+                $this->assertStringContainsString('only file format v3 is supported', $e->getMessage());
+            }
+            $this->assertSame($before, $this->dirEntries(), "size {$size}: something was created");
         }
     }
 
@@ -825,22 +832,33 @@ final class SecurityFileEncryptionTest extends TestCase
 
         $this->assertSame(self::KEY_ID, Security::fileKeyId($underKey));
         $this->assertSame(self::referenceKeyId(self::OTHER_KEY), Security::fileKeyId($underOther));
-        $this->assertNull(Security::fileKeyId($legacy), 'a v2 file records no key id');
-
-        $this->expectException(\Exception::class);
-        $this->expectExceptionMessage('Cipher type does not match');
-        Security::fileKeyId($this->write('junk', self::encodeBlocks(['not a cipher'])));
+        foreach (['a v2 file' => [$legacy, 'only file format v3 is supported'],
+                  'not an encrypted file' => [$this->write('junk', self::encodeBlocks(['not a cipher'])), 'Cipher type does not match']] as $label => [$path, $message]) {
+            try {
+                Security::fileKeyId($path);
+                $this->fail("{$label} must be refused.");
+            } catch (\Exception $e) {
+                $this->assertStringContainsString($message, $e->getMessage(), $label);
+            }
+        }
     }
 
-    /** LEGACY: a v2 file written before the reader/writer rewrite still decrypts. */
-    public function testALegacyFileWrittenBeforeTheRewriteStillDecrypts(): void
+    /** The v2 file the former encryptFileV2 wrote is refused under its own key, leaving nothing behind. */
+    public function testTheLegacyV2FileIsRefused(): void
     {
+        $this->assertSame('v2', self::decodeBlocks(base64_decode(self::LEGACY_FILE_B64))[1], 'premise: a v2 file');
         $legacy = $this->write('legacy.enc', base64_decode(self::LEGACY_FILE_B64));
+        $destination = $this->write('legacy.dec', 'PREVIOUS');
 
-        $dec = Security::decryptFile($legacy, self::LEGACY_KEY, $this->path('legacy.dec'));
+        try {
+            Security::decryptFile($legacy, self::LEGACY_KEY, $destination);
+            $this->fail('A v2 file must be refused.');
+        } catch (\Exception $e) {
+            $this->assertStringContainsString('only file format v3 is supported', $e->getMessage());
+        }
 
-        $this->assertSame(base64_decode(self::LEGACY_PAYLOAD_B64), file_get_contents($dec));
-        $this->assertSame('legacy-salt', self::decodeBlocks(base64_decode(self::LEGACY_FILE_B64))[2]);
+        $this->assertSame('PREVIOUS', file_get_contents($destination));
+        $this->assertSame(['legacy.dec', 'legacy.enc'], $this->dirEntries());
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1394,7 +1412,8 @@ final class SecurityFileEncryptionTest extends TestCase
             'v3: malformed file id'        => [self::encodeBlocks(['aes-256-gcm', 'v3', self::KEY_ID, '?', 'short']), 'malformed file id'],
             'v3: block shorter than a tag' => [self::encodeBlocks(['aes-256-gcm', 'v3', self::KEY_ID, '?', $fileId, str_repeat('t', 16)]), 'shorter than ciphertext plus tag'],
             'v3: header only'              => [self::encodeBlocks(['aes-256-gcm', 'v3', self::KEY_ID, '?', $fileId]), 'truncated'],
-            'v2: short IV'                 => [self::encodeBlocks(['aes-256-gcm', 'v2', '?', $fileId, str_repeat('i', 11)]), 'iv length'],
+            'v2 (no longer read)'          => [self::encodeBlocks(['aes-256-gcm', 'v2', '?', $fileId]), 'only file format v3 is supported'],
+            'v1 (no longer read)'          => [self::encodeBlocks(['aes-256-gcm', 'v1', '?', $fileId]), 'only file format v3 is supported'],
             'length never ends'            => [str_repeat('1', 5), 'truncated'],
         ];
     }
