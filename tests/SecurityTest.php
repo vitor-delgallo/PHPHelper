@@ -93,9 +93,10 @@ final class SecurityTest extends TestCase
     }
 
     /**
-     * Splits the V2 file format into its raw "{len}-{base64}" blocks so a test can manipulate the
-     * ciphertext structurally. Layout: [cipher][version][salt][fileId] then [iv][tag][ct] triples,
-     * then the authenticated end-marker triple.
+     * Splits the v3 file format into its raw "{len}-{base64}" blocks so a test can manipulate the
+     * ciphertext structurally. Layout: [cipher][version][keyId][salt][fileId] (blocks 0-4), then one
+     * [ciphertext || tag] block per data block (block 5 is data block 0), then the authenticated
+     * end-marker block.
      *
      * @return string[] The base64 payload of each block, in file order
      */
@@ -138,7 +139,7 @@ final class SecurityTest extends TestCase
         $src = $this->tempPath('src');
         $enc = $this->tempPath('enc');
         file_put_contents($src, $payload);
-        Security::encryptFileV2($src, $key ?? self::masterKey(), $enc);
+        Security::encryptFile($src, $key ?? self::masterKey(), $enc);
 
         return [$src, $enc];
     }
@@ -313,13 +314,13 @@ final class SecurityTest extends TestCase
         Security::generateSearchHash('x', str_repeat('k', 31));
     }
 
-    public function testEncryptFileV2RejectsShortKey(): void
+    public function testEncryptFileRejectsShortKey(): void
     {
         $src = $this->tempPath('src');
         file_put_contents($src, 'payload');
 
         $this->expectException(\Exception::class);
-        Security::encryptFileV2($src, str_repeat('k', 31), $this->tempPath('enc'));
+        Security::encryptFile($src, str_repeat('k', 31), $this->tempPath('enc'));
     }
 
     // ---------------------------------------------------------------------------------------
@@ -908,7 +909,7 @@ final class SecurityTest extends TestCase
     }
 
     // ---------------------------------------------------------------------------------------
-    // encryptFileV2 / decryptFileV2 — authenticated chunked file format
+    // encryptFile / decryptFile — authenticated chunked file format
     // ---------------------------------------------------------------------------------------
 
     public function testFileRoundTripMatchesAcrossManyBlocks(): void
@@ -918,7 +919,7 @@ final class SecurityTest extends TestCase
         [, $enc] = $this->makeEncryptedFile($payload);
         $dec = $this->tempPath('dec');
 
-        $returned = Security::decryptFileV2($enc, self::masterKey(), $dec);
+        $returned = Security::decryptFile($enc, self::masterKey(), $dec);
 
         $this->assertFileExists($returned);
         $this->assertSame(realpath($dec), $returned);
@@ -933,8 +934,8 @@ final class SecurityTest extends TestCase
         $dec = $this->tempPath('dec');
         file_put_contents($src, $payload);
 
-        Security::encryptFileV2($src, self::masterKey(), $enc, 'per-subject-salt');
-        Security::decryptFileV2($enc, self::masterKey(), $dec);
+        Security::encryptFile($src, self::masterKey(), $enc, 'per-subject-salt');
+        Security::decryptFile($enc, self::masterKey(), $dec);
 
         $this->assertSame($payload, file_get_contents($dec));
     }
@@ -946,8 +947,8 @@ final class SecurityTest extends TestCase
         $dec = $this->tempPath('dec');
         file_put_contents($src, '');
 
-        Security::encryptFileV2($src, self::masterKey(), $enc);
-        Security::decryptFileV2($enc, self::masterKey(), $dec);
+        Security::encryptFile($src, self::masterKey(), $enc);
+        Security::decryptFile($enc, self::masterKey(), $dec);
 
         $this->assertSame('', file_get_contents($dec));
     }
@@ -960,14 +961,14 @@ final class SecurityTest extends TestCase
         $dec = $this->tempPath('dec');
 
         $blocks = self::parseBlocks(file_get_contents($enc));
-        file_put_contents($enc, self::rebuildBlocks(array_slice($blocks, 0, count($blocks) - 3)));
+        file_put_contents($enc, self::rebuildBlocks(array_slice($blocks, 0, count($blocks) - 1)));
 
         $this->expectException(\Exception::class);
         $this->expectExceptionMessage('truncated');
-        Security::decryptFileV2($enc, self::masterKey(), $dec);
+        Security::decryptFile($enc, self::masterKey(), $dec);
     }
 
-    /** Reorder: the AAD binds each block to its index, so swapping two triples must fail. */
+    /** Reorder: the nonce and the AAD bind each block to its index, so swapping two blocks must fail. */
     public function testFileBlockReorderIsRejected(): void
     {
         Security::setFileEncryptBlocksBytes(16);
@@ -975,15 +976,11 @@ final class SecurityTest extends TestCase
         $dec = $this->tempPath('dec');
 
         $blocks = self::parseBlocks(file_get_contents($enc));
-        for ($k = 0; $k < 3; $k++) {
-            $tmp = $blocks[4 + $k];
-            $blocks[4 + $k] = $blocks[7 + $k];
-            $blocks[7 + $k] = $tmp;
-        }
+        [$blocks[5], $blocks[6]] = [$blocks[6], $blocks[5]];
         file_put_contents($enc, self::rebuildBlocks($blocks));
 
         $this->expectException(\Exception::class);
-        Security::decryptFileV2($enc, self::masterKey(), $dec);
+        Security::decryptFile($enc, self::masterKey(), $dec);
     }
 
     public function testFileCiphertextTamperIsRejected(): void
@@ -993,16 +990,16 @@ final class SecurityTest extends TestCase
         $dec = $this->tempPath('dec');
 
         $blocks = self::parseBlocks(file_get_contents($enc));
-        $bin = base64_decode($blocks[6]); // first triple's ciphertext
+        $bin = base64_decode($blocks[5]); // data block 0's ciphertext
         $bin[0] = chr(ord($bin[0]) ^ 0x01);
-        $blocks[6] = base64_encode($bin);
+        $blocks[5] = base64_encode($bin);
         file_put_contents($enc, self::rebuildBlocks($blocks));
 
         $this->expectException(\Exception::class);
-        Security::decryptFileV2($enc, self::masterKey(), $dec);
+        Security::decryptFile($enc, self::masterKey(), $dec);
     }
 
-    /** The header is not separately MAC'd — it is bound via the fileId in every block's AAD. */
+    /** The header is not separately MAC'd — the fileId selects the file key and is in every block's AAD. */
     public function testFileHeaderFileIdTamperIsRejected(): void
     {
         Security::setFileEncryptBlocksBytes(16);
@@ -1010,11 +1007,11 @@ final class SecurityTest extends TestCase
         $dec = $this->tempPath('dec');
 
         $blocks = self::parseBlocks(file_get_contents($enc));
-        $blocks[3] = base64_encode(str_repeat('0', 32)); // fileId
+        $blocks[4] = base64_encode(str_repeat('0', 32)); // fileId
         file_put_contents($enc, self::rebuildBlocks($blocks));
 
         $this->expectException(\Exception::class);
-        Security::decryptFileV2($enc, self::masterKey(), $dec);
+        Security::decryptFile($enc, self::masterKey(), $dec);
     }
 
     /** Tampering the stored salt changes the derived key, so every block fails to authenticate. */
@@ -1025,11 +1022,11 @@ final class SecurityTest extends TestCase
         $dec = $this->tempPath('dec');
 
         $blocks = self::parseBlocks(file_get_contents($enc));
-        $blocks[2] = base64_encode('another-salt');
+        $blocks[3] = base64_encode('another-salt');
         file_put_contents($enc, self::rebuildBlocks($blocks));
 
         $this->expectException(\Exception::class);
-        Security::decryptFileV2($enc, self::masterKey(), $dec);
+        Security::decryptFile($enc, self::masterKey(), $dec);
     }
 
     public function testFileVersionTamperIsRejected(): void
@@ -1039,12 +1036,12 @@ final class SecurityTest extends TestCase
         $dec = $this->tempPath('dec');
 
         $blocks = self::parseBlocks(file_get_contents($enc));
-        $blocks[1] = base64_encode('v3');
+        $blocks[1] = base64_encode('v9');
         file_put_contents($enc, self::rebuildBlocks($blocks));
 
         $this->expectException(\Exception::class);
         $this->expectExceptionMessage('Cipher version does not match');
-        Security::decryptFileV2($enc, self::masterKey(), $dec);
+        Security::decryptFile($enc, self::masterKey(), $dec);
     }
 
     /** Cross-file splice: blocks from another file (different fileId) must not authenticate. */
@@ -1057,13 +1054,11 @@ final class SecurityTest extends TestCase
 
         $blocksA = self::parseBlocks(file_get_contents($encA));
         $blocksB = self::parseBlocks(file_get_contents($encB));
-        for ($k = 0; $k < 3; $k++) {
-            $blocksA[4 + $k] = $blocksB[4 + $k];
-        }
+        $blocksA[5] = $blocksB[5];
         file_put_contents($encA, self::rebuildBlocks($blocksA));
 
         $this->expectException(\Exception::class);
-        Security::decryptFileV2($encA, self::masterKey(), $dec);
+        Security::decryptFile($encA, self::masterKey(), $dec);
     }
 
     /** The end marker must be the LAST block: appended data must not be silently ignored. */
@@ -1074,14 +1069,12 @@ final class SecurityTest extends TestCase
         $dec = $this->tempPath('dec');
 
         $blocks = self::parseBlocks(file_get_contents($enc));
-        $blocks[] = $blocks[4];
         $blocks[] = $blocks[5];
-        $blocks[] = $blocks[6];
         file_put_contents($enc, self::rebuildBlocks($blocks));
 
         $this->expectException(\Exception::class);
         $this->expectExceptionMessage('Trailing data after end-of-file marker');
-        Security::decryptFileV2($enc, self::masterKey(), $dec);
+        Security::decryptFile($enc, self::masterKey(), $dec);
     }
 
     public function testFileWrongKeyIsRejected(): void
@@ -1091,25 +1084,25 @@ final class SecurityTest extends TestCase
         $dec = $this->tempPath('dec');
 
         $this->expectException(\Exception::class);
-        Security::decryptFileV2($enc, self::otherKey(), $dec);
+        Security::decryptFile($enc, self::otherKey(), $dec);
     }
 
-    public function testEncryptFileV2ThrowsOnMissingSource(): void
+    public function testEncryptFileThrowsOnMissingSource(): void
     {
         $this->expectException(\Exception::class);
         $this->expectExceptionMessage('File not found');
-        Security::encryptFileV2(
+        Security::encryptFile(
             sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'phpht_does_not_exist_' . bin2hex(random_bytes(6)),
             self::masterKey(),
             $this->tempPath('enc')
         );
     }
 
-    public function testDecryptFileV2ThrowsOnMissingSource(): void
+    public function testDecryptFileThrowsOnMissingSource(): void
     {
         $this->expectException(\Exception::class);
         $this->expectExceptionMessage('File not found');
-        Security::decryptFileV2(
+        Security::decryptFile(
             sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'phpht_does_not_exist_' . bin2hex(random_bytes(6)),
             self::masterKey(),
             $this->tempPath('dec')
@@ -1124,13 +1117,13 @@ final class SecurityTest extends TestCase
         $dec = $this->tempPath('dec');
 
         $blocks = self::parseBlocks(file_get_contents($enc));
-        $bin = base64_decode($blocks[12]); // 3rd triple's ciphertext: blocks 0 and 1 write first
+        $bin = base64_decode($blocks[7]); // data block 2's ciphertext: blocks 0 and 1 write first
         $bin[0] = chr(ord($bin[0]) ^ 0x01);
-        $blocks[12] = base64_encode($bin);
+        $blocks[7] = base64_encode($bin);
         file_put_contents($enc, self::rebuildBlocks($blocks));
 
         try {
-            Security::decryptFileV2($enc, self::masterKey(), $dec);
+            Security::decryptFile($enc, self::masterKey(), $dec);
             $this->fail('Expected an Exception for a tampered block.');
         } catch (\Exception) {
             // expected
@@ -1140,7 +1133,7 @@ final class SecurityTest extends TestCase
     }
 
     // ---------------------------------------------------------------------------------------
-    // decryptFileV2 — $outReadMode contract (findings: documented 'w'/'a' vs accepted 'wb'/'ab')
+    // decryptFile — $outReadMode contract (findings: documented 'w'/'a' vs accepted 'wb'/'ab')
     // ---------------------------------------------------------------------------------------
 
     /**
@@ -1149,7 +1142,7 @@ final class SecurityTest extends TestCase
      * TRUNCATED the destination instead of appending, destroying every previously-appended part.
      * Fails without the fix (the destination would contain only part 2).
      */
-    public function testDecryptFileV2AppendModeAppendsInsteadOfSilentlyTruncating(): void
+    public function testDecryptFileAppendModeAppendsInsteadOfSilentlyTruncating(): void
     {
         $partA = 'AAAAAAAAAAAAAAAA';
         $partB = 'BBBBBBBBBBBBBBBB';
@@ -1157,14 +1150,14 @@ final class SecurityTest extends TestCase
         [, $encB] = $this->makeEncryptedFile($partB);
         $dec = $this->tempPath('dec');
 
-        Security::decryptFileV2($encA, self::masterKey(), $dec, null, 'w');
-        Security::decryptFileV2($encB, self::masterKey(), $dec, null, 'a');
+        Security::decryptFile($encA, self::masterKey(), $dec, null, 'w');
+        Security::decryptFile($encB, self::masterKey(), $dec, null, 'a');
 
         $this->assertSame($partA . $partB, file_get_contents($dec));
     }
 
     /** 'ab' is the binary spelling of the same documented mode and must behave identically. */
-    public function testDecryptFileV2AcceptsBinarySpellingOfAppendMode(): void
+    public function testDecryptFileAcceptsBinarySpellingOfAppendMode(): void
     {
         $partA = 'AAAA';
         $partB = 'BBBB';
@@ -1172,21 +1165,21 @@ final class SecurityTest extends TestCase
         [, $encB] = $this->makeEncryptedFile($partB);
         $dec = $this->tempPath('dec');
 
-        Security::decryptFileV2($encA, self::masterKey(), $dec, null, 'wb');
-        Security::decryptFileV2($encB, self::masterKey(), $dec, null, 'ab');
+        Security::decryptFile($encA, self::masterKey(), $dec, null, 'wb');
+        Security::decryptFile($encB, self::masterKey(), $dec, null, 'ab');
 
         $this->assertSame($partA . $partB, file_get_contents($dec));
     }
 
     /** The default mode truncates, so decrypting twice must not double the content. */
-    public function testDecryptFileV2DefaultModeTruncates(): void
+    public function testDecryptFileDefaultModeTruncates(): void
     {
         $payload = 'payload';
         [, $enc] = $this->makeEncryptedFile($payload);
         $dec = $this->tempPath('dec');
 
-        Security::decryptFileV2($enc, self::masterKey(), $dec);
-        Security::decryptFileV2($enc, self::masterKey(), $dec);
+        Security::decryptFile($enc, self::masterKey(), $dec);
+        Security::decryptFile($enc, self::masterKey(), $dec);
 
         $this->assertSame($payload, file_get_contents($dec));
     }
@@ -1195,23 +1188,23 @@ final class SecurityTest extends TestCase
      * An unrecognized mode must be REJECTED, never silently rewritten to the truncating default —
      * that silent substitution is exactly what destroyed data before. Fails without the fix.
      */
-    public function testDecryptFileV2RejectsUnknownOutReadModeInsteadOfDefaultingToTruncate(): void
+    public function testDecryptFileRejectsUnknownOutReadModeInsteadOfDefaultingToTruncate(): void
     {
         [, $enc] = $this->makeEncryptedFile('payload');
         $dec = $this->tempPath('dec');
 
         $this->expectException(\Exception::class);
         $this->expectExceptionMessage("Invalid \$outReadMode");
-        Security::decryptFileV2($enc, self::masterKey(), $dec, null, 'append');
+        Security::decryptFile($enc, self::masterKey(), $dec, null, 'append');
     }
 
-    public function testDecryptFileV2RejectsEmptyOutReadMode(): void
+    public function testDecryptFileRejectsEmptyOutReadMode(): void
     {
         [, $enc] = $this->makeEncryptedFile('payload');
         $dec = $this->tempPath('dec');
 
         $this->expectException(\Exception::class);
-        Security::decryptFileV2($enc, self::masterKey(), $dec, null, '');
+        Security::decryptFile($enc, self::masterKey(), $dec, null, '');
     }
 
     /**
@@ -1228,18 +1221,18 @@ final class SecurityTest extends TestCase
         [, $encB] = $this->makeEncryptedFile(random_bytes(100));
         $dec = $this->tempPath('dec');
 
-        Security::decryptFileV2($encA, self::masterKey(), $dec, null, 'w');
+        Security::decryptFile($encA, self::masterKey(), $dec, null, 'w');
         $this->assertSame($partA, file_get_contents($dec));
 
-        // Tamper the 3rd data triple of part B: blocks 0-1 decrypt and get appended, then it fails.
+        // Tamper data block 2 of part B: blocks 0-1 decrypt and get appended, then it fails.
         $blocks = self::parseBlocks(file_get_contents($encB));
-        $bin = base64_decode($blocks[12]);
+        $bin = base64_decode($blocks[7]);
         $bin[0] = chr(ord($bin[0]) ^ 0x01);
-        $blocks[12] = base64_encode($bin);
+        $blocks[7] = base64_encode($bin);
         file_put_contents($encB, self::rebuildBlocks($blocks));
 
         try {
-            Security::decryptFileV2($encB, self::masterKey(), $dec, null, 'a');
+            Security::decryptFile($encB, self::masterKey(), $dec, null, 'a');
             $this->fail('Expected an Exception for a tampered block.');
         } catch (\Exception) {
             // expected
@@ -1250,7 +1243,7 @@ final class SecurityTest extends TestCase
     }
 
     // ---------------------------------------------------------------------------------------
-    // decryptFileV2 — fail-loud return contract
+    // decryptFile — fail-loud return contract
     // ---------------------------------------------------------------------------------------
 
     /**
@@ -1259,9 +1252,9 @@ final class SecurityTest extends TestCase
      * throws. A caller who followed the doc wrote `if ($out === false)`, which is dead code, and
      * the first tampered file escaped as an uncaught \Exception. The declared type is now `string`.
      */
-    public function testDecryptFileV2DeclaresStringReturnBecauseFalseIsUnreachable(): void
+    public function testDecryptFileDeclaresStringReturnBecauseFalseIsUnreachable(): void
     {
-        $type = (new \ReflectionMethod(Security::class, 'decryptFileV2'))->getReturnType();
+        $type = (new \ReflectionMethod(Security::class, 'decryptFile'))->getReturnType();
 
         $this->assertInstanceOf(\ReflectionNamedType::class, $type);
         $this->assertSame('string', $type->getName());
@@ -1269,23 +1262,23 @@ final class SecurityTest extends TestCase
     }
 
     /** The behavioural half of the same contract: failure throws, it never returns a falsy value. */
-    public function testDecryptFileV2ThrowsRatherThanReturningFalseOnTamper(): void
+    public function testDecryptFileThrowsRatherThanReturningFalseOnTamper(): void
     {
         Security::setFileEncryptBlocksBytes(16);
         [, $enc] = $this->makeEncryptedFile(random_bytes(100));
         $dec = $this->tempPath('dec');
 
         $blocks = self::parseBlocks(file_get_contents($enc));
-        $bin = base64_decode($blocks[6]);
+        $bin = base64_decode($blocks[5]);
         $bin[0] = chr(ord($bin[0]) ^ 0x01);
-        $blocks[6] = base64_encode($bin);
+        $blocks[5] = base64_encode($bin);
         file_put_contents($enc, self::rebuildBlocks($blocks));
 
         // (This used to assert `$returned !== false` INSIDE the catch, where $returned could only
         // ever hold its initial sentinel — a tautology that passed whatever the code did.)
         try {
-            Security::decryptFileV2($enc, self::masterKey(), $dec);
-            $this->fail('Expected an Exception; decryptFileV2 must never return false.');
+            Security::decryptFile($enc, self::masterKey(), $dec);
+            $this->fail('Expected an Exception; decryptFile must never return false.');
         } catch (\Exception $e) {
             $this->assertStringContainsString('failed authentication', $e->getMessage());
         }
@@ -1299,12 +1292,12 @@ final class SecurityTest extends TestCase
      * passed in (symlinks, "..", and Windows 8.3 short names are all normalized away), so callers
      * must use the RETURN VALUE rather than assume it echoes their argument.
      */
-    public function testDecryptFileV2ReturnsResolvedDestinationPathOnSuccess(): void
+    public function testDecryptFileReturnsResolvedDestinationPathOnSuccess(): void
     {
         [, $enc] = $this->makeEncryptedFile('payload');
         $dec = $this->tempPath('dec');
 
-        $returned = Security::decryptFileV2($enc, self::masterKey(), $dec);
+        $returned = Security::decryptFile($enc, self::masterKey(), $dec);
 
         $this->assertFileExists($returned);
         $this->assertSame(realpath($dec), $returned);
@@ -2656,11 +2649,11 @@ final class SecurityTest extends TestCase
     }
 
     // ---------------------------------------------------------------------------------------
-    // decryptFileV2: a crafted zero-length block must not escape the documented contract
+    // decryptFile: a crafted zero-length block must not escape the documented contract
     // ---------------------------------------------------------------------------------------
 
-    /** Splits a V2 file into its raw "{len}-{payload}" block spans. */
-    private static function v2BlockSpans(string $raw): array
+    /** Splits an encrypted file into its raw "{len}-{payload}" block spans. */
+    private static function fileBlockSpans(string $raw): array
     {
         $spans = [];
         $i = 0;
@@ -2677,29 +2670,29 @@ final class SecurityTest extends TestCase
         return $spans;
     }
 
-    public function testDecryptFileV2ThrowsAndRollsBackOnACraftedZeroLengthBlock(): void
+    public function testDecryptFileThrowsAndRollsBackOnACraftedZeroLengthBlock(): void
     {
         $source = $this->tempPath('plain');
         file_put_contents($source, 'HELLO WORLD SECRET');
 
-        $encrypted = Security::encryptFileV2($source, self::masterKey(), $this->tempPath('enc'));
+        $encrypted = Security::encryptFile($source, self::masterKey(), $this->tempPath('enc'));
         $raw = file_get_contents($encrypted);
 
-        // Header is 4 blocks; the first data triple is blocks 4..6. Keep them, then splice in a
+        // The header is blocks 0-4 and data block 0 is block 5. Keep them, then splice in a
         // zero-length block: fread($fp, 0) raises a ValueError — an \Error, NOT an \Exception — so
         // it escaped the catch AND skipped the rollback, stranding the first block's decrypted
         // plaintext on disk.
-        $spans = self::v2BlockSpans($raw);
+        $spans = self::fileBlockSpans($raw);
         $crafted = $this->tempPath('crafted');
-        file_put_contents($crafted, substr($raw, 0, $spans[6][1]) . '0-');
+        file_put_contents($crafted, substr($raw, 0, $spans[5][1]) . '0-');
 
         $destination = $this->tempPath('out');
 
         try {
-            Security::decryptFileV2($crafted, self::masterKey(), $destination);
+            Security::decryptFile($crafted, self::masterKey(), $destination);
             $this->fail('A crafted zero-length block must not decrypt.');
         } catch (\Exception $e) {
-            $this->assertStringContainsString('Error on reading IV ciphertext', $e->getMessage());
+            $this->assertStringContainsString('Error on reading block 1', $e->getMessage());
         }
 
         clearstatcache(true, $destination);
@@ -2709,26 +2702,26 @@ final class SecurityTest extends TestCase
         );
     }
 
-    public function testDecryptFileV2RejectsAZeroLengthHeaderBlock(): void
+    public function testDecryptFileRejectsAZeroLengthHeaderBlock(): void
     {
         $crafted = $this->tempPath('crafted');
         file_put_contents($crafted, '0-');
 
         $this->expectException(\Exception::class);
-        Security::decryptFileV2($crafted, self::masterKey(), $this->tempPath('out'));
+        Security::decryptFile($crafted, self::masterKey(), $this->tempPath('out'));
     }
 
-    public function testDecryptFileV2RollsBackToTheEntryLengthOnACraftedBlockInAppendMode(): void
+    public function testDecryptFileRollsBackToTheEntryLengthOnACraftedBlockInAppendMode(): void
     {
         $source = $this->tempPath('plain');
         file_put_contents($source, 'PART TWO PAYLOAD');
 
-        $encrypted = Security::encryptFileV2($source, self::masterKey(), $this->tempPath('enc'));
+        $encrypted = Security::encryptFile($source, self::masterKey(), $this->tempPath('enc'));
         $raw = file_get_contents($encrypted);
-        $spans = self::v2BlockSpans($raw);
+        $spans = self::fileBlockSpans($raw);
 
         $crafted = $this->tempPath('crafted');
-        file_put_contents($crafted, substr($raw, 0, $spans[6][1]) . '0-');
+        file_put_contents($crafted, substr($raw, 0, $spans[5][1]) . '0-');
 
         // A part an earlier successful call already appended: it belongs to the caller and must
         // survive a bad part untouched.
@@ -2736,7 +2729,7 @@ final class SecurityTest extends TestCase
         file_put_contents($destination, 'PART ONE;');
 
         try {
-            Security::decryptFileV2($crafted, self::masterKey(), $destination, null, 'a');
+            Security::decryptFile($crafted, self::masterKey(), $destination, null, 'a');
             $this->fail('A crafted zero-length block must not decrypt.');
         } catch (\Exception $e) {
             // expected
@@ -2745,21 +2738,21 @@ final class SecurityTest extends TestCase
         $this->assertSame('PART ONE;', file_get_contents($destination));
     }
 
-    public function testDecryptFileV2LeavesAnExistingDestinationAloneWhenItFailsBeforeOpeningIt(): void
+    public function testDecryptFileLeavesAnExistingDestinationAloneWhenItFailsBeforeOpeningIt(): void
     {
         // The rollback may only undo what this call did. A failure raised before the destination
         // is ever opened has written nothing, so deleting the caller's file would be pure data
         // destruction — and routing the key rejection through the rollback made that a live bug.
         $source = $this->tempPath('plain');
         file_put_contents($source, 'DATA');
-        $encrypted = Security::encryptFileV2($source, self::masterKey(), $this->tempPath('enc'));
+        $encrypted = Security::encryptFile($source, self::masterKey(), $this->tempPath('enc'));
 
         $destination = $this->tempPath('precious');
 
         // (a) a key deriveKey rejects, before the destination is opened
         file_put_contents($destination, 'PRECIOUS');
         try {
-            Security::decryptFileV2($encrypted, str_repeat('k', 31), $destination);
+            Security::decryptFile($encrypted, str_repeat('k', 31), $destination);
             $this->fail('A short key must be rejected.');
         } catch (\Exception $e) {
             // expected
@@ -2771,7 +2764,7 @@ final class SecurityTest extends TestCase
         file_put_contents($junk, '12-QUJDREVGRw==');
         file_put_contents($destination, 'PRECIOUS');
         try {
-            Security::decryptFileV2($junk, self::masterKey(), $destination);
+            Security::decryptFile($junk, self::masterKey(), $destination);
             $this->fail('A bad header must be rejected.');
         } catch (\Exception $e) {
             // expected
@@ -2780,27 +2773,27 @@ final class SecurityTest extends TestCase
     }
 
     /**
-     * CONTRACT CHANGE (was: "still deletes a destination it truncated itself"). decryptFileV2 no
+     * CONTRACT CHANGE (was: "still deletes a destination it truncated itself"). decryptFile no
      * longer writes into the destination until the whole file has authenticated, so a failure
      * mid-stream leaves a pre-existing destination EXACTLY as it was instead of destroying it.
      */
-    public function testDecryptFileV2LeavesAPreExistingDestinationIntactWhenItFailsMidStream(): void
+    public function testDecryptFileLeavesAPreExistingDestinationIntactWhenItFailsMidStream(): void
     {
         $source = $this->tempPath('plain');
         file_put_contents($source, 'HELLO WORLD SECRET');
-        $encrypted = Security::encryptFileV2($source, self::masterKey(), $this->tempPath('enc'));
+        $encrypted = Security::encryptFile($source, self::masterKey(), $this->tempPath('enc'));
 
         // Truncate away the authenticated end marker: this fails AFTER data blocks are written.
         $raw = file_get_contents($encrypted);
-        $spans = self::v2BlockSpans($raw);
+        $spans = self::fileBlockSpans($raw);
         $truncated = $this->tempPath('trunc');
-        file_put_contents($truncated, substr($raw, 0, $spans[6][1]));
+        file_put_contents($truncated, substr($raw, 0, $spans[5][1])); // header + data block 0, no end marker
 
         $destination = $this->tempPath('out');
         file_put_contents($destination, 'OLD');
 
         try {
-            Security::decryptFileV2($truncated, self::masterKey(), $destination);
+            Security::decryptFile($truncated, self::masterKey(), $destination);
             $this->fail('A truncated file must not decrypt.');
         } catch (\Exception $e) {
             $this->assertStringContainsString('truncated', $e->getMessage());
@@ -2810,7 +2803,7 @@ final class SecurityTest extends TestCase
         $this->assertSame('OLD', file_get_contents($destination));
     }
 
-    public function testDecryptFileV2StillRoundTripsAfterTheZeroLengthGuard(): void
+    public function testDecryptFileStillRoundTripsAfterTheZeroLengthGuard(): void
     {
         // The guard rejects "0-", which writeLengthEncodedBlock never emits. Prove the legitimate
         // path is untouched, including a file whose size is an exact multiple of the block size.
@@ -2820,8 +2813,8 @@ final class SecurityTest extends TestCase
             $source = $this->tempPath('plain');
             file_put_contents($source, $payload);
 
-            $encrypted = Security::encryptFileV2($source, self::masterKey(), $this->tempPath('enc'));
-            $decrypted = Security::decryptFileV2($encrypted, self::masterKey(), $this->tempPath('out'));
+            $encrypted = Security::encryptFile($source, self::masterKey(), $this->tempPath('enc'));
+            $decrypted = Security::decryptFile($encrypted, self::masterKey(), $this->tempPath('out'));
 
             $this->assertSame($payload, file_get_contents($decrypted));
         } finally {
@@ -2830,24 +2823,24 @@ final class SecurityTest extends TestCase
     }
 
     // ---------------------------------------------------------------------------------------
-    // encryptFileV2 / decryptFileV2 — in-place (destination === source) is REFUSED
+    // encryptFile / decryptFile — in-place (destination === source) is REFUSED
     //
     // Both functions open the destination for writing (truncating it) and only then read the
     // source. Passing one path as both shredded the file and STILL reported success:
-    // encryptFileV2($f, $key, $f) returned $f, left 284 bytes of its own envelope header, and the
-    // original was unrecoverable. decryptFileV2 was worse: for a ciphertext small enough to fit
+    // encryptFile($f, $key, $f) returned $f, left 284 bytes of its own envelope header, and the
+    // original was unrecoverable. decryptFile was worse: for a ciphertext small enough to fit
     // PHP's 8192-byte stream read buffer it "worked", so it passed in dev; above that it failed
     // mid-read and the rollback then DELETED the caller's only ciphertext copy.
     // ---------------------------------------------------------------------------------------
 
     /** The exact call from the report: encrypt a file onto itself. */
-    public function testEncryptFileV2RefusesToWriteOntoItsOwnSource(): void
+    public function testEncryptFileRefusesToWriteOntoItsOwnSource(): void
     {
         $file = $this->tempPath('inplace');
         file_put_contents($file, 'CONTEUDO IMPORTANTE DO USUARIO');
 
         try {
-            Security::encryptFileV2($file, self::masterKey(), $file);
+            Security::encryptFile($file, self::masterKey(), $file);
             $this->fail('Expected an Exception: encrypting a file onto itself destroys it.');
         } catch (\Exception $e) {
             $this->assertStringContainsString('must not be the same file', $e->getMessage());
@@ -2858,18 +2851,18 @@ final class SecurityTest extends TestCase
     }
 
     /**
-     * decryptFileV2 in place, on BOTH sides of the stream-buffer threshold that made this defect
+     * decryptFile in place, on BOTH sides of the stream-buffer threshold that made this defect
      * invisible in development. The 10-byte case used to return SUCCESS; the 100 KB case used to
      * throw AND unlink the ciphertext.
      */
     #[DataProvider('inPlaceDecryptSizeProvider')]
-    public function testDecryptFileV2RefusesToWriteOntoItsOwnSource(int $payloadSize): void
+    public function testDecryptFileRefusesToWriteOntoItsOwnSource(int $payloadSize): void
     {
         [, $enc] = $this->makeEncryptedFile(str_repeat('A', $payloadSize));
         $before = file_get_contents($enc);
 
         try {
-            Security::decryptFileV2($enc, self::masterKey(), $enc);
+            Security::decryptFile($enc, self::masterKey(), $enc);
             $this->fail('Expected an Exception: decrypting a file onto itself destroys the ciphertext.');
         } catch (\Exception $e) {
             $this->assertStringContainsString('must not be the same file', $e->getMessage());
@@ -2895,7 +2888,7 @@ final class SecurityTest extends TestCase
      * the SAME file and must be refused just like the identical path.
      */
     #[DataProvider('equivalentPathSpellingProvider')]
-    public function testFileV2RefusesInPlaceForEquivalentPathSpellings(string $mutation): void
+    public function testFileRefusesInPlaceForEquivalentPathSpellings(string $mutation): void
     {
         $file = $this->tempPath('spell');
         file_put_contents($file, 'CONTEUDO');
@@ -2915,7 +2908,7 @@ final class SecurityTest extends TestCase
         }
 
         try {
-            Security::encryptFileV2($file, self::masterKey(), $destination);
+            Security::encryptFile($file, self::masterKey(), $destination);
             $this->fail("Expected an Exception for the '{$mutation}' spelling of the source path.");
         } catch (\Exception $e) {
             $this->assertStringContainsString('must not be the same file', $e->getMessage());
@@ -2936,7 +2929,7 @@ final class SecurityTest extends TestCase
     }
 
     /** A symlink is a second name for the same file; realpath() collapses it. */
-    public function testFileV2RefusesInPlaceThroughASymlink(): void
+    public function testFileRefusesInPlaceThroughASymlink(): void
     {
         $file = $this->tempPath('symsrc');
         file_put_contents($file, 'CONTEUDO');
@@ -2947,7 +2940,7 @@ final class SecurityTest extends TestCase
         }
 
         try {
-            Security::encryptFileV2($file, self::masterKey(), $link);
+            Security::encryptFile($file, self::masterKey(), $link);
             $this->fail('Expected an Exception: the destination symlink resolves to the source.');
         } catch (\Exception $e) {
             $this->assertStringContainsString('must not be the same file', $e->getMessage());
@@ -2961,7 +2954,7 @@ final class SecurityTest extends TestCase
      * realpath() correctly reports two different paths for one file. Only the device+inode
      * comparison catches it. Verified on Windows too — its stat() does report a real inode.
      */
-    public function testFileV2RefusesInPlaceThroughAHardLink(): void
+    public function testFileRefusesInPlaceThroughAHardLink(): void
     {
         $file = $this->tempPath('hardsrc');
         file_put_contents($file, 'CONTEUDO');
@@ -2975,7 +2968,7 @@ final class SecurityTest extends TestCase
         $this->assertNotSame(realpath($file), realpath($hard), 'Premise: a hard link has its own realpath.');
 
         try {
-            Security::encryptFileV2($file, self::masterKey(), $hard);
+            Security::encryptFile($file, self::masterKey(), $hard);
             $this->fail('Expected an Exception: the destination hard link IS the source file.');
         } catch (\Exception $e) {
             $this->assertStringContainsString('must not be the same file', $e->getMessage());
@@ -2989,7 +2982,7 @@ final class SecurityTest extends TestCase
     // The in-place guard runs on EVERY call; a false positive here would break all file crypto.
     // ---------------------------------------------------------------------------------------
 
-    public function testFileV2RoundTripIsUnaffectedByTheInPlaceGuard(): void
+    public function testFileRoundTripIsUnaffectedByTheInPlaceGuard(): void
     {
         $payload = random_bytes(200000); // spans several stream buffers
         $src = $this->tempPath('ok_src');
@@ -2997,8 +2990,8 @@ final class SecurityTest extends TestCase
         $enc = $this->tempPath('ok_enc');
         $dec = $this->tempPath('ok_dec');
 
-        Security::encryptFileV2($src, self::masterKey(), $enc);
-        Security::decryptFileV2($enc, self::masterKey(), $dec);
+        Security::encryptFile($src, self::masterKey(), $enc);
+        Security::decryptFile($enc, self::masterKey(), $dec);
 
         $this->assertSame($payload, file_get_contents($dec));
     }
@@ -3008,7 +3001,7 @@ final class SecurityTest extends TestCase
      * not-reported inode (0 === 0) or a shared device, this would fail — every normal overwrite
      * would be rejected.
      */
-    public function testFileV2AllowsOverwritingPreExistingDistinctDestinations(): void
+    public function testFileAllowsOverwritingPreExistingDistinctDestinations(): void
     {
         $payload = 'CONTEUDO IMPORTANTE';
         $src = $this->tempPath('pre_src');
@@ -3020,14 +3013,14 @@ final class SecurityTest extends TestCase
         file_put_contents($enc, 'stale');
         file_put_contents($dec, 'stale');
 
-        Security::encryptFileV2($src, self::masterKey(), $enc);
-        Security::decryptFileV2($enc, self::masterKey(), $dec);
+        Security::encryptFile($src, self::masterKey(), $enc);
+        Security::decryptFile($enc, self::masterKey(), $dec);
 
         $this->assertSame($payload, file_get_contents($dec));
     }
 
     /** Append mode reassembly must still work — the guard must not fire on a shared destination. */
-    public function testFileV2AppendModeIsUnaffectedByTheInPlaceGuard(): void
+    public function testFileAppendModeIsUnaffectedByTheInPlaceGuard(): void
     {
         $a = $this->tempPath('part_a');
         $b = $this->tempPath('part_b');
@@ -3037,10 +3030,10 @@ final class SecurityTest extends TestCase
         $encB = $this->tempPath('part_b_enc');
         $out  = $this->tempPath('joined');
 
-        Security::encryptFileV2($a, self::masterKey(), $encA);
-        Security::encryptFileV2($b, self::masterKey(), $encB);
-        Security::decryptFileV2($encA, self::masterKey(), $out, null, 'w');
-        Security::decryptFileV2($encB, self::masterKey(), $out, null, 'a');
+        Security::encryptFile($a, self::masterKey(), $encA);
+        Security::encryptFile($b, self::masterKey(), $encB);
+        Security::decryptFile($encA, self::masterKey(), $out, null, 'w');
+        Security::decryptFile($encB, self::masterKey(), $out, null, 'a');
 
         $this->assertSame('PARTE-A|PARTE-B', file_get_contents($out));
     }
@@ -3054,12 +3047,12 @@ final class SecurityTest extends TestCase
      * inodes. Folding case rejected that legitimate call. Nothing is lost by not folding: on a
      * case-INsensitive volume the two spellings are one file, so realpath() returns the same
      * on-disk name for both and they share an inode — proved by the 'different case' data set of
-     * testFileV2RefusesInPlaceForEquivalentPathSpellings, which still passes.
+     * testFileRefusesInPlaceForEquivalentPathSpellings, which still passes.
      *
      * Self-validating: if the premise (two coexisting case-differing files) does not hold on this
      * filesystem, the test skips rather than asserting something meaningless.
      */
-    public function testFileV2AllowsDistinctFilesDifferingOnlyInCase(): void
+    public function testFileAllowsDistinctFilesDifferingOnlyInCase(): void
     {
         $dir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'phpht_casesens_' . bin2hex(random_bytes(6));
         if (!@mkdir($dir)) {
@@ -3096,7 +3089,7 @@ final class SecurityTest extends TestCase
             }
 
             // Encrypting one onto the other is a perfectly legitimate call.
-            Security::encryptFileV2($lower, self::masterKey(), $upper);
+            Security::encryptFile($lower, self::masterKey(), $upper);
 
             $this->assertSame('SOU O ARQUIVO MINUSCULO', file_get_contents($lower), 'The source must be untouched.');
             $this->assertNotSame('SOU O ARQUIVO MAIUSCULO', file_get_contents($upper), 'The destination should hold the ciphertext.');
@@ -3108,21 +3101,21 @@ final class SecurityTest extends TestCase
     }
 
     /** A destination whose path merely CONTAINS the source path must be allowed. */
-    public function testFileV2AllowsADestinationThatExtendsTheSourcePath(): void
+    public function testFileAllowsADestinationThatExtendsTheSourcePath(): void
     {
         $src = $this->tempPath('prefix');
         file_put_contents($src, 'CONTEUDO');
         $enc = $src . '.enc';
         $this->tempPaths[] = $enc;
 
-        Security::encryptFileV2($src, self::masterKey(), $enc);
+        Security::encryptFile($src, self::masterKey(), $enc);
 
         $this->assertFileExists($enc);
         $this->assertSame('CONTEUDO', file_get_contents($src));
     }
 
     // ---------------------------------------------------------------------------------------
-    // decryptFileV2 — a pre-open failure must leave the destination's PERMISSIONS alone too
+    // decryptFile — a pre-open failure must leave the destination's PERMISSIONS alone too
     // ---------------------------------------------------------------------------------------
 
     /**
@@ -3134,7 +3127,7 @@ final class SecurityTest extends TestCase
      * Runs everywhere: it asserts on the READ-ONLY bit, the one permission Windows does model
      * (verified: chmod(0444) reports 0444/not-writable, chmod(0644) reports 0666/writable).
      */
-    public function testDecryptFileV2DoesNotWidenDestinationPermissionsOnAPreOpenFailure(): void
+    public function testDecryptFileDoesNotWidenDestinationPermissionsOnAPreOpenFailure(): void
     {
         if (function_exists('posix_geteuid') && posix_geteuid() === 0) {
             $this->markTestSkipped('Running as root: a read-only file is still writable.');
@@ -3154,7 +3147,7 @@ final class SecurityTest extends TestCase
 
             try {
                 // Fails on the header, i.e. BEFORE the destination is ever opened.
-                Security::decryptFileV2($junk, self::masterKey(), $destination, '0666');
+                Security::decryptFile($junk, self::masterKey(), $destination, '0666');
                 $this->fail('Expected an Exception for a non-envelope source.');
             } catch (\Exception) {
                 // expected
@@ -3175,7 +3168,7 @@ final class SecurityTest extends TestCase
      * Windows cannot rename over a read-only file, so the commit must apply the mode first.
      * Without a mode, a read-only destination is refused (SecurityFileEncryptionTest).
      */
-    public function testDecryptFileV2ReplacesAReadOnlyDestinationWhenPermissionModeGrantsWrite(): void
+    public function testDecryptFileReplacesAReadOnlyDestinationWhenPermissionModeGrantsWrite(): void
     {
         if (function_exists('posix_geteuid') && posix_geteuid() === 0) {
             $this->markTestSkipped('Running as root: a read-only file is still writable.');
@@ -3192,7 +3185,7 @@ final class SecurityTest extends TestCase
             $this->assertFalse(is_writable($dec), 'Premise: the destination starts read-only.');
 
             // $permissionMode grants write, so the commit may replace the read-only file.
-            Security::decryptFileV2($enc, self::masterKey(), $dec, '0666');
+            Security::decryptFile($enc, self::masterKey(), $dec, '0666');
 
             $this->assertSame('CONTEUDO', file_get_contents($dec));
         } finally {
@@ -3201,7 +3194,7 @@ final class SecurityTest extends TestCase
     }
 
     /** A real decrypt over an existing destination ends with exactly $permissionMode. */
-    public function testDecryptFileV2StillAppliesPermissionModeOnSuccess(): void
+    public function testDecryptFileStillAppliesPermissionModeOnSuccess(): void
     {
         if (DIRECTORY_SEPARATOR === '\\') {
             $this->markTestSkipped('Windows models only the read-only bit; the exact mode is asserted on POSIX.');
@@ -3212,7 +3205,7 @@ final class SecurityTest extends TestCase
         file_put_contents($dec, 'stale');
         chmod($dec, 0666);
 
-        Security::decryptFileV2($enc, self::masterKey(), $dec, '0600');
+        Security::decryptFile($enc, self::masterKey(), $dec, '0600');
 
         clearstatcache(true, $dec);
         $this->assertSame(0600, fileperms($dec) & 0777);
@@ -3236,8 +3229,8 @@ final class SecurityTest extends TestCase
         $enc = $this->tempPath('short_enc');
         $dec = $this->tempPath('short_dec');
 
-        Security::encryptFileV2($src, self::masterKey(), $enc);
-        Security::decryptFileV2($enc, self::masterKey(), $dec);
+        Security::encryptFile($src, self::masterKey(), $enc);
+        Security::decryptFile($enc, self::masterKey(), $dec);
 
         $this->assertSame($payload, file_get_contents($dec));
     }

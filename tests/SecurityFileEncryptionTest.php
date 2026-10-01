@@ -5,12 +5,15 @@ namespace VD\PHPHelper\Tests;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\TestCase;
+use VD\PHPHelper\Keyring;
 use VD\PHPHelper\Security;
 
 /**
- * encryptFileV2 / decryptFileV2 end to end: exact round trips around every block boundary, the
+ * encryptFile / decryptFile end to end: exact round trips around every block boundary, the
  * configurable max-encoded-block limit on both sides, streaming memory, and an adversarial decrypt
- * battery.
+ * battery — for the v3 format encryptFile writes (a key per file, counter nonces, key id in the
+ * header), checked against an independent implementation of it, plus the legacy v2 format
+ * decryptFile still reads.
  *
  * Every test runs in its own directory, so "nothing was left behind" is checked as "the directory
  * holds exactly the files the test created" — which also catches a stray staging (.part) file.
@@ -26,9 +29,23 @@ final class SecurityFileEncryptionTest extends TestCase
     private const DEFAULT_BLOCK_BYTES = 3200000;
     private const DEFAULT_MAX_ENCODED_BLOCK_BYTES = 268435456;
 
+    /** Security::keyId(KEY): the v3 header names the key by it. */
+    private const KEY_ID = '0735d1be7e009715';
+
+    /** v3 header blocks: cipher, version, key id, salt, file id. Data block i is block 5 + i. */
+    private const HEADER_BLOCKS = 5;
+
     /**
-     * A file written by encryptFileV2 BEFORE the reader/writer rewrite (block size 16, key 'L' x 32,
-     * salt 'legacy-salt'). Files at rest must stay decryptable across library versions.
+     * A v3 file written by encryptFile (key KEY, salt 'v3-salt', 16-byte blocks). Files at rest must
+     * stay decryptable across library versions: a change to the key derivation, the nonces or the
+     * AAD would still round-trip against itself, and strand every file already written.
+     */
+    private const V3_PAYLOAD_B64 = 'VjMgdmVjdG9yOiAwMTIzNDU2Nzg5LUFCQwD/DQoaIGVuZCDinJM=';
+    private const V3_FILE_B64 = 'MTYtWVdWekxUSTFOaTFuWTIwPTQtZGpNPTI0LU1EY3pOV1F4WW1VM1pUQXdPVGN4TlE9PTEyLWRqTXRjMkZzZEE9PTQ0LU9XRmhaR1psTXpjNU5HSmtOREppTVdWak1ERTJNR0kxWm1JMk1UUmpPVEE9NDQtbEl3T1VjM1FUQ3JOci82clJERXk4bmMrd2VxWVg5cEFaSXFLajhrMDlGQT00NC1uYXRmdGF0aDRaT0EwcVZDcmJaQWNuTlJMaUdQU1N5YXQ0RWNCQ21xS1RJPTMyLU1vKzhuNzV0MWV5SG4xcHY1SEFYSGY0d1BER2o0UT09MjQtNUw0cTZTMThnWTNBQU4wUDl5dkhzZ289';
+
+    /**
+     * A LEGACY v2 file, written by the former encryptFileV2 before the reader/writer rewrite (block
+     * size 16, key 'L' x 32, salt 'legacy-salt'). decryptFile must keep reading it.
      */
     private const LEGACY_KEY = 'LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL';
     private const LEGACY_PAYLOAD_B64 = 'TGVnYWN5IFYyIHZlY3RvcjogMDEyMzQ1Njc4OS1BQkMA/w0KGiBlbmQ=';
@@ -118,8 +135,8 @@ final class SecurityFileEncryptionTest extends TestCase
     private function assertRoundTrip(string $payload, ?string $salt = null, string $name = 'rt'): array
     {
         $src = $this->write("{$name}.src", $payload);
-        $enc = Security::encryptFileV2($src, self::KEY, $this->path("{$name}.enc"), $salt);
-        $dec = Security::decryptFileV2($enc, self::KEY, $this->path("{$name}.dec"));
+        $enc = Security::encryptFile($src, self::KEY, $this->path("{$name}.enc"), $salt);
+        $dec = Security::decryptFile($enc, self::KEY, $this->path("{$name}.dec"));
         clearstatcache();
 
         $this->assertSame(realpath($this->path("{$name}.enc")), $enc);
@@ -195,30 +212,46 @@ final class SecurityFileEncryptionTest extends TestCase
         return $spans;
     }
 
-    /** Number of DATA blocks in a V2 file (header and end marker excluded). */
+    /** Number of DATA blocks in a v3 file (header and end marker excluded). */
     private static function dataBlockCount(string $raw): int
     {
-        $blocks = self::decodeBlocks($raw);
-
-        return intdiv(count($blocks) - 4, 3) - 1;
+        return count(self::decodeBlocks($raw)) - self::HEADER_BLOCKS - 1;
     }
 
-    /** Decrypts a V2 file using nothing but the documented format — independent of Security. */
+    /** The documented nonce of block $i: the block counter, 12 bytes big-endian. */
+    private static function nonce(int $i): string
+    {
+        return str_repeat("\0", 4) . pack('J', $i);
+    }
+
+    /** The documented key id: HKDF-SHA256(master key, info "key-id"), 8 bytes, hex. */
+    private static function referenceKeyId(string $masterKey): string
+    {
+        return bin2hex(hash_hkdf('sha256', $masterKey, 8, 'key-id'));
+    }
+
+    /** The documented per-file key: HKDF-SHA256(master key, salt, info "file-v3|{file id}"). */
+    private static function referenceFileKey(string $masterKey, string $salt, string $fileId): string
+    {
+        return hash_hkdf('sha256', $masterKey, 32, "file-v3|{$fileId}", $salt);
+    }
+
+    /** Decrypts a v3 file using nothing but the documented format — independent of Security. */
     private static function referenceDecrypt(string $raw, string $masterKey): string
     {
         $blocks = self::decodeBlocks($raw);
-        [$cipher, $version, $salt, $fileId] = array_slice($blocks, 0, 4);
-        if ($cipher !== 'aes-256-gcm' || $version !== 'v2' || (count($blocks) - 4) % 3 !== 0) {
-            throw new \RuntimeException('not a V2 file');
+        [$cipher, $version, $keyId, $salt, $fileId] = array_slice($blocks, 0, self::HEADER_BLOCKS);
+        if ($cipher !== 'aes-256-gcm' || $version !== 'v3' || $keyId !== self::referenceKeyId($masterKey)) {
+            throw new \RuntimeException('not a v3 file under this key');
         }
 
-        $key = hash_hkdf('sha256', $masterKey, 32, 'file-v2', $salt);
-        $triples = array_chunk(array_slice($blocks, 4), 3);
-        $count = count($triples) - 1;
+        $key = self::referenceFileKey($masterKey, $salt, $fileId);
+        $body = array_slice($blocks, self::HEADER_BLOCKS);
+        $count = count($body) - 1;
         $out = '';
-        foreach ($triples as $i => [$iv, $tag, $ct]) {
-            $aad = $i < $count ? "{$fileId}|v2|D|{$i}" : "{$fileId}|v2|F|{$count}";
-            $pt = openssl_decrypt($ct, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $iv, $tag, $aad);
+        foreach ($body as $i => $block) {
+            $aad = $i < $count ? "{$fileId}|v3|D|{$i}" : "{$fileId}|v3|F|{$count}";
+            $pt = openssl_decrypt(substr($block, 0, -16), 'aes-256-gcm', $key, OPENSSL_RAW_DATA, self::nonce($i), substr($block, -16), $aad);
             if ($pt === false) {
                 throw new \RuntimeException("block {$i} failed authentication");
             }
@@ -232,8 +265,29 @@ final class SecurityFileEncryptionTest extends TestCase
         return $out;
     }
 
-    /** Builds a V2 file by hand from the documented format — independent of Security. */
+    /** Builds a v3 file by hand from the documented format — independent of Security. */
     private static function referenceEncrypt(string $plaintext, string $masterKey, string $salt, int $blockBytes): string
+    {
+        $fileId = bin2hex(random_bytes(16));
+        $key = self::referenceFileKey($masterKey, $salt, $fileId);
+        $blocks = ['aes-256-gcm', 'v3', self::referenceKeyId($masterKey), $salt, $fileId];
+        $chunks = ($plaintext === '' ? [] : str_split($plaintext, $blockBytes));
+        foreach ($chunks as $i => $chunk) {
+            $ct = openssl_encrypt($chunk, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, self::nonce($i), $tag, "{$fileId}|v3|D|{$i}", 16);
+            $blocks[] = $ct . $tag;
+        }
+        $count = count($chunks);
+        $ct = openssl_encrypt((string) $count, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, self::nonce($count), $tag, "{$fileId}|v3|F|{$count}", 16);
+        $blocks[] = $ct . $tag;
+
+        return self::encodeBlocks($blocks);
+    }
+
+    /**
+     * Builds a LEGACY v2 file by hand: one key per master key and salt (info "file-v2"), a random IV
+     * per block, and [iv][tag][ciphertext] triples — what the former encryptFileV2 wrote.
+     */
+    private static function referenceEncryptV2(string $plaintext, string $masterKey, string $salt, int $blockBytes): string
     {
         $fileId = bin2hex(random_bytes(16));
         $key = hash_hkdf('sha256', $masterKey, 32, 'file-v2', $salt);
@@ -253,7 +307,7 @@ final class SecurityFileEncryptionTest extends TestCase
     }
 
     /**
-     * Asserts decryptFileV2 refuses $bytes and leaves nothing behind: no destination, no staging
+     * Asserts decryptFile refuses $bytes and leaves nothing behind: no destination, no staging
      * file, no other change to the directory.
      */
     private function assertDecryptRejects(string $bytes, string $label, ?string $messagePart = null): \Exception
@@ -263,7 +317,7 @@ final class SecurityFileEncryptionTest extends TestCase
         $before = $this->dirEntries();
 
         try {
-            Security::decryptFileV2($crafted, self::KEY, $destination);
+            Security::decryptFile($crafted, self::KEY, $destination);
         } catch (\Exception $e) {
             if ($messagePart !== null) {
                 $this->assertStringContainsString($messagePart, $e->getMessage(), $label);
@@ -275,7 +329,7 @@ final class SecurityFileEncryptionTest extends TestCase
             return $e;
         }
 
-        $this->fail("decryptFileV2 accepted a modified file: {$label}");
+        $this->fail("decryptFile accepted a modified file: {$label}");
     }
 
     /** A small multi-block ciphertext for the tamper tests: 16-byte blocks, 7 data blocks. */
@@ -283,7 +337,7 @@ final class SecurityFileEncryptionTest extends TestCase
     {
         Security::setFileEncryptBlocksBytes(16);
         $src = $this->write("{$name}.src", $payload ?? self::bytes(100, $name));
-        Security::encryptFileV2($src, self::KEY, $this->path("{$name}.enc"), $salt);
+        Security::encryptFile($src, self::KEY, $this->path("{$name}.enc"), $salt);
 
         return file_get_contents($this->path("{$name}.enc"));
     }
@@ -310,7 +364,7 @@ final class SecurityFileEncryptionTest extends TestCase
     }
 
     /**
-     * A limit of 1 (or anything below 44) could not hold the 32-character file id that EVERY V2
+     * A limit of 1 (or anything below 44) could not hold the 32-character file id that EVERY
      * file contains, so no file — not even an empty one — could ever be written or read under it.
      * It is refused in the setter, loudly, instead of failing every later call.
      */
@@ -340,19 +394,19 @@ final class SecurityFileEncryptionTest extends TestCase
         ];
     }
 
-    /** The minimum is genuinely usable: a 33-byte block encodes to exactly 44 bytes. */
+    /** The minimum is genuinely usable: a 17-byte block plus its 16-byte tag encodes to exactly 44 bytes. */
     public function testTheMinimumLimitIsUsableAtItsExactBoundary(): void
     {
         Security::setFileMaxEncodedBlockBytes(44);
-        Security::setFileEncryptBlocksBytes(33);
+        Security::setFileEncryptBlocksBytes(17);
 
         [, $enc] = $this->assertRoundTrip(self::bytes(100));
-        $this->assertSame(4, self::dataBlockCount(file_get_contents($enc)));
+        $this->assertSame(6, self::dataBlockCount(file_get_contents($enc)));
 
-        Security::setFileEncryptBlocksBytes(34); // 48 encoded bytes
+        Security::setFileEncryptBlocksBytes(18); // 34 bytes with the tag: 48 encoded
         $this->expectException(\Exception::class);
         $this->expectExceptionMessage('max-encoded-block limit');
-        Security::encryptFileV2($this->path('rt.src'), self::KEY, $this->path('over.enc'));
+        Security::encryptFile($this->path('rt.src'), self::KEY, $this->path('over.enc'));
     }
 
     public function testSetFileEncryptBlocksBytesRejectsNonPositiveSizesAsInvalidArgument(): void
@@ -458,32 +512,34 @@ final class SecurityFileEncryptionTest extends TestCase
     // ---------------------------------------------------------------------------------------
 
     /**
-     * Opens a V2 file written with 1-byte blocks and asserts its exact layout: one
-     * [iv, tag, ciphertext] triple per plaintext byte, in order, each holding exactly that byte
-     * under its own position-bound AAD and its own nonce, followed by an end marker counting them.
+     * Opens a v3 file written with 1-byte blocks and asserts its exact layout: one block per
+     * plaintext byte, in order, each holding exactly that byte plus its tag, authenticated under the
+     * file's own key, its position-bound AAD and the nonce equal to its position — and under no
+     * other nonce — followed by an end marker counting them.
      */
     private function assertOneBytePerBlockLayout(string $raw, string $payload): void
     {
         $size = strlen($payload);
         $blocks = self::decodeBlocks($raw);
-        $this->assertCount(4 + 3 * ($size + 1), $blocks, 'header + one [iv, tag, ciphertext] triple per byte + end marker');
+        $this->assertCount(self::HEADER_BLOCKS + $size + 1, $blocks, 'header + one block per byte + end marker');
 
-        [$cipher, $version, $salt, $fileId] = $blocks;
-        $this->assertSame(['aes-256-gcm', 'v2'], [$cipher, $version]);
-        $key = hash_hkdf('sha256', self::KEY, 32, 'file-v2', $salt);
+        [$cipher, $version, $keyId, $salt, $fileId] = $blocks;
+        $this->assertSame(['aes-256-gcm', 'v3', self::KEY_ID], [$cipher, $version, $keyId]);
+        $key = self::referenceFileKey(self::KEY, $salt, $fileId);
 
-        $triples = array_chunk(array_slice($blocks, 4), 3);
-        $ivs = [];
-        foreach (array_slice($triples, 0, $size) as $i => [$iv, $tag, $ciphertext]) {
-            $this->assertSame([12, 16, 1], [strlen($iv), strlen($tag), strlen($ciphertext)], "data block {$i}: iv/tag/ciphertext sizes");
-            $plaintext = openssl_decrypt($ciphertext, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $iv, $tag, "{$fileId}|v2|D|{$i}");
+        foreach (array_slice($blocks, self::HEADER_BLOCKS, $size) as $i => $block) {
+            $this->assertSame(17, strlen($block), "data block {$i}: one byte of ciphertext plus the 16-byte tag");
+            [$ciphertext, $tag] = [substr($block, 0, 1), substr($block, 1)];
+            $plaintext = openssl_decrypt($ciphertext, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, self::nonce($i), $tag, "{$fileId}|v3|D|{$i}");
             $this->assertSame($payload[$i], $plaintext, "data block {$i} must hold exactly byte {$i} of the source");
-            $ivs[$iv] = true;
+            $this->assertFalse(
+                openssl_decrypt($ciphertext, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, self::nonce($i + 1), $tag, "{$fileId}|v3|D|{$i}"),
+                "data block {$i} must authenticate under nonce {$i} only"
+            );
         }
-        $this->assertCount($size, $ivs, 'every block must carry its own nonce (GCM nonce reuse is fatal)');
 
-        [$iv, $tag, $ciphertext] = $triples[$size];
-        $count = openssl_decrypt($ciphertext, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $iv, $tag, "{$fileId}|v2|F|{$size}");
+        $marker = $blocks[self::HEADER_BLOCKS + $size];
+        $count = openssl_decrypt(substr($marker, 0, -16), 'aes-256-gcm', $key, OPENSSL_RAW_DATA, self::nonce($size), substr($marker, -16), "{$fileId}|v3|F|{$size}");
         $this->assertSame((string) $size, $count, 'the end marker must count every byte');
     }
 
@@ -553,11 +609,11 @@ final class SecurityFileEncryptionTest extends TestCase
     {
         Security::setFileEncryptBlocksBytes(1);
         $src = $this->write('swap.src', 'AB');
-        $raw = file_get_contents(Security::encryptFileV2($src, self::KEY, $this->path('swap.enc')));
+        $raw = file_get_contents(Security::encryptFile($src, self::KEY, $this->path('swap.enc')));
 
         $blocks = self::decodeBlocks($raw);
-        $swapped = array_merge(array_slice($blocks, 0, 4), array_slice($blocks, 7, 3), array_slice($blocks, 4, 3), array_slice($blocks, 10));
-        $this->assertCount(count($blocks), $swapped);
+        $swapped = $blocks;
+        [$swapped[5], $swapped[6]] = [$blocks[6], $blocks[5]];
 
         $this->assertDecryptRejects(self::encodeBlocks($swapped), 'blocks 0 and 1 swapped');
     }
@@ -613,7 +669,7 @@ final class SecurityFileEncryptionTest extends TestCase
         [, $enc, $dec] = $this->assertRoundTrip('');
 
         $raw = file_get_contents($enc);
-        $this->assertCount(4 + 3, self::decodeBlocks($raw), 'header + end marker only');
+        $this->assertCount(self::HEADER_BLOCKS + 1, self::decodeBlocks($raw), 'header + end marker only');
         $this->assertSame(0, self::dataBlockCount($raw));
         $this->assertFileExists($dec);
         $this->assertSame(0, filesize($dec));
@@ -628,7 +684,7 @@ final class SecurityFileEncryptionTest extends TestCase
         $this->assertSame(256, self::dataBlockCount(file_get_contents($enc)));
     }
 
-    /** The salt is stored in the header (decryptFileV2 takes none); null and "" are stored as "?". */
+    /** The salt is stored in the header (decryptFile takes none); null and "" are stored as "?". */
     #[DataProvider('saltProvider')]
     public function testRoundTripWithSaltsAndTheSaltIsStoredInTheHeader(?string $salt, string $stored): void
     {
@@ -636,7 +692,7 @@ final class SecurityFileEncryptionTest extends TestCase
 
         [, $enc] = $this->assertRoundTrip(self::bytes(300, 'salted'), $salt);
 
-        $this->assertSame($stored, self::decodeBlocks(file_get_contents($enc))[2]);
+        $this->assertSame($stored, self::decodeBlocks(file_get_contents($enc))[3]);
     }
 
     public static function saltProvider(): array
@@ -661,13 +717,26 @@ final class SecurityFileEncryptionTest extends TestCase
             $payload = self::bytes($size, "ref{$size}");
             $crafted = $this->write("ref{$size}.enc", self::referenceEncrypt($payload, self::KEY, 'ref-salt', $block));
 
-            $dec = Security::decryptFileV2($crafted, self::KEY, $this->path("ref{$size}.dec"));
+            $dec = Security::decryptFile($crafted, self::KEY, $this->path("ref{$size}.dec"));
 
             $this->assertTrue($payload === file_get_contents($dec), "size {$size}");
         }
     }
 
-    public function testFilesWrittenByEncryptFileV2FollowTheDocumentedFormat(): void
+    /** LEGACY: v2 files built by the independent v2 encoder still decrypt — through a keyring too. */
+    public function testLegacyV2FilesStillDecrypt(): void
+    {
+        foreach ([[0, 16], [1, 16], [16, 16], [17, 16], [1000, 7]] as [$size, $block]) {
+            $payload = self::bytes($size, "v2-{$size}");
+            $crafted = $this->write("v2-{$size}.enc", self::referenceEncryptV2($payload, self::KEY, 'v2-salt', $block));
+
+            $dec = Security::decryptFile($crafted, new Keyring(self::OTHER_KEY, self::KEY), $this->path("v2-{$size}.dec"));
+
+            $this->assertTrue($payload === file_get_contents($dec), "size {$size}");
+        }
+    }
+
+    public function testFilesWrittenByEncryptFileFollowTheDocumentedFormat(): void
     {
         Security::setFileEncryptBlocksBytes(10);
         $payload = self::bytes(95, 'format');
@@ -677,18 +746,98 @@ final class SecurityFileEncryptionTest extends TestCase
         $blocks = self::decodeBlocks($raw);
 
         $this->assertSame('aes-256-gcm', $blocks[0]);
-        $this->assertSame('v2', $blocks[1]);
-        $this->assertSame('fmt-salt', $blocks[2]);
-        $this->assertMatchesRegularExpression('/^[0-9a-f]{32}$/', $blocks[3]);
+        $this->assertSame('v3', $blocks[1]);
+        $this->assertSame(self::KEY_ID, $blocks[2]);
+        $this->assertSame('fmt-salt', $blocks[3]);
+        $this->assertMatchesRegularExpression('/^[0-9a-f]{32}$/', $blocks[4]);
+        $this->assertSame(10, self::dataBlockCount($raw));
         $this->assertSame($payload, self::referenceDecrypt($raw, self::KEY));
     }
 
-    /** Backward compatibility: a file written before the rewrite still decrypts. */
+    public function testAFixedV3FileStillDecrypts(): void
+    {
+        $raw = base64_decode(self::V3_FILE_B64);
+        $vector = $this->write('v3.enc', $raw);
+
+        $dec = Security::decryptFile($vector, self::KEY, $this->path('v3.dec'));
+
+        $this->assertSame(base64_decode(self::V3_PAYLOAD_B64), file_get_contents($dec));
+        $this->assertSame(base64_decode(self::V3_PAYLOAD_B64), self::referenceDecrypt($raw, self::KEY));
+    }
+
+    /**
+     * WHY v3: every file has its own key, so the same content under the same master key and salt
+     * shares no ciphertext — not across files, and not between equal blocks of one file.
+     */
+    public function testIdenticalInputsUnderTheSameKeyShareNoCiphertext(): void
+    {
+        Security::setFileEncryptBlocksBytes(16);
+        $payload = str_repeat('A', 160); // ten identical 16-byte blocks
+
+        $a = self::decodeBlocks(file_get_contents(Security::encryptFile($this->write('a.src', $payload), self::KEY, $this->path('a.enc'), 'same')));
+        $b = self::decodeBlocks(file_get_contents(Security::encryptFile($this->write('b.src', $payload), self::KEY, $this->path('b.enc'), 'same')));
+
+        $this->assertNotSame($a[4], $b[4], 'each file draws its own file id');
+        $bodyA = array_slice($a, self::HEADER_BLOCKS);
+        $bodyB = array_slice($b, self::HEADER_BLOCKS);
+        $this->assertSame([], array_values(array_intersect($bodyA, $bodyB)), 'no block may appear in both files');
+        $this->assertCount(count($bodyA), array_unique($bodyA), 'equal plaintext blocks must not repeat within a file');
+    }
+
+    /** v3 stores no nonce: at 1-byte blocks a file is about half the size the v2 format needed. */
+    public function testAV3FileIsSmallerThanTheV2FileOfTheSameContent(): void
+    {
+        Security::setFileEncryptBlocksBytes(1);
+        $payload = self::bytes(1000, 'size');
+        [, $enc] = $this->assertRoundTrip($payload);
+
+        $v2 = strlen(self::referenceEncryptV2($payload, self::KEY, '?', 1));
+        $this->assertLessThan($v2 * 0.6, filesize($enc), 'v3 ' . filesize($enc) . " bytes vs v2 {$v2} bytes");
+    }
+
+    /** The header names the key: a keyring goes straight to it, and a missing key is named. */
+    public function testTheHeaderNamesTheKeyAndAKeyringUsesIt(): void
+    {
+        $src = $this->write('k.src', 'written under the newer key');
+        $enc = Security::encryptFile($src, new Keyring(self::OTHER_KEY, self::KEY), $this->path('k.enc'));
+        $this->assertSame(self::referenceKeyId(self::OTHER_KEY), self::decodeBlocks(file_get_contents($enc))[2]);
+
+        $dec = Security::decryptFile($enc, new Keyring(self::KEY, self::OTHER_KEY), $this->path('k.dec'));
+        $this->assertSame('written under the newer key', file_get_contents($dec));
+
+        $before = $this->dirEntries();
+        try {
+            Security::decryptFile($enc, self::KEY, $this->path('k2.dec'));
+            $this->fail('A file under a key the keyring does not hold must be refused.');
+        } catch (\Exception $e) {
+            $this->assertStringContainsString('No key with id ' . self::referenceKeyId(self::OTHER_KEY), $e->getMessage());
+        }
+        $this->assertSame($before, $this->dirEntries());
+    }
+
+    /** For a rotation: which key wrote a file, read from the header alone. */
+    public function testFileKeyIdReadsTheKeyIdFromTheHeader(): void
+    {
+        $src = $this->write('id.src', 'x');
+        $underKey = Security::encryptFile($src, self::KEY, $this->path('k.enc'));
+        $underOther = Security::encryptFile($src, new Keyring(self::OTHER_KEY, self::KEY), $this->path('o.enc'));
+        $legacy = $this->write('legacy-id.enc', base64_decode(self::LEGACY_FILE_B64));
+
+        $this->assertSame(self::KEY_ID, Security::fileKeyId($underKey));
+        $this->assertSame(self::referenceKeyId(self::OTHER_KEY), Security::fileKeyId($underOther));
+        $this->assertNull(Security::fileKeyId($legacy), 'a v2 file records no key id');
+
+        $this->expectException(\Exception::class);
+        $this->expectExceptionMessage('Cipher type does not match');
+        Security::fileKeyId($this->write('junk', self::encodeBlocks(['not a cipher'])));
+    }
+
+    /** LEGACY: a v2 file written before the reader/writer rewrite still decrypts. */
     public function testALegacyFileWrittenBeforeTheRewriteStillDecrypts(): void
     {
         $legacy = $this->write('legacy.enc', base64_decode(self::LEGACY_FILE_B64));
 
-        $dec = Security::decryptFileV2($legacy, self::LEGACY_KEY, $this->path('legacy.dec'));
+        $dec = Security::decryptFile($legacy, self::LEGACY_KEY, $this->path('legacy.dec'));
 
         $this->assertSame(base64_decode(self::LEGACY_PAYLOAD_B64), file_get_contents($dec));
         $this->assertSame('legacy-salt', self::decodeBlocks(base64_decode(self::LEGACY_FILE_B64))[2]);
@@ -713,13 +862,13 @@ final class SecurityFileEncryptionTest extends TestCase
         gc_collect_cycles();
         memory_reset_peak_usage();
         $baseline = memory_get_usage();
-        $enc = Security::encryptFileV2($src, self::KEY, $this->path("{$name}.enc"));
+        $enc = Security::encryptFile($src, self::KEY, $this->path("{$name}.enc"));
         $encryptPeak = memory_get_peak_usage() - $baseline;
 
         gc_collect_cycles();
         memory_reset_peak_usage();
         $baseline = memory_get_usage();
-        $dec = Security::decryptFileV2($enc, self::KEY, $this->path("{$name}.dec"));
+        $dec = Security::decryptFile($enc, self::KEY, $this->path("{$name}.dec"));
         $decryptPeak = memory_get_peak_usage() - $baseline;
 
         $this->assertSame(hash_file('sha256', $src), hash_file('sha256', $dec));
@@ -753,13 +902,13 @@ final class SecurityFileEncryptionTest extends TestCase
     // The max-encoded-block limit, enforced on BOTH sides
     // ---------------------------------------------------------------------------------------
 
-    /** A 300-byte block encodes to exactly 400 bytes: a limit of exactly 400 must work. */
+    /** A 284-byte block plus its 16-byte tag is 300 bytes, which encode to exactly 400: a limit of exactly 400 must work. */
     public function testAnEncodedBlockExactlyAtTheLimitRoundTrips(): void
     {
-        Security::setFileEncryptBlocksBytes(300);
+        Security::setFileEncryptBlocksBytes(284);
         Security::setFileMaxEncodedBlockBytes(400);
 
-        foreach ([300, 600, 900, 901] as $size) {
+        foreach ([284, 568, 852, 853] as $size) {
             [, $enc] = $this->assertRoundTrip(self::bytes($size, "limit{$size}"), null, "limit{$size}");
 
             $raw = file_get_contents($enc);
@@ -778,19 +927,19 @@ final class SecurityFileEncryptionTest extends TestCase
      */
     public function testALimitOneByteBelowTheEncodedBlockFailsAtEncryptTimeLeavingNothing(): void
     {
-        Security::setFileEncryptBlocksBytes(300);
+        Security::setFileEncryptBlocksBytes(284);
         Security::setFileMaxEncodedBlockBytes(399);
         $src = $this->write('src', self::bytes(300));
         $destination = $this->path('not-created' . DIRECTORY_SEPARATOR . 'out.enc');
 
         try {
-            Security::encryptFileV2($src, self::KEY, $destination);
+            Security::encryptFile($src, self::KEY, $destination);
             $this->fail('An over-limit block size must be refused at encrypt time.');
         } catch (\Exception $e) {
             $this->assertStringContainsString('setFileEncryptBlocksBytes', $e->getMessage());
             $this->assertStringContainsString('setFileMaxEncodedBlockBytes', $e->getMessage());
             $this->assertStringContainsString('400-byte base64 block', $e->getMessage());
-            $this->assertStringContainsString('at most 297 bytes', $e->getMessage());
+            $this->assertStringContainsString('at most 281 bytes', $e->getMessage());
         }
 
         $this->assertSame(['src'], $this->dirEntries(), 'Not even the destination directory may be created.');
@@ -804,7 +953,7 @@ final class SecurityFileEncryptionTest extends TestCase
         $destination = $this->write('precious.enc', 'PRECIOUS');
 
         try {
-            Security::encryptFileV2($src, self::KEY, $destination);
+            Security::encryptFile($src, self::KEY, $destination);
             $this->fail('Expected the over-limit refusal.');
         } catch (\Exception) {
         }
@@ -814,20 +963,20 @@ final class SecurityFileEncryptionTest extends TestCase
     }
 
     /**
-     * The exact threshold under the DEFAULT limit: 3*floor(268435456/4) = 201.326.592 bytes. One
-     * byte more and the file could never be decrypted. Refused before a single byte is read, so
-     * this costs no 200 MB allocation.
+     * The exact threshold under the DEFAULT limit: 3*floor(268435456/4) - 16 = 201.326.576 bytes
+     * (the block is written with its 16-byte tag). One byte more and the file could never be
+     * decrypted. Refused before a single byte is read, so this costs no 200 MB allocation.
      */
     public function testTheDefaultLimitRefusesABlockSizeOneByteAboveTheDecryptableThreshold(): void
     {
-        Security::setFileEncryptBlocksBytes(201326593);
+        Security::setFileEncryptBlocksBytes(201326577);
         $src = $this->write('src', 'tiny');
 
         try {
-            Security::encryptFileV2($src, self::KEY, $this->path('out.enc'));
-            $this->fail('A block size above 201326592 bytes must be refused under the default limit.');
+            Security::encryptFile($src, self::KEY, $this->path('out.enc'));
+            $this->fail('A block size above 201326576 bytes must be refused under the default limit.');
         } catch (\Exception $e) {
-            $this->assertStringContainsString('at most 201326592 bytes', $e->getMessage());
+            $this->assertStringContainsString('at most 201326576 bytes', $e->getMessage());
             $this->assertStringContainsString('268435460-byte base64 block', $e->getMessage());
         }
 
@@ -841,7 +990,7 @@ final class SecurityFileEncryptionTest extends TestCase
      */
     public function testTheDefaultLimitAcceptsTheLargestDecryptableBlockSizeWithoutAllocatingIt(): void
     {
-        Security::setFileEncryptBlocksBytes(201326592);
+        Security::setFileEncryptBlocksBytes(201326576);
 
         memory_reset_peak_usage();
         $baseline = memory_get_usage();
@@ -858,7 +1007,7 @@ final class SecurityFileEncryptionTest extends TestCase
 
         $this->expectException(\Exception::class);
         $this->expectExceptionMessage('max-encoded-block limit');
-        Security::encryptFileV2($src, self::KEY, $this->path('out.enc'));
+        Security::encryptFile($src, self::KEY, $this->path('out.enc'));
     }
 
     /** The salt is a header block, so it is bound by the same limit. */
@@ -871,7 +1020,7 @@ final class SecurityFileEncryptionTest extends TestCase
         $before = $this->dirEntries();
 
         try {
-            Security::encryptFileV2($this->path('rt.src'), self::KEY, $this->path('salt.enc'), str_repeat('s', 301));
+            Security::encryptFile($this->path('rt.src'), self::KEY, $this->path('salt.enc'), str_repeat('s', 301));
             $this->fail('A salt whose header block exceeds the limit must be refused.');
         } catch (\Exception $e) {
             $this->assertStringContainsString('301-byte salt', $e->getMessage());
@@ -888,11 +1037,11 @@ final class SecurityFileEncryptionTest extends TestCase
      */
     public function testAFileWrittenUnderARaisedLimitNeedsThatLimitToDecrypt(): void
     {
-        Security::setFileEncryptBlocksBytes(300);
+        Security::setFileEncryptBlocksBytes(284);
         Security::setFileMaxEncodedBlockBytes(400);
         $payload = self::bytes(1000, 'xproc');
         $src = $this->write('src', $payload);
-        $enc = Security::encryptFileV2($src, self::KEY, $this->path('file.enc'));
+        $enc = Security::encryptFile($src, self::KEY, $this->path('file.enc'));
 
         // "Another process", running with a smaller limit.
         Security::setFileEncryptBlocksBytes(null);
@@ -902,7 +1051,7 @@ final class SecurityFileEncryptionTest extends TestCase
         $appended = $this->write('appended.dec', 'PART ONE;');
         foreach ([[$replaced, 'w', 'OLD CONTENT'], [$appended, 'a', 'PART ONE;']] as [$destination, $mode, $expected]) {
             try {
-                Security::decryptFileV2($enc, self::KEY, $destination, null, $mode);
+                Security::decryptFile($enc, self::KEY, $destination, null, $mode);
                 $this->fail("Mode {$mode}: a block above the current limit must be refused.");
             } catch (\Exception $e) {
                 $this->assertStringContainsString('declares 400 encoded bytes', $e->getMessage());
@@ -914,8 +1063,8 @@ final class SecurityFileEncryptionTest extends TestCase
         $this->assertSame(['appended.dec', 'file.enc', 'replaced.dec', 'src'], $this->dirEntries());
 
         Security::setFileMaxEncodedBlockBytes(400);
-        Security::decryptFileV2($enc, self::KEY, $replaced);
-        Security::decryptFileV2($enc, self::KEY, $appended, null, 'a');
+        Security::decryptFile($enc, self::KEY, $replaced);
+        Security::decryptFile($enc, self::KEY, $appended, null, 'a');
 
         $this->assertSame($payload, file_get_contents($replaced));
         $this->assertSame('PART ONE;' . $payload, file_get_contents($appended));
@@ -967,8 +1116,27 @@ final class SecurityFileEncryptionTest extends TestCase
         $before = $this->dirEntries();
 
         try {
-            Security::decryptFileV2($crafted, self::OTHER_KEY, $this->path('wrongkey.dec'));
+            Security::decryptFile($crafted, self::OTHER_KEY, $this->path('wrongkey.dec'));
             $this->fail('A wrong key must be rejected.');
+        } catch (\Exception $e) {
+            // The header names the key it needs; a different key has a different id.
+            $this->assertStringContainsString('No key with id ' . self::KEY_ID, $e->getMessage());
+        }
+
+        $this->assertSame($before, $this->dirEntries());
+    }
+
+    /** Pointing the header at another key of the keyring cannot select it: every block then fails. */
+    public function testRewritingTheKeyIdInTheHeaderIsRejected(): void
+    {
+        $blocks = self::decodeBlocks($this->smallEncryptedFile());
+        $blocks[2] = self::referenceKeyId(self::OTHER_KEY);
+        $crafted = $this->write('kid.enc', self::encodeBlocks($blocks));
+        $before = $this->dirEntries();
+
+        try {
+            Security::decryptFile($crafted, new Keyring(self::KEY, self::OTHER_KEY), $this->path('kid.dec'));
+            $this->fail('A rewritten key id must be rejected.');
         } catch (\Exception $e) {
             $this->assertStringContainsString('failed authentication', $e->getMessage());
         }
@@ -982,8 +1150,8 @@ final class SecurityFileEncryptionTest extends TestCase
         $enc = $this->write('file.enc', $this->smallEncryptedFile());
         $before = $this->dirEntries();
 
-        foreach (['encrypt' => fn () => Security::encryptFileV2($enc, str_repeat('k', 31), $this->path('new' . DIRECTORY_SEPARATOR . 'x')),
-                  'decrypt' => fn () => Security::decryptFileV2($enc, str_repeat('k', 31), $this->path('new' . DIRECTORY_SEPARATOR . 'x'))] as $label => $call) {
+        foreach (['encrypt' => fn () => Security::encryptFile($enc, str_repeat('k', 31), $this->path('new' . DIRECTORY_SEPARATOR . 'x')),
+                  'decrypt' => fn () => Security::decryptFile($enc, str_repeat('k', 31), $this->path('new' . DIRECTORY_SEPARATOR . 'x'))] as $label => $call) {
             try {
                 $call();
                 $this->fail("{$label}: a 31-byte key must be refused.");
@@ -1033,13 +1201,14 @@ final class SecurityFileEncryptionTest extends TestCase
     public function testATamperedBlockIsRejectedWhereverItIs(): void
     {
         $blocks = self::decodeBlocks($this->smallEncryptedFile('semantic'));
-        $names = ['cipher', 'version', 'salt', 'file id'];
+        $names = ['cipher', 'version', 'key id', 'salt', 'file id'];
+        $last = count($blocks) - 1;
 
         foreach ($blocks as $k => $block) {
             foreach ([0, strlen($block) - 1] as $position) {
                 $mutated = $blocks;
                 $mutated[$k][$position] = chr(ord($block[$position]) ^ 0x01);
-                $name = $names[$k] ?? (['iv', 'tag', 'ciphertext'][($k - 4) % 3] . ' of triple ' . intdiv($k - 4, 3));
+                $name = $names[$k] ?? ($k === $last ? 'end marker' : 'data block ' . ($k - self::HEADER_BLOCKS));
                 $this->assertDecryptRejects(self::encodeBlocks($mutated), "{$name}, byte {$position}");
             }
         }
@@ -1054,22 +1223,22 @@ final class SecurityFileEncryptionTest extends TestCase
         }
     }
 
-    public function testDroppingWholeTrailingTriplesIsReportedAsTruncation(): void
+    public function testDroppingWholeTrailingBlocksIsReportedAsTruncation(): void
     {
         $blocks = self::decodeBlocks($this->smallEncryptedFile());
 
-        $this->assertDecryptRejects(self::encodeBlocks(array_slice($blocks, 0, -3)), 'end marker dropped', 'truncated');
-        $this->assertDecryptRejects(self::encodeBlocks(array_slice($blocks, 0, -6)), 'last data block + marker dropped', 'truncated');
-        $this->assertDecryptRejects(self::encodeBlocks(array_slice($blocks, 0, 4)), 'header only', 'truncated');
-        $this->assertDecryptRejects(self::encodeBlocks(array_slice($blocks, 0, 3)), 'no file id', 'truncated');
+        $this->assertDecryptRejects(self::encodeBlocks(array_slice($blocks, 0, -1)), 'end marker dropped', 'truncated');
+        $this->assertDecryptRejects(self::encodeBlocks(array_slice($blocks, 0, -2)), 'last data block + marker dropped', 'truncated');
+        $this->assertDecryptRejects(self::encodeBlocks(array_slice($blocks, 0, self::HEADER_BLOCKS)), 'header only', 'truncated');
+        $this->assertDecryptRejects(self::encodeBlocks(array_slice($blocks, 0, self::HEADER_BLOCKS - 1)), 'no file id', 'truncated');
     }
 
     /**
-     * Structural attacks on whole triples: each must fail authentication.
+     * Structural attacks on whole blocks: each must fail authentication.
      *
      * @return array<string, array{0: string}>
      */
-    public static function tripleAttackProvider(): array
+    public static function blockAttackProvider(): array
     {
         return [
             'swap first two data blocks'    => ['swap01'],
@@ -1081,54 +1250,55 @@ final class SecurityFileEncryptionTest extends TestCase
         ];
     }
 
-    #[DataProvider('tripleAttackProvider')]
+    #[DataProvider('blockAttackProvider')]
     public function testReorderingDuplicatingOrDroppingBlocksIsRejected(string $attack): void
     {
         $blocks = self::decodeBlocks($this->smallEncryptedFile());
-        $header = array_slice($blocks, 0, 4);
-        $triples = array_chunk(array_slice($blocks, 4), 3);
-        $last = count($triples) - 1; // the end marker
+        $header = array_slice($blocks, 0, self::HEADER_BLOCKS);
+        $body = array_slice($blocks, self::HEADER_BLOCKS);
+        $last = count($body) - 1; // the end marker
 
         switch ($attack) {
             case 'swap01':
-                [$triples[0], $triples[1]] = [$triples[1], $triples[0]];
+                [$body[0], $body[1]] = [$body[1], $body[0]];
                 break;
             case 'swapLastMarker':
-                [$triples[$last - 1], $triples[$last]] = [$triples[$last], $triples[$last - 1]];
+                [$body[$last - 1], $body[$last]] = [$body[$last], $body[$last - 1]];
                 break;
             case 'duplicate':
-                array_splice($triples, 2, 0, [$triples[2]]);
+                array_splice($body, 2, 0, [$body[2]]);
                 break;
             case 'dropMiddle':
-                array_splice($triples, 3, 1);
+                array_splice($body, 3, 1);
                 break;
             case 'dropFirst':
-                array_shift($triples);
+                array_shift($body);
                 break;
             case 'markerFirst':
-                array_unshift($triples, array_pop($triples));
+                array_unshift($body, array_pop($body));
                 break;
         }
 
-        $this->assertDecryptRejects(self::encodeBlocks(array_merge($header, ...$triples)), $attack);
+        $this->assertDecryptRejects(self::encodeBlocks(array_merge($header, $body)), $attack);
     }
 
-    /** Same key, same salt, same position — only the per-file id tells the files apart. */
+    /** Same key, same salt, same position — only the per-file id (hence the file key) tells the files apart. */
     public function testBlocksSplicedFromAnotherFileUnderTheSameKeyAreRejected(): void
     {
         $a = self::decodeBlocks($this->smallEncryptedFile('a', self::bytes(100, 'same')));
         $b = self::decodeBlocks($this->smallEncryptedFile('b', self::bytes(100, 'same')));
         $this->assertSame(count($a), count($b));
+        $last = count($a) - 1;
 
         $dataFromB = $a;
-        array_splice($dataFromB, 7, 3, array_slice($b, 7, 3));
+        $dataFromB[self::HEADER_BLOCKS + 1] = $b[self::HEADER_BLOCKS + 1];
         $this->assertDecryptRejects(self::encodeBlocks($dataFromB), 'data block 1 from file B');
 
         $markerFromB = $a;
-        array_splice($markerFromB, -3, 3, array_slice($b, -3));
+        $markerFromB[$last] = $b[$last];
         $this->assertDecryptRejects(self::encodeBlocks($markerFromB), 'end marker from file B (same block count)');
 
-        $headerFromB = array_merge(array_slice($b, 0, 4), array_slice($a, 4));
+        $headerFromB = array_merge(array_slice($b, 0, self::HEADER_BLOCKS), array_slice($a, self::HEADER_BLOCKS));
         $this->assertDecryptRejects(self::encodeBlocks($headerFromB), 'header (file id) from file B');
     }
 
@@ -1138,8 +1308,8 @@ final class SecurityFileEncryptionTest extends TestCase
         $raw = $this->smallEncryptedFile();
         $blocks = self::decodeBlocks($raw);
         $suffix = match ($suffix) {
-            'MARKER' => self::encodeBlocks(array_slice($blocks, -3)),
-            'TRIPLE' => self::encodeBlocks(array_slice($blocks, 4, 3)),
+            'MARKER' => self::encodeBlocks(array_slice($blocks, -1)),
+            'BLOCK'  => self::encodeBlocks([$blocks[self::HEADER_BLOCKS]]),
             default  => $suffix,
         };
 
@@ -1156,7 +1326,7 @@ final class SecurityFileEncryptionTest extends TestCase
             'a NUL'                  => ["\0"],
             'a valid block'          => ['4-QUJD'],
             'the end marker again'   => ['MARKER'],
-            'a data triple again'    => ['TRIPLE'],
+            'a data block again'     => ['BLOCK'],
         ];
     }
 
@@ -1169,7 +1339,7 @@ final class SecurityFileEncryptionTest extends TestCase
     {
         $raw = $this->smallEncryptedFile();
         $spans = self::blockSpans($raw);
-        [$start, $end] = $spans[5]; // the first tag: 16 bytes, "==" padded, 4 unused bits
+        [$start, $end] = $spans[2]; // the key id: 16 bytes, "==" padded, 4 unused bits
         $block = substr($raw, $start, $end - $start);
         [$len, $payload] = explode('-', $block, 2);
         $len = (int) $len;
@@ -1203,22 +1373,29 @@ final class SecurityFileEncryptionTest extends TestCase
         );
     }
 
-    #[DataProvider('notAV2FileProvider')]
-    public function testSomethingThatIsNotAV2FileIsRejected(string $bytes, string $message): void
+    #[DataProvider('notAnEncryptedFileProvider')]
+    public function testSomethingThatIsNotAnEncryptedFileIsRejected(string $bytes, string $message): void
     {
         $this->assertDecryptRejects($bytes, bin2hex(substr($bytes, 0, 16)), $message);
     }
 
-    public static function notAV2FileProvider(): array
+    public static function notAnEncryptedFileProvider(): array
     {
+        $fileId = str_repeat('a', 32);
+
         return [
-            'empty file'         => ['', 'truncated'],
-            'plain text'         => ['hello world', 'malformed block length'],
-            'zero-length block'  => ['0-', 'malformed block length'],
-            'other cipher'       => [self::encodeBlocks(['aes-128-gcm', 'v2', '?', str_repeat('a', 32)]), 'Cipher type does not match'],
-            'other version'      => [self::encodeBlocks(['aes-256-gcm', 'v3', '?', str_repeat('a', 32)]), 'Cipher version does not match'],
-            'short IV'           => [self::encodeBlocks(['aes-256-gcm', 'v2', '?', str_repeat('a', 32), str_repeat('i', 11)]), 'iv length'],
-            'length never ends'  => [str_repeat('1', 5), 'truncated'],
+            'empty file'                   => ['', 'truncated'],
+            'plain text'                   => ['hello world', 'malformed block length'],
+            'zero-length block'            => ['0-', 'malformed block length'],
+            'other cipher'                 => [self::encodeBlocks(['aes-128-gcm', 'v3', self::KEY_ID, '?', $fileId]), 'Cipher type does not match'],
+            'unknown version'              => [self::encodeBlocks(['aes-256-gcm', 'v9', self::KEY_ID, '?', $fileId]), 'Cipher version does not match'],
+            'v3: malformed key id'         => [self::encodeBlocks(['aes-256-gcm', 'v3', 'not-a-key-id', '?', $fileId]), 'malformed key id'],
+            'v3: unknown key id'           => [self::encodeBlocks(['aes-256-gcm', 'v3', str_repeat('0', 16), '?', $fileId]), 'No key with id 0000000000000000'],
+            'v3: malformed file id'        => [self::encodeBlocks(['aes-256-gcm', 'v3', self::KEY_ID, '?', 'short']), 'malformed file id'],
+            'v3: block shorter than a tag' => [self::encodeBlocks(['aes-256-gcm', 'v3', self::KEY_ID, '?', $fileId, str_repeat('t', 16)]), 'shorter than ciphertext plus tag'],
+            'v3: header only'              => [self::encodeBlocks(['aes-256-gcm', 'v3', self::KEY_ID, '?', $fileId]), 'truncated'],
+            'v2: short IV'                 => [self::encodeBlocks(['aes-256-gcm', 'v2', '?', $fileId, str_repeat('i', 11)]), 'iv length'],
+            'length never ends'            => [str_repeat('1', 5), 'truncated'],
         ];
     }
 
@@ -1232,13 +1409,13 @@ final class SecurityFileEncryptionTest extends TestCase
     {
         $blocks = self::decodeBlocks($this->smallEncryptedFile());
         $last = count($blocks) - 1;
-        $blocks[$last - 3][0] = chr(ord($blocks[$last - 3][0]) ^ 1); // the LAST data block: 6 decrypt first
+        $blocks[$last - 1][0] = chr(ord($blocks[$last - 1][0]) ^ 1); // the LAST data block: 6 decrypt first
         $crafted = $this->write('crafted.enc', self::encodeBlocks($blocks));
 
         foreach (['w', 'a'] as $mode) {
             $destination = $this->write("existing-{$mode}.dec", "PREVIOUS CONTENT ({$mode})");
             try {
-                Security::decryptFileV2($crafted, self::KEY, $destination, null, $mode);
+                Security::decryptFile($crafted, self::KEY, $destination, null, $mode);
                 $this->fail('A tampered block must be rejected.');
             } catch (\Exception) {
             }
@@ -1253,20 +1430,20 @@ final class SecurityFileEncryptionTest extends TestCase
         $partA = $this->write('a.src', self::bytes(50, 'A'));
         $partB = $this->write('b.src', self::bytes(70, 'B'));
         Security::setFileEncryptBlocksBytes(16);
-        $encA = Security::encryptFileV2($partA, self::KEY, $this->path('a.enc'));
-        $encB = Security::encryptFileV2($partB, self::KEY, $this->path('b.enc'));
+        $encA = Security::encryptFile($partA, self::KEY, $this->path('a.enc'));
+        $encB = Security::encryptFile($partB, self::KEY, $this->path('b.enc'));
         $bad = $this->write('bad.enc', substr(file_get_contents($encB), 0, -10));
 
         $joined = $this->path('joined');
-        Security::decryptFileV2($encA, self::KEY, $joined, null, 'a'); // creates it
+        Security::decryptFile($encA, self::KEY, $joined, null, 'a'); // creates it
         try {
-            Security::decryptFileV2($bad, self::KEY, $joined, null, 'a');
+            Security::decryptFile($bad, self::KEY, $joined, null, 'a');
             $this->fail('A truncated part must be rejected.');
         } catch (\Exception) {
         }
         $this->assertSame(self::bytes(50, 'A'), file_get_contents($joined), 'The failed part must not change the destination.');
 
-        Security::decryptFileV2($encB, self::KEY, $joined, null, 'ab');
+        Security::decryptFile($encB, self::KEY, $joined, null, 'ab');
         $this->assertSame(self::bytes(50, 'A') . self::bytes(70, 'B'), file_get_contents($joined));
     }
 
@@ -1297,7 +1474,7 @@ final class SecurityFileEncryptionTest extends TestCase
 
         foreach (['w', 'a'] as $mode) {
             try {
-                Security::decryptFileV2($enc, self::KEY, $destination, null, $mode);
+                Security::decryptFile($enc, self::KEY, $destination, null, $mode);
                 $this->fail("{$mutation}/{$mode}: decrypting onto the source must be refused.");
             } catch (\Exception $e) {
                 $this->assertStringContainsString('must not be the same file', $e->getMessage());
@@ -1318,9 +1495,9 @@ final class SecurityFileEncryptionTest extends TestCase
         $destination = $this->write('precious', 'PRECIOUS');
         $missing = $this->path('does-not-exist');
 
-        foreach (['encrypt' => fn () => Security::encryptFileV2($missing, self::KEY, $destination),
-                  'decrypt' => fn () => Security::decryptFileV2($missing, self::KEY, $destination),
-                  'empty path' => fn () => Security::encryptFileV2('', self::KEY, $destination)] as $label => $call) {
+        foreach (['encrypt' => fn () => Security::encryptFile($missing, self::KEY, $destination),
+                  'decrypt' => fn () => Security::decryptFile($missing, self::KEY, $destination),
+                  'empty path' => fn () => Security::encryptFile('', self::KEY, $destination)] as $label => $call) {
             try {
                 $call();
                 $this->fail("{$label}: a missing source must be refused.");
@@ -1340,8 +1517,8 @@ final class SecurityFileEncryptionTest extends TestCase
     {
         mkdir($this->path('folder'));
 
-        foreach (['encrypt' => fn () => Security::encryptFileV2($this->path('folder'), self::KEY, $this->path('out')),
-                  'decrypt' => fn () => Security::decryptFileV2($this->path('folder'), self::KEY, $this->path('out'))] as $label => $call) {
+        foreach (['encrypt' => fn () => Security::encryptFile($this->path('folder'), self::KEY, $this->path('out')),
+                  'decrypt' => fn () => Security::decryptFile($this->path('folder'), self::KEY, $this->path('out'))] as $label => $call) {
             try {
                 $call();
                 $this->fail("{$label}: a directory must not be accepted as the source.");
@@ -1359,10 +1536,10 @@ final class SecurityFileEncryptionTest extends TestCase
         mkdir($this->path('out'));
         $src = $this->write('in' . DIRECTORY_SEPARATOR . '0', 'zero-named payload');
 
-        $enc = Security::encryptFileV2($src, self::KEY, $this->path('out' . DIRECTORY_SEPARATOR . '0'));
+        $enc = Security::encryptFile($src, self::KEY, $this->path('out' . DIRECTORY_SEPARATOR . '0'));
         $this->assertSame(realpath($this->path('out' . DIRECTORY_SEPARATOR . '0')), $enc);
 
-        $dec = Security::decryptFileV2($enc, self::KEY, $this->path('0'));
+        $dec = Security::decryptFile($enc, self::KEY, $this->path('0'));
         $this->assertSame('zero-named payload', file_get_contents($dec));
     }
 
@@ -1375,7 +1552,7 @@ final class SecurityFileEncryptionTest extends TestCase
     public function testBlankAndNulPathsAreRefusedWithAnException(string $side, string $path): void
     {
         $src = $this->write('src', 'x');
-        $enc = Security::encryptFileV2($src, self::KEY, $this->path('src.enc'));
+        $enc = Security::encryptFile($src, self::KEY, $this->path('src.enc'));
         $before = $this->dirEntries();
 
         $cwd = getcwd();
@@ -1386,12 +1563,12 @@ final class SecurityFileEncryptionTest extends TestCase
                 try {
                     if ($direction === 'encrypt') {
                         $side === 'source'
-                            ? Security::encryptFileV2($path, self::KEY, $this->path('out'))
-                            : Security::encryptFileV2($input, self::KEY, $path);
+                            ? Security::encryptFile($path, self::KEY, $this->path('out'))
+                            : Security::encryptFile($input, self::KEY, $path);
                     } else {
                         $side === 'source'
-                            ? Security::decryptFileV2($path, self::KEY, $this->path('out'))
-                            : Security::decryptFileV2($input, self::KEY, $path);
+                            ? Security::decryptFile($path, self::KEY, $this->path('out'))
+                            : Security::decryptFile($input, self::KEY, $path);
                     }
                     $this->fail("{$direction}: the {$side} path " . json_encode($path) . ' must be refused.');
                 } catch (\Exception $e) {
@@ -1427,7 +1604,7 @@ final class SecurityFileEncryptionTest extends TestCase
 
         $this->expectException(\Exception::class);
         $this->expectExceptionMessage('Invalid destination path');
-        Security::encryptFileV2($src, self::KEY, $this->path('folder'));
+        Security::encryptFile($src, self::KEY, $this->path('folder'));
     }
 
     /**
@@ -1438,12 +1615,12 @@ final class SecurityFileEncryptionTest extends TestCase
     public function testAMalformedPermissionModeIsRefusedBeforeAnythingIsTouched(string $mode): void
     {
         $src = $this->write('src', 'x');
-        $enc = Security::encryptFileV2($src, self::KEY, $this->path('ok.enc'));
+        $enc = Security::encryptFile($src, self::KEY, $this->path('ok.enc'));
         $before = $this->dirEntries();
         $destination = $this->path('sub' . DIRECTORY_SEPARATOR . 'out');
 
-        foreach (['encrypt' => fn () => Security::encryptFileV2($src, self::KEY, $destination, null, $mode),
-                  'decrypt' => fn () => Security::decryptFileV2($enc, self::KEY, $destination, $mode)] as $label => $call) {
+        foreach (['encrypt' => fn () => Security::encryptFile($src, self::KEY, $destination, null, $mode),
+                  'decrypt' => fn () => Security::decryptFile($enc, self::KEY, $destination, $mode)] as $label => $call) {
             try {
                 $call();
                 $this->fail("{$label}: mode '{$mode}' must be refused.");
@@ -1477,23 +1654,23 @@ final class SecurityFileEncryptionTest extends TestCase
         $src = $this->write('src', 'SECRET');
         $windows = (DIRECTORY_SEPARATOR === '\\');
         $readOnly = ($windows ? '0444' : '0400');
-        $enc = Security::encryptFileV2($src, self::KEY, $this->path('new.enc'), null, $readOnly);
-        $dec = Security::decryptFileV2($enc, self::KEY, $this->path('new.dec'), $readOnly);
+        $enc = Security::encryptFile($src, self::KEY, $this->path('new.enc'), null, $readOnly);
+        $dec = Security::decryptFile($enc, self::KEY, $this->path('new.dec'), $readOnly);
         clearstatcache();
         $this->assertSame('SECRET', file_get_contents($dec));
 
         if ($windows) {
-            $this->assertFalse(is_writable($enc), 'encryptFileV2 did not apply the mode to a new file');
-            $this->assertFalse(is_writable($dec), 'decryptFileV2 did not apply the mode to a new file');
+            $this->assertFalse(is_writable($enc), 'encryptFile did not apply the mode to a new file');
+            $this->assertFalse(is_writable($dec), 'decryptFile did not apply the mode to a new file');
 
             return;
         }
 
         // Exact bits rather than is_writable(): root may write a 0400 file.
-        $this->assertSame(0400, fileperms($enc) & 0777, 'encryptFileV2 did not apply the mode to a new file');
-        $this->assertSame(0400, fileperms($dec) & 0777, 'decryptFileV2 did not apply the mode to a new file');
+        $this->assertSame(0400, fileperms($enc) & 0777, 'encryptFile did not apply the mode to a new file');
+        $this->assertSame(0400, fileperms($dec) & 0777, 'decryptFile did not apply the mode to a new file');
         chmod($enc, 0600);
-        Security::decryptFileV2($enc, self::KEY, $this->path('secret.dec'), '0600');
+        Security::decryptFile($enc, self::KEY, $this->path('secret.dec'), '0600');
         clearstatcache();
         $this->assertSame(0600, fileperms($this->path('secret.dec')) & 0777);
     }
@@ -1515,8 +1692,8 @@ final class SecurityFileEncryptionTest extends TestCase
         $src = $this->write('src', 'payload');
         $destination = $this->path('made' . DIRECTORY_SEPARATOR . 'deeper' . DIRECTORY_SEPARATOR . 'out.enc');
 
-        $enc = Security::encryptFileV2($src, self::KEY, $destination, null, '0600');
-        $dec = Security::decryptFileV2($enc, self::KEY, $this->path('made2' . DIRECTORY_SEPARATOR . 'out.dec'), '0600');
+        $enc = Security::encryptFile($src, self::KEY, $destination, null, '0600');
+        $dec = Security::decryptFile($enc, self::KEY, $this->path('made2' . DIRECTORY_SEPARATOR . 'out.dec'), '0600');
 
         $this->assertSame('payload', file_get_contents($dec));
         if (DIRECTORY_SEPARATOR !== '\\') {
@@ -1535,19 +1712,19 @@ final class SecurityFileEncryptionTest extends TestCase
         clearstatcache();
 
         try {
-            Security::encryptFileV2($src, self::KEY, $destination);
+            Security::encryptFile($src, self::KEY, $destination);
             $this->fail('A read-only destination must not be replaced without a mode.');
         } catch (\Exception $e) {
             $this->assertStringContainsString('read-only', $e->getMessage());
         }
         $this->assertSame('READ-ONLY CONTENT', file_get_contents($destination));
 
-        Security::encryptFileV2($src, self::KEY, $destination, null, '0644');
-        $this->assertSame('NEW', file_get_contents(Security::decryptFileV2($destination, self::KEY, $this->path('ro.dec'))));
+        Security::encryptFile($src, self::KEY, $destination, null, '0644');
+        $this->assertSame('NEW', file_get_contents(Security::decryptFile($destination, self::KEY, $this->path('ro.dec'))));
     }
 
     /**
-     * The staging file holds plaintext while decryptFileV2 writes it. Permissions are checked at
+     * The staging file holds plaintext while decryptFile writes it. Permissions are checked at
      * open time, so it must be owner-only from the moment it exists — not narrowed afterwards.
      */
     public function testTheStagingFileIsCreatedOwnerOnly(): void
@@ -1577,11 +1754,11 @@ final class SecurityFileEncryptionTest extends TestCase
         }
 
         $src = $this->write('src', 'SECRET');
-        $enc = Security::encryptFileV2($src, self::KEY, $this->path('file.enc'));
+        $enc = Security::encryptFile($src, self::KEY, $this->path('file.enc'));
         $destination = $this->write('private.dec', 'old');
         chmod($destination, 0600);
 
-        Security::decryptFileV2($enc, self::KEY, $destination);
+        Security::decryptFile($enc, self::KEY, $destination);
         clearstatcache();
 
         $this->assertSame(0600, fileperms($destination) & 0777);
@@ -1593,7 +1770,7 @@ final class SecurityFileEncryptionTest extends TestCase
     // ---------------------------------------------------------------------------------------
 
     /**
-     * The source becomes unreadable after encryptFileV2 has started. The old code had already
+     * The source becomes unreadable after encryptFile has started. The old code had already
      * truncated the destination by then; now a pre-existing destination survives and no staging
      * file is left. A byte-range lock (mandatory on Windows) makes every read fail.
      */
@@ -1609,7 +1786,7 @@ final class SecurityFileEncryptionTest extends TestCase
         $this->assertTrue(flock($lock, LOCK_EX), 'Premise: the source can be locked.');
 
         try {
-            Security::encryptFileV2($src, self::KEY, $destination);
+            Security::encryptFile($src, self::KEY, $destination);
             $this->fail('An unreadable source must fail the encryption.');
         } catch (\Exception $e) {
             $this->assertStringContainsString('Error on reading plaintext', $e->getMessage());
@@ -1635,7 +1812,7 @@ final class SecurityFileEncryptionTest extends TestCase
         $this->assertTrue(flock($lock, LOCK_EX), 'Premise: the source can be locked.');
 
         try {
-            Security::decryptFileV2($enc, self::KEY, $destination);
+            Security::decryptFile($enc, self::KEY, $destination);
             $this->fail('An unreadable source must fail the decryption.');
         } catch (\Exception $e) {
             $this->assertStringContainsString('Error on reading', $e->getMessage());

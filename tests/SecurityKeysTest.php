@@ -480,14 +480,14 @@ final class SecurityKeysTest extends TestCase
         file_put_contents("{$dir}/plain", $content);
         Security::setFileEncryptBlocksBytes(4);
         try {
-            Security::encryptFileV2("{$dir}/plain", self::KEY_K, "{$dir}/old.enc");
-            Security::encryptFileV2("{$dir}/plain", self::rotated(), "{$dir}/new.enc");
+            Security::encryptFile("{$dir}/plain", self::KEY_K, "{$dir}/old.enc");
+            Security::encryptFile("{$dir}/plain", self::rotated(), "{$dir}/new.enc");
         } finally {
             Security::setFileEncryptBlocksBytes(null);
         }
 
-        Security::decryptFileV2("{$dir}/old.enc", self::rotated(), "{$dir}/old.dec");
-        Security::decryptFileV2("{$dir}/new.enc", self::KEY_Z, "{$dir}/new.dec");
+        Security::decryptFile("{$dir}/old.enc", self::rotated(), "{$dir}/old.dec");
+        Security::decryptFile("{$dir}/new.enc", self::KEY_Z, "{$dir}/new.dec");
 
         $this->assertSame($content, file_get_contents("{$dir}/old.dec"));
         $this->assertSame($content, file_get_contents("{$dir}/new.dec"));
@@ -505,13 +505,13 @@ final class SecurityKeysTest extends TestCase
     {
         $dir = $this->tempDir();
         file_put_contents("{$dir}/plain", 'secret file');
-        Security::encryptFileV2("{$dir}/plain", self::KEY_K, "{$dir}/file.enc");
+        Security::encryptFile("{$dir}/plain", self::KEY_K, "{$dir}/file.enc");
 
         try {
-            Security::decryptFileV2("{$dir}/file.enc", new Keyring(self::KEY_Z, self::KEY_Q), "{$dir}/file.dec");
+            Security::decryptFile("{$dir}/file.enc", new Keyring(self::KEY_Z, self::KEY_Q), "{$dir}/file.dec");
             $this->fail('A file under a key the keyring does not hold must be rejected.');
         } catch (\Exception $e) {
-            $this->assertStringContainsString('failed authentication under every key', $e->getMessage());
+            $this->assertStringContainsString('No key with id ' . self::KEY_K_ID, $e->getMessage());
         }
 
         $this->assertSame(['file.enc', 'plain'], array_values(array_diff(scandir($dir), ['.', '..'])));

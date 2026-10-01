@@ -141,9 +141,9 @@ Security::encryptDataDB(null, $keys, $aad);                        // null
 // Deterministic blind index, to search an encrypted column
 $hash = Security::generateSearchHash('529.982.247-25', $keys);     // 64 hex chars
 
-// Files: streamed block by block and authenticated end to end
-Security::encryptFileV2('/data/report.pdf', $keys, '/data/report.pdf.enc');
-Security::decryptFileV2('/data/report.pdf.enc', $keys, '/tmp/report.pdf');
+// Files: streamed block by block, a key of their own, authenticated end to end
+Security::encryptFile('/data/report.pdf', $keys, '/data/report.pdf.enc');
+Security::decryptFile('/data/report.pdf.enc', $keys, '/tmp/report.pdf');
 
 // Passwords (Argon2id)
 $stored = Security::encryptPassword($password);
