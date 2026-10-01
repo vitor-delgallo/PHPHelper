@@ -27,7 +27,10 @@ final class SecurityFileEncryptionTest extends TestCase
     private const OTHER_KEY = 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz';
 
     private const DEFAULT_BLOCK_BYTES = 3200000;
-    private const DEFAULT_MAX_ENCODED_BLOCK_BYTES = 268435456;
+    private const DEFAULT_MAX_ENCODED_BLOCK_BYTES = 16777216; // 16 MiB
+
+    /** The largest plaintext block the default limit allows: 3*floor(16777216/4) - 16. */
+    private const LARGEST_DEFAULT_BLOCK_BYTES = 12582896;
 
     /** Security::keyId(KEY): the v3 header names the key by it. */
     private const KEY_ID = '0735d1be7e009715';
@@ -346,7 +349,13 @@ final class SecurityFileEncryptionTest extends TestCase
     // get/setFileMaxEncodedBlockBytes
     // ---------------------------------------------------------------------------------------
 
-    public function testMaxEncodedBlockBytesDefaultsTo256MiB(): void
+    /**
+     * 16 MiB, not the 256 MiB it used to be: decryptFile holds about 1.75x one encoded block while
+     * reading it, so a 256 MiB block needed ~450 MB — a ~48 MB hostile upload killed a worker
+     * under the stock 128M memory_limit with an uncatchable fatal (see
+     * testAHostileBlockAtTheLimitFailsCleanlyUnderAModestMemoryLimit).
+     */
+    public function testMaxEncodedBlockBytesDefaultsTo16MiB(): void
     {
         $this->assertSame(self::DEFAULT_MAX_ENCODED_BLOCK_BYTES, Security::getFileMaxEncodedBlockBytes());
     }
@@ -697,7 +706,7 @@ final class SecurityFileEncryptionTest extends TestCase
 
     public static function saltProvider(): array
     {
-        $binary = "a\x00-1-\xFF\x00";
+        $binary = "a\x01-1-\xFF\x7F";
 
         return [
             'null'            => [null, '?'],
@@ -705,10 +714,38 @@ final class SecurityFileEncryptionTest extends TestCase
             'question mark'   => ['?', '?'],
             'zero'            => ['0', '0'],
             'dashes & digits' => ['12-34-', '12-34-'],
-            'binary with NUL' => [$binary, $binary],
+            'binary'          => [$binary, $binary],
             'unicode'         => ['sal ✓ 塩', 'sal ✓ 塩'],
-            '1000 bytes'      => [str_repeat('s', 1000), str_repeat('s', 1000)],
+            '64 bytes (max)'  => [str_repeat('s', 64), str_repeat('s', 64)],
         ];
+    }
+
+    /**
+     * HKDF-Extract is HMAC with the salt as its key, and HMAC pads a short key with NUL bytes and
+     * hashes a long one: "s" and "s\0" (and S and SHA-256(S) for S over 64 bytes) derive the SAME
+     * file key, so a header could be rewritten in dozens of equivalent ways. Such salts are refused
+     * on both sides — before anything is created on encrypt, and from the header on decrypt — so a
+     * header names exactly one key.
+     */
+    public function testASaltWithANulByteOrOver64BytesIsRefusedOnBothSides(): void
+    {
+        $src = $this->write('src', 'payload');
+        foreach (["salt\0", "\0", "a\0b", str_repeat('s', 65)] as $salt) {
+            try {
+                Security::encryptFile($src, self::KEY, $this->path('out.enc'), $salt);
+                $this->fail('A salt with a NUL byte or over 64 bytes must be refused: ' . bin2hex($salt));
+            } catch (\InvalidArgumentException $e) {
+                $this->assertStringContainsString('Invalid salt', $e->getMessage());
+            }
+        }
+        $this->assertSame(['src'], $this->dirEntries(), 'nothing may be created for a refused salt');
+
+        // A file whose header salt was rewritten to an equivalent spelling is refused, not read.
+        $blocks = self::decodeBlocks($this->smallEncryptedFile('s', null, 'salt'));
+        $blocks[3] = "salt\0";
+        $this->assertDecryptRejects(self::encodeBlocks($blocks), 'salt with a trailing NUL', 'Invalid salt');
+        $blocks[3] = str_repeat('s', 65);
+        $this->assertDecryptRejects(self::encodeBlocks($blocks), '65-byte salt', 'Invalid salt');
     }
 
     public function testFilesWrittenByTheIndependentFormatReferenceDecrypt(): void
@@ -832,7 +869,8 @@ final class SecurityFileEncryptionTest extends TestCase
 
         $this->assertSame(self::KEY_ID, Security::fileKeyId($underKey));
         $this->assertSame(self::referenceKeyId(self::OTHER_KEY), Security::fileKeyId($underOther));
-        foreach (['a v2 file' => [$legacy, 'only file format v3 is supported'],
+        foreach (['a v2 file' => [$legacy, "only file format v3 is supported, 'v2' found"],
+                  'a v1 file' => [$this->write('v1', self::encodeBlocks(['aes-128-cbc', 'v1', '?', str_repeat("\x01", 16)])), "only file format v3 is supported, 'v1' found"],
                   'not an encrypted file' => [$this->write('junk', self::encodeBlocks(['not a cipher'])), 'Cipher type does not match']] as $label => [$path, $message]) {
             try {
                 Security::fileKeyId($path);
@@ -841,6 +879,39 @@ final class SecurityFileEncryptionTest extends TestCase
                 $this->assertStringContainsString($message, $e->getMessage(), $label);
             }
         }
+    }
+
+    /**
+     * fileKeyId() returns "16 hex characters" — a forged header must not turn that into an
+     * arbitrary string handed to a rotation script. The validation could be removed without any
+     * test noticing before this one.
+     */
+    #[DataProvider('malformedKeyIdHeaderProvider')]
+    public function testFileKeyIdRefusesAMalformedHeader(string $bytes, string $message): void
+    {
+        $path = $this->write('bad.enc', $bytes);
+
+        try {
+            Security::fileKeyId($path);
+            $this->fail('A malformed header must be refused.');
+        } catch (\Exception $e) {
+            $this->assertStringContainsString($message, $e->getMessage());
+        }
+    }
+
+    public static function malformedKeyIdHeaderProvider(): array
+    {
+        $header = ['aes-256-gcm', 'v3'];
+
+        return [
+            'not hex'                  => [self::encodeBlocks([...$header, 'ZZZZZZZZZZZZZZZZ']), 'malformed key id'],
+            '15 hex'                   => [self::encodeBlocks([...$header, substr(self::KEY_ID, 0, 15)]), 'malformed key id'],
+            '17 hex'                   => [self::encodeBlocks([...$header, self::KEY_ID . 'a']), 'malformed key id'],
+            'uppercase'                => [self::encodeBlocks([...$header, strtoupper(self::KEY_ID)]), 'malformed key id'],
+            'cut after the version'    => [self::encodeBlocks($header), 'the file ends before it'],
+            'cut inside the key id'    => [substr(self::encodeBlocks([...$header, self::KEY_ID]), 0, -5), 'truncated'],
+            'empty file'               => ['', 'truncated'],
+        ];
     }
 
     /** The v2 file the former encryptFileV2 wrote is refused under its own key, leaving nothing behind. */
@@ -981,21 +1052,21 @@ final class SecurityFileEncryptionTest extends TestCase
     }
 
     /**
-     * The exact threshold under the DEFAULT limit: 3*floor(268435456/4) - 16 = 201.326.576 bytes
+     * The exact threshold under the DEFAULT limit: 3*floor(16777216/4) - 16 = 12.582.896 bytes
      * (the block is written with its 16-byte tag). One byte more and the file could never be
-     * decrypted. Refused before a single byte is read, so this costs no 200 MB allocation.
+     * decrypted. Refused before a single byte is read, so this costs no 12 MB allocation.
      */
     public function testTheDefaultLimitRefusesABlockSizeOneByteAboveTheDecryptableThreshold(): void
     {
-        Security::setFileEncryptBlocksBytes(201326577);
+        Security::setFileEncryptBlocksBytes(self::LARGEST_DEFAULT_BLOCK_BYTES + 1);
         $src = $this->write('src', 'tiny');
 
         try {
             Security::encryptFile($src, self::KEY, $this->path('out.enc'));
-            $this->fail('A block size above 201326576 bytes must be refused under the default limit.');
+            $this->fail('A block size above ' . self::LARGEST_DEFAULT_BLOCK_BYTES . ' bytes must be refused under the default limit.');
         } catch (\Exception $e) {
-            $this->assertStringContainsString('at most 201326576 bytes', $e->getMessage());
-            $this->assertStringContainsString('268435460-byte base64 block', $e->getMessage());
+            $this->assertStringContainsString('at most ' . self::LARGEST_DEFAULT_BLOCK_BYTES . ' bytes', $e->getMessage());
+            $this->assertStringContainsString((self::DEFAULT_MAX_ENCODED_BLOCK_BYTES + 4) . '-byte base64 block', $e->getMessage());
         }
 
         $this->assertSame(['src'], $this->dirEntries());
@@ -1003,12 +1074,12 @@ final class SecurityFileEncryptionTest extends TestCase
 
     /**
      * ...and exactly AT the threshold it is accepted. Reads are capped at what is left of the
-     * file (fread() allocates its full length up front), so a 192 MiB block size costs nothing on
+     * file (fread() allocates its full length up front), so a 12 MiB block size costs nothing on
      * a small file — it used to allocate the whole block for every file.
      */
     public function testTheDefaultLimitAcceptsTheLargestDecryptableBlockSizeWithoutAllocatingIt(): void
     {
-        Security::setFileEncryptBlocksBytes(201326576);
+        Security::setFileEncryptBlocksBytes(self::LARGEST_DEFAULT_BLOCK_BYTES);
 
         memory_reset_peak_usage();
         $baseline = memory_get_usage();
@@ -1028,20 +1099,20 @@ final class SecurityFileEncryptionTest extends TestCase
         Security::encryptFile($src, self::KEY, $this->path('out.enc'));
     }
 
-    /** The salt is a header block, so it is bound by the same limit. */
+    /** The salt is a header block, so it is bound by the same limit (within the 64-byte salt cap). */
     public function testAnOversizedSaltIsRefusedAtEncryptTime(): void
     {
         Security::setFileEncryptBlocksBytes(30);
-        Security::setFileMaxEncodedBlockBytes(400);
+        Security::setFileMaxEncodedBlockBytes(84);
 
-        $this->assertRoundTrip(self::bytes(100), str_repeat('s', 300)); // 400 encoded: fits exactly
+        $this->assertRoundTrip(self::bytes(100), str_repeat('s', 63)); // 84 encoded: fits exactly
         $before = $this->dirEntries();
 
         try {
-            Security::encryptFile($this->path('rt.src'), self::KEY, $this->path('salt.enc'), str_repeat('s', 301));
+            Security::encryptFile($this->path('rt.src'), self::KEY, $this->path('salt.enc'), str_repeat('s', 64)); // 88 encoded
             $this->fail('A salt whose header block exceeds the limit must be refused.');
         } catch (\Exception $e) {
-            $this->assertStringContainsString('301-byte salt', $e->getMessage());
+            $this->assertStringContainsString('64-byte salt', $e->getMessage());
             $this->assertStringContainsString('setFileMaxEncodedBlockBytes', $e->getMessage());
         }
 
@@ -1103,7 +1174,7 @@ final class SecurityFileEncryptionTest extends TestCase
     public static function hostileLengthProvider(): array
     {
         return [
-            'limit + 1'             => ['268435457-'],
+            'limit + 1'             => ['16777217-'],
             '12 digits'             => ['999999999999-'],
             'beyond PHP_INT_MAX'    => ['99999999999999999999999999-'],
         ];
@@ -1111,14 +1182,14 @@ final class SecurityFileEncryptionTest extends TestCase
 
     /**
      * A length WITHIN the limit but longer than the file: fread() would allocate the whole
-     * declared size (here 256 MiB) before discovering the file is 14 bytes long.
+     * declared size (here 16 MiB) before discovering the file is 13 bytes long.
      */
     public function testALengthWithinTheLimitButBeyondTheFileCostsNoAllocation(): void
     {
         memory_reset_peak_usage();
         $baseline = memory_get_usage();
 
-        $this->assertDecryptRejects('268435456-QUJD', 'exactly the limit', 'truncated');
+        $this->assertDecryptRejects('16777216-QUJD', 'exactly the limit', 'truncated');
 
         $this->assertLessThan(1024 * 1024, memory_get_peak_usage() - $baseline);
     }
@@ -1412,8 +1483,10 @@ final class SecurityFileEncryptionTest extends TestCase
             'v3: malformed file id'        => [self::encodeBlocks(['aes-256-gcm', 'v3', self::KEY_ID, '?', 'short']), 'malformed file id'],
             'v3: block shorter than a tag' => [self::encodeBlocks(['aes-256-gcm', 'v3', self::KEY_ID, '?', $fileId, str_repeat('t', 16)]), 'shorter than ciphertext plus tag'],
             'v3: header only'              => [self::encodeBlocks(['aes-256-gcm', 'v3', self::KEY_ID, '?', $fileId]), 'truncated'],
-            'v2 (no longer read)'          => [self::encodeBlocks(['aes-256-gcm', 'v2', '?', $fileId]), 'only file format v3 is supported'],
-            'v1 (no longer read)'          => [self::encodeBlocks(['aes-256-gcm', 'v1', '?', $fileId]), 'only file format v3 is supported'],
+            'v2 (no longer read)'          => [self::encodeBlocks(['aes-256-gcm', 'v2', '?', $fileId]), "only file format v3 is supported, 'v2' found"],
+            // The removed encryptFileV1 wrote "aes-128-cbc" as its FIRST block: that is what a real v1 file looks like.
+            'v1 (no longer read)'          => [self::encodeBlocks(['aes-128-cbc', 'v1', '?', str_repeat("\x01", 16)]), "only file format v3 is supported, 'v1' found"],
+            'unknown version tag'          => [self::encodeBlocks(['aes-256-gcm', 'what?', self::KEY_ID, '?', $fileId]), 'only file format v3 is supported, (not a version tag) found'],
             'length never ends'            => [str_repeat('1', 5), 'truncated'],
         ];
     }
@@ -1734,9 +1807,13 @@ final class SecurityFileEncryptionTest extends TestCase
             Security::encryptFile($src, self::KEY, $destination);
             $this->fail('A read-only destination must not be replaced without a mode.');
         } catch (\Exception $e) {
-            $this->assertStringContainsString('read-only', $e->getMessage());
+            // The GUARD's message, not commitStagingFile's generic "(read-only, open in another
+            // process, ...)": on Windows the rename over a read-only file fails too, and that
+            // message also contains "read-only" — but only after the whole file was encrypted.
+            $this->assertStringContainsString('only replaced when a $permissionMode is given', $e->getMessage());
         }
         $this->assertSame('READ-ONLY CONTENT', file_get_contents($destination));
+        $this->assertSame(['ro.enc', 'src'], $this->dirEntries(), 'the refusal must come before any staging file is written');
 
         Security::encryptFile($src, self::KEY, $destination, null, '0644');
         $this->assertSame('NEW', file_get_contents(Security::decryptFile($destination, self::KEY, $this->path('ro.dec'))));
@@ -1892,6 +1969,232 @@ final class SecurityFileEncryptionTest extends TestCase
         } finally {
             stream_wrapper_unregister($protocol);
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Refusals create nothing; append mode and links; limits under a real memory_limit
+    // ---------------------------------------------------------------------------------------
+
+    /**
+     * A refused file — an earlier format, a key the keyring does not hold, not an encrypted file
+     * at all — must not leave a freshly created destination directory behind: the destination is
+     * resolved (and its missing directory created) only once the header has been read and its key
+     * resolved. The old order created the directory first.
+     */
+    public function testARefusedFileCreatesNoDestinationDirectory(): void
+    {
+        $v2 = $this->write('legacy.enc', base64_decode(self::LEGACY_FILE_B64));
+        $junk = $this->write('junk.enc', 'not an encrypted file');
+        $good = Security::encryptFile($this->write('src', 'x'), self::KEY, $this->path('good.enc'));
+
+        foreach ([
+            'v2 file'      => [$v2, self::LEGACY_KEY, 'only file format v3 is supported'],
+            'junk'         => [$junk, self::KEY, 'malformed block length'],
+            'unknown key'  => [$good, new Keyring(self::OTHER_KEY), 'No key with id ' . self::KEY_ID],
+        ] as $label => [$source, $key, $message]) {
+            $directory = $this->path("new-{$label}");
+            try {
+                Security::decryptFile($source, $key, $directory . DIRECTORY_SEPARATOR . 'sub' . DIRECTORY_SEPARATOR . 'out.dec');
+                $this->fail("{$label} must be refused.");
+            } catch (\Exception $e) {
+                $this->assertStringContainsString($message, $e->getMessage(), $label);
+            }
+            clearstatcache();
+            $this->assertDirectoryDoesNotExist($directory, "{$label}: the destination directory was created for a refused file");
+        }
+
+        // Control: an accepted file does get its directory created.
+        Security::decryptFile($good, self::KEY, $this->path('made') . DIRECTORY_SEPARATOR . 'out.dec');
+        $this->assertSame('x', file_get_contents($this->path('made') . DIRECTORY_SEPARATOR . 'out.dec'));
+    }
+
+    /**
+     * Append mode writes INTO the destination (the one step that is not a rename), and fopen('ab')
+     * follows symlinks: the plaintext would be appended to — and a $permissionMode applied to —
+     * whatever a link planted at the destination points at. A link is refused; the target is
+     * untouched. ("w" mode replaces the link with a regular file, as documented.)
+     */
+    public function testAppendModeRefusesASymlinkDestinationAndLeavesItsTargetAlone(): void
+    {
+        $target = $this->write('elsewhere.txt', "original\n");
+        $link = $this->path('outbox.txt');
+        if (!@symlink($target, $link)) {
+            $this->markTestSkipped('Cannot create a symlink here (Windows without the privilege).');
+        }
+        $enc = Security::encryptFile($this->write('src', 'APPENDED'), self::KEY, $this->path('part.enc'));
+        $before = $this->dirEntries();
+
+        try {
+            Security::decryptFile($enc, self::KEY, $link, '0600', 'a');
+            $this->fail('Append mode must refuse a symlink destination.');
+        } catch (\Exception $e) {
+            $this->assertStringContainsString('symbolic link', $e->getMessage());
+        }
+
+        clearstatcache();
+        $this->assertSame("original\n", file_get_contents($target), 'the link target must not be written through');
+        $this->assertTrue(is_link($link), 'the link itself must be left in place');
+        $this->assertSame($before, $this->dirEntries(), 'no staging file may be left behind');
+        if (DIRECTORY_SEPARATOR !== '\\') {
+            $this->assertNotSame(0600, fileperms($target) & 0777, 'the mode must not be applied to the link target');
+        }
+
+        // "w" mode: the link is replaced by a regular file, the target still untouched.
+        Security::decryptFile($enc, self::KEY, $link);
+        clearstatcache();
+        $this->assertFalse(is_link($link));
+        $this->assertSame('APPENDED', file_get_contents($link));
+        $this->assertSame("original\n", file_get_contents($target));
+    }
+
+    /**
+     * The limit is also a MEMORY promise: a block that declares (and holds) exactly the limit must
+     * be refused with a catchable exception under a modest memory_limit, never with a memory
+     * fatal — which no catch sees and which leaves the staging file behind. Under the old 256 MiB
+     * default a ~48 MB hostile upload killed the worker. Run in a child process so the limit is
+     * real.
+     */
+    #[Group('slow')]
+    public function testAHostileBlockAtTheLimitFailsCleanlyUnderAModestMemoryLimit(): void
+    {
+        $limit = Security::getFileMaxEncodedBlockBytes();
+        $rawBytes = intdiv($limit, 4) * 3; // encodes to exactly $limit bytes, no padding
+
+        // A valid v3 header under KEY, then one block of random "ciphertext" at the limit.
+        $header = self::encodeBlocks(['aes-256-gcm', 'v3', self::KEY_ID, '?', bin2hex(random_bytes(16))]);
+        $hostile = $this->path('hostile.enc');
+        $fp = fopen($hostile, 'wb');
+        fwrite($fp, $header . $limit . '-');
+        for ($written = 0; $written < $rawBytes; $written += 3 * 65536) {
+            fwrite($fp, base64_encode(random_bytes(min(3 * 65536, $rawBytes - $written))));
+        }
+        fclose($fp);
+        $this->assertSame(strlen($header) + strlen((string) $limit) + 1 + $limit, filesize($hostile), 'premise: the block is exactly at the limit');
+
+        $destination = $this->path('hostile.dec');
+        $output = $this->runChildPhp(
+            '$e = null; try { \VD\PHPHelper\Security::decryptFile($argv[1], $argv[2], $argv[3]); echo "DECRYPTED"; } '
+            . 'catch (\Exception $e) { echo "EXCEPTION: ", $e->getMessage(); } echo "\nPEAK=", memory_get_peak_usage(true);',
+            [$hostile, self::KEY, $destination],
+            ['-d', 'memory_limit=64M']
+        );
+
+        $this->assertStringContainsString('EXCEPTION: ', $output, "The child must fail with an exception, not a fatal:\n{$output}");
+        $this->assertStringContainsString('failed authentication', $output);
+        $this->assertFileDoesNotExist($destination);
+        $this->assertSame(['hostile.enc'], $this->dirEntries(), 'no staging file may be left behind');
+        $this->assertMatchesRegularExpression('/PEAK=(\d+)/', $output);
+        preg_match('/PEAK=(\d+)/', $output, $m);
+        $this->assertLessThan(64 * 1024 * 1024, (int) $m[1]);
+    }
+
+    /**
+     * The append-mode rollback: when the VERIFIED plaintext cannot be appended in full (disk
+     * full), the destination is truncated back to its previous length, so earlier parts survive.
+     * The one way to make a write come up short deterministically is a file-size limit on a child
+     * process (ulimit -f, with SIGXFSZ ignored so write() returns EFBIG instead of killing it).
+     */
+    public function testAppendRollsBackWhenTheAppendItselfComesUpShort(): void
+    {
+        if (DIRECTORY_SEPARATOR === '\\' || !is_executable('/bin/bash')) {
+            $this->markTestSkipped('Needs bash and ulimit -f (POSIX).');
+        }
+
+        $existing = str_repeat('E', 40 * 1024);
+        $destination = $this->write('assembled.bin', $existing);
+        $enc = Security::encryptFile($this->write('part.src', str_repeat('P', 40 * 1024)), self::KEY, $this->path('part.enc'));
+
+        // 64 KiB cap: the 40 KiB staging file fits, appending 40 KiB to a 40 KiB file does not.
+        $script = $this->path('child.php');
+        file_put_contents($script, '<?php require ' . var_export(self::autoloadPath(), true) . '; '
+            . 'try { \VD\PHPHelper\Security::decryptFile($argv[1], $argv[2], $argv[3], null, "a"); echo "APPENDED"; } '
+            . 'catch (\Exception $e) { echo "EXCEPTION: ", $e->getMessage(); }');
+        $command = 'trap "" XFSZ; ulimit -f 64; exec ' . escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg($script) . ' '
+            . escapeshellarg($enc) . ' ' . escapeshellarg(self::KEY) . ' ' . escapeshellarg($destination);
+        $output = shell_exec('/bin/bash -c ' . escapeshellarg($command) . ' 2>&1');
+
+        $this->assertIsString($output);
+        $this->assertStringContainsString('EXCEPTION: ', $output, "Appending past the file-size limit must fail:\n{$output}");
+        $this->assertStringContainsString('truncated back to its previous length', $output);
+        clearstatcache();
+        $this->assertSame($existing, file_get_contents($destination), 'the destination must be exactly what it was');
+        $this->assertSame(['assembled.bin', 'child.php', 'part.enc', 'part.src'], $this->dirEntries(), 'no staging file may be left behind');
+    }
+
+    /**
+     * A source that SHRINKS while it is being read looks like a plain end of file to fread():
+     * without the size check, encryptFile wrote a valid, authenticated ciphertext of a truncated
+     * file and reported success. A child encrypts one byte per block (slow enough to be caught
+     * mid-read) while this process truncates the source.
+     */
+    public function testEncryptFailsLoudlyWhenTheSourceShrinksWhileItIsRead(): void
+    {
+        $size = 3000000;
+        $src = $this->write('shrinking.src', self::bytes($size));
+        $destination = $this->path('shrinking.enc');
+
+        $script = $this->path('child.php');
+        file_put_contents($script, '<?php require ' . var_export(self::autoloadPath(), true) . '; '
+            . 'echo "READY\n"; flush(); \VD\PHPHelper\Security::setFileEncryptBlocksBytes(1); '
+            . 'try { \VD\PHPHelper\Security::encryptFile($argv[1], $argv[2], $argv[3]); echo "DONE"; } '
+            . 'catch (\Exception $e) { echo "EXCEPTION: ", $e->getMessage(); }');
+        $process = proc_open(
+            [PHP_BINARY, $script, $src, self::KEY, $destination],
+            [1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+            $pipes
+        );
+        $this->assertIsResource($process);
+
+        $this->assertSame("READY\n", fgets($pipes[1]), 'premise: the child started');
+        usleep(300000); // the child is now inside encryptFile, reading one byte per block
+        $fp = fopen($src, 'r+b');
+        ftruncate($fp, 1000);
+        fclose($fp);
+
+        $output = stream_get_contents($pipes[1]) . stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        proc_close($process);
+
+        if (str_contains($output, 'DONE')) {
+            $this->markTestSkipped('The child finished before the source was truncated (inconclusive on this machine).');
+        }
+        $this->assertStringContainsString('EXCEPTION: Error on reading plaintext: only ', $output, $output);
+        $this->assertStringContainsString("of {$size} bytes could be read", $output);
+        $this->assertFileDoesNotExist($destination);
+        $this->assertSame(['child.php', 'shrinking.src'], $this->dirEntries(), 'no staging file may be left behind');
+    }
+
+    private static function autoloadPath(): string
+    {
+        return dirname(__DIR__) . DIRECTORY_SEPARATOR . 'vendor' . DIRECTORY_SEPARATOR . 'autoload.php';
+    }
+
+    /**
+     * Runs $code in a fresh PHP process with the autoloader loaded and $arguments in $argv[1..];
+     * returns stdout + stderr.
+     *
+     * @param string[] $arguments
+     * @param string[] $phpOptions e.g. ['-d', 'memory_limit=64M']
+     */
+    private function runChildPhp(string $code, array $arguments, array $phpOptions = []): string
+    {
+        $script = $this->path('child.php');
+        file_put_contents($script, '<?php require ' . var_export(self::autoloadPath(), true) . '; ' . $code);
+
+        $process = proc_open(
+            [PHP_BINARY, ...$phpOptions, $script, ...$arguments],
+            [1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+            $pipes
+        );
+        $this->assertIsResource($process);
+        $output = stream_get_contents($pipes[1]) . stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        proc_close($process);
+        unlink($script);
+
+        return $output;
     }
 }
 

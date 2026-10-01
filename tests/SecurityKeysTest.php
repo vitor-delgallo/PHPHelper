@@ -31,6 +31,23 @@ final class SecurityKeysTest extends TestCase
     private const DB_VECTOR = 'v2:0735d1be7e009715:yvLVrjddGSJ/mRG0pOI/8Y/BZe6Fb5LH+c35Z3GHkhU6LIsLLNAR+Qzy';
     private const LOCAL_VECTOR = 'l1:0735d1be7e009715:yXX+Ph3jV4ftStnVjqn0uD+/PR0IZrOpWc03HpdRUnBDOnAHJf9/LoeGEuKmGvRutolon3ydntB8aFfzcDvh';
 
+    /**
+     * Blind indexes written by this version for KEY_K: [value, salt, hash]. A blind index is a
+     * persisted format too (it sits in an indexed column): a change to its derivation would still
+     * match itself while every stored index stopped matching — and a UNIQUE constraint on it
+     * stopped catching duplicates.
+     */
+    private const SEARCH_HASH_VECTORS = [
+        ['a@b.com', '', '251da3efcc5812e2043cdeb87f557a1f466d5f282af62e54564aebf943ecdafc'],
+        ['a@b.com', 'tenant-1', '8e0365080d46fa91ba29117a189bfb33003d08ec63a4e1756c8fbf7fddbe1919'],
+        [1, '', '05da9182eb9a68144a31fbaffcb3c22146c67a1040624efdf07c4370e400a600'],
+        ['Ação ü', 's', '303896f44c72b244279f60e5e71287588f43b290a380abd2ec6a7122eebf72ea'],
+    ];
+
+    /** A key whose id is made of decimal digits only (about one key in 2.000 is): PHP int-ifies it as an array key. */
+    private const DIGIT_ID_KEY_B64 = 'CnZENWy1Xi/6+Yr5aNJtZWnVn85NSaoPsAyFIM734t4=';
+    private const DIGIT_ID = '6629894354780748';
+
     private ?string $dir = null;
 
     protected function tearDown(): void
@@ -114,6 +131,91 @@ final class SecurityKeysTest extends TestCase
         $this->expectException(\InvalidArgumentException::class);
         $this->expectExceptionMessage('at least 32 bytes');
         Security::keyId(str_repeat('k', 31));
+    }
+
+    /** "Every method that takes $key accepts a Keyring" includes keyId(): the id of its current key. */
+    public function testKeyIdAcceptsAKeyringAndReturnsTheIdOfItsCurrentKey(): void
+    {
+        $this->assertSame(Security::keyId(self::KEY_Z), Security::keyId(self::rotated()));
+        $this->assertSame(self::rotated()->currentId(), Security::keyId(self::rotated()));
+    }
+
+    /**
+     * An all-digit key id is a valid id. PHP turns it into an int when it is an ARRAY KEY, so
+     * ids() and currentId() normalize to strings (a strict in_array() of the current id in ids()
+     * used to be false for such a key); the keys of all() and generateSearchHashes() stay ints, as
+     * documented, and compare as (string). The derivation itself must not change: it is a format.
+     */
+    public function testAnAllDigitKeyIdIsAStringInIdsAndCurrentIdAndRoundTrips(): void
+    {
+        $key = Security::keyFromBase64(self::DIGIT_ID_KEY_B64);
+        $this->assertSame(self::DIGIT_ID, Security::keyId($key), 'premise: an all-digit id');
+
+        $ring = new Keyring($key, self::KEY_K);
+        $this->assertSame(self::DIGIT_ID, $ring->currentId());
+        $this->assertSame([self::DIGIT_ID, self::KEY_K_ID], $ring->ids());
+        $this->assertTrue(in_array($ring->currentId(), $ring->ids(), true));
+        $this->assertSame($key, $ring->get(self::DIGIT_ID));
+        $this->assertSame([self::DIGIT_ID, self::KEY_K_ID], array_map('strval', array_keys($ring->all())));
+        $this->assertSame([self::DIGIT_ID, self::KEY_K_ID], array_map('strval', array_keys(Security::generateSearchHashes('a@b.com', $ring))));
+
+        $aad = Security::dbContext('t', 'c', 1);
+        $envelope = Security::encryptDataDB('x', $ring, $aad);
+        $this->assertStringStartsWith('v2:' . self::DIGIT_ID . ':', $envelope);
+        $this->assertSame('x', Security::decryptDataDB($envelope, $ring, $aad));
+        $this->assertSame('y', Security::decryptLocal(Security::encryptLocal('y', $ring), new Keyring(self::KEY_K, $key)));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Salts
+    // ---------------------------------------------------------------------------------------
+
+    /**
+     * HKDF-Extract is HMAC keyed with the salt; HMAC NUL-pads a short key and hashes a long one,
+     * so "s" and "s\0" — and S and SHA-256(S) past 64 bytes — would derive the SAME key. Every
+     * derivation refuses such salts, so a salt names exactly one key; 64 bytes is the maximum.
+     */
+    #[DataProvider('invalidSaltProvider')]
+    public function testASaltWithANulByteOrOver64BytesIsRefusedByEveryDerivation(string $salt): void
+    {
+        $aad = Security::dbContext('t', 'c', 1);
+        $calls = [
+            'encryptDataDB'        => fn () => Security::encryptDataDB('x', self::KEY_K, $aad, $salt),
+            'decryptDataDB'        => fn () => Security::decryptDataDB(self::DB_VECTOR, self::KEY_K, $aad, $salt),
+            'encryptLocal'         => fn () => Security::encryptLocal('x', self::KEY_K, $salt),
+            'decryptLocal'         => fn () => Security::decryptLocal(self::LOCAL_VECTOR, self::KEY_K, $salt),
+            'encryptCrossPlatform' => fn () => Security::encryptCrossPlatform('x', self::KEY_K, $salt),
+            'generateSearchHash'   => fn () => Security::generateSearchHash('x', self::KEY_K, $salt),
+            'generateSearchHashes' => fn () => Security::generateSearchHashes('x', self::rotated(), $salt),
+        ];
+        foreach ($calls as $method => $call) {
+            try {
+                $call();
+                $this->fail("{$method} must refuse the salt " . bin2hex($salt));
+            } catch (\InvalidArgumentException $e) {
+                $this->assertStringContainsString('Invalid salt', $e->getMessage(), $method);
+            }
+        }
+    }
+
+    public static function invalidSaltProvider(): array
+    {
+        return [
+            'trailing NUL'   => ["salt\0"],
+            'only a NUL'     => ["\0"],
+            'NUL inside'     => ["sa\0lt"],
+            '65 bytes'       => [str_repeat('s', 65)],
+        ];
+    }
+
+    public function testA64ByteSaltIsTheLongestAccepted(): void
+    {
+        $salt = str_repeat('s', 64);
+        $aad = Security::dbContext('t', 'c', 1);
+
+        $this->assertSame('x', Security::decryptDataDB(Security::encryptDataDB('x', self::KEY_K, $aad, $salt), self::KEY_K, $aad, $salt));
+        $this->assertSame('x', Security::decryptLocal(Security::encryptLocal('x', self::KEY_K, $salt), self::KEY_K, $salt));
+        $this->assertSame(64, strlen(Security::generateSearchHash('x', self::KEY_K, $salt)));
     }
 
     // ---------------------------------------------------------------------------------------
@@ -209,6 +311,84 @@ final class SecurityKeysTest extends TestCase
             $this->assertStringNotContainsString(substr(self::KEY_K, 0, 10), $trace);
             $this->assertStringNotContainsString(substr($plaintext, 0, 10), $trace);
         }
+
+        // The attribute is per FRAME: an exception thrown inside a private helper (here the
+        // refusal of an array, in scalarToString) carried the plaintext in that helper's frame
+        // while the public method's frame showed SensitiveParameterValue.
+        try {
+            Security::encryptLocal(['cpf' => $plaintext, 'senha' => 'hunter2-SECRET'], self::KEY_K, 'visible-salt');
+            $this->fail('An array must be refused.');
+        } catch (\InvalidArgumentException $e) {
+            $trace = $e->getTraceAsString() . print_r($e->getTrace(), true);
+
+            $this->assertStringContainsString('visible-salt', $trace, 'control');
+            $this->assertStringNotContainsString('hunter2-SECRET', $trace);
+            $this->assertStringNotContainsString(substr($plaintext, 0, 10), $trace);
+            $this->assertStringNotContainsString(substr(self::KEY_K, 0, 10), $trace);
+        }
+    }
+
+    /**
+     * Every parameter that carries a key or a plaintext — in the public methods AND in the private
+     * helpers they pass it to — is marked #[\SensitiveParameter]. A helper without it is the frame
+     * where a disk-full or a type refusal is thrown, with the secret in its arguments.
+     */
+    #[DataProvider('sensitiveParameterProvider')]
+    public function testEveryKeyAndPlaintextParameterIsMarkedSensitive(string $class, string $method, array $parameters): void
+    {
+        $reflection = new \ReflectionMethod($class, $method);
+        $found = [];
+        foreach ($reflection->getParameters() as $parameter) {
+            $found[$parameter->getName()] = $parameter->getAttributes(\SensitiveParameter::class) !== [];
+        }
+
+        foreach ($parameters as $name) {
+            $this->assertArrayHasKey($name, $found, "{$class}::{$method}() has no parameter \${$name}");
+            $this->assertTrue($found[$name], "{$class}::{$method}(\${$name}) must be #[\\SensitiveParameter]");
+        }
+    }
+
+    public static function sensitiveParameterProvider(): array
+    {
+        $cases = [
+            [Security::class, 'encryptDataDB', ['str', 'key']],
+            [Security::class, 'decryptDataDB', ['key']],
+            [Security::class, 'reencryptDataDB', ['key']],
+            [Security::class, 'encryptLocal', ['str', 'key']],
+            [Security::class, 'decryptLocal', ['key']],
+            [Security::class, 'encryptCrossPlatform', ['var', 'key']],
+            [Security::class, 'decryptCrossPlatform', ['key']],
+            [Security::class, 'generateSearchHash', ['str', 'key']],
+            [Security::class, 'generateSearchHashes', ['str', 'key']],
+            [Security::class, 'encryptFile', ['key']],
+            [Security::class, 'decryptFile', ['key']],
+            [Security::class, 'applySecurityFunctionArray', ['item', 'key']],
+            [Security::class, 'keyId', ['key']],
+            [Security::class, 'keyFromBase64', ['encoded']],
+            [Security::class, 'encryptPassword', ['password']],
+            [Security::class, 'verifyPassword', ['password']],
+            [Security::class, 'scalarToString', ['value']],
+            [Security::class, 'writeAll', ['data']],
+            [Security::class, 'writeLengthEncodedBlock', ['raw']],
+            [Security::class, 'writeFileV3Block', ['key', 'plaintext']],
+            [Security::class, 'openEnvelope', ['keys']],
+            [Security::class, 'fileV3BodyDecryptor', ['keys']],
+            [Security::class, 'deriveKey', ['key']],
+            [Security::class, 'assertKeyLength', ['key']],
+            [Security::class, 'keyring', ['key']],
+            [Security::class, 'searchHashUnder', ['str', 'key']],
+            [Security::class, 'localKeys', ['masterKey']],
+            [Security::class, 'aesBridgeGcmDecrypt', ['passphrases']],
+            [Keyring::class, '__construct', ['current', 'previous']],
+            [Keyring::class, 'fromBase64', ['current', 'previous']],
+        ];
+
+        $provider = [];
+        foreach ($cases as [$class, $method, $parameters]) {
+            $provider[(new \ReflectionClass($class))->getShortName() . "::{$method}"] = [$class, $method, $parameters];
+        }
+
+        return $provider;
     }
 
     // ---------------------------------------------------------------------------------------
@@ -233,7 +413,7 @@ final class SecurityKeysTest extends TestCase
     }
 
     #[DataProvider('invalidContextProvider')]
-    public function testDbContextRejectsInvalidParts(string $table, string $column, string|int $rowId, ?int $version): void
+    public function testDbContextRejectsInvalidParts(string $table, string $column, string|int|float|bool $rowId, ?int $version): void
     {
         $this->expectException(\InvalidArgumentException::class);
         Security::dbContext($table, $column, $rowId, $version);
@@ -247,7 +427,23 @@ final class SecurityKeysTest extends TestCase
             'empty row id'     => ['t', 'c', '', null],
             'negative version' => ['t', 'c', 1, -1],
             'invalid UTF-8'    => ["t\xC3", 'c', 1, null],
+            // A float used to be COERCED to int (1.5 -> row "1", with only a deprecation), so two
+            // rows shared one context and a ciphertext moved between them still decrypted.
+            'float row id'     => ['t', 'c', 1.5, null],
+            'whole float id'   => ['t', 'c', 2.0, null],
+            'bool row id'      => ['t', 'c', true, null],
         ];
+    }
+
+    /** The row id is part of the context: a float must not be silently rounded onto another row. */
+    public function testDbContextRefusesAFloatRowIdInsteadOfTruncatingIt(): void
+    {
+        try {
+            Security::dbContext('t', 'c', 1.5);
+            $this->fail('A float row id must be refused.');
+        } catch (\InvalidArgumentException $e) {
+            $this->assertStringContainsString('float given', $e->getMessage());
+        }
     }
 
     // ---------------------------------------------------------------------------------------
@@ -291,6 +487,25 @@ final class SecurityKeysTest extends TestCase
 
         $this->assertSame('1000.00', Security::decryptDataDB($v8, self::KEY_K, Security::dbContext('wallets', 'balance', 42, 8)));
         $this->assertNotSame($v7, $v8);
+    }
+
+    /**
+     * The salt goes through reencryptDataDB on BOTH sides. Dropping it on the encrypt side would
+     * migrate every salted row to salt "" — and every later read with the tenant's salt would
+     * throw, with the original envelope already overwritten.
+     */
+    public function testReencryptDataDbKeepsTheSaltOnBothSides(): void
+    {
+        $old = Security::encryptDataDB('salted', self::KEY_K, Security::dbContext('t', 'c', 1), 'tenant-1');
+
+        $migrated = Security::reencryptDataDB($old, self::rotated(), Security::dbContext('t', 'c', 1), Security::dbContext('t', 'c', 1, 2), 'tenant-1');
+
+        $this->assertStringStartsWith('v2:' . Security::keyId(self::KEY_Z) . ':', $migrated);
+        $this->assertSame('salted', Security::decryptDataDB($migrated, self::KEY_Z, Security::dbContext('t', 'c', 1, 2), 'tenant-1'));
+
+        $this->expectException(\Exception::class);
+        $this->expectExceptionMessage('authentication tag mismatch');
+        Security::decryptDataDB($migrated, self::KEY_Z, Security::dbContext('t', 'c', 1, 2), '');
     }
 
     // ---------------------------------------------------------------------------------------
@@ -349,7 +564,11 @@ final class SecurityKeysTest extends TestCase
         Security::decryptDataDB($old, new Keyring(self::KEY_Z, self::KEY_Q), $aad);
     }
 
-    /** The key id is authenticated: pointing an envelope at another key of the ring fails. */
+    /**
+     * Pointing an envelope at another key of the ring fails. (That the failure comes from the key
+     * switch as much as from the AAD — the key id IS in the AAD, "v2|{id}|{aad}" — is what
+     * testTheDbEnvelopeFollowsItsDocumentedFormat and the fixed vector pin.)
+     */
     public function testRewritingTheKeyIdOfAnEnvelopeIsDetected(): void
     {
         $aad = Security::dbContext('t', 'c', 1);
@@ -371,12 +590,96 @@ final class SecurityKeysTest extends TestCase
     public static function malformedEnvelopeProvider(): array
     {
         return [
-            'v1 envelope (no key id)'   => ['v1:' . base64_encode(str_repeat('a', 40)), 'Unsupported envelope version'],
+            'v1 envelope (no key id)'   => ['v1:' . base64_encode(str_repeat('a', 40)), "Unsupported envelope version 'v1'"],
             'no key id'                 => ['v2:' . base64_encode(str_repeat('a', 40)), 'invalid key id'],
             'uppercase key id'          => ['v2:' . strtoupper(self::KEY_K_ID) . ':AAAA', 'invalid key id'],
             'short key id'              => ['v2:0735d1be:AAAA', 'invalid key id'],
             'no separator at all'       => [base64_encode(str_repeat('a', 40)), 'missing version prefix'],
+            'not a version tag'         => ['mysecret:rest', 'Unsupported envelope version (not a version tag)'],
         ];
+    }
+
+    /**
+     * A value that was never encrypted ("secret:1" — a column decrypted by mistake during a
+     * migration) must not have its first bytes copied into the exception message, hence into logs.
+     * Only a version-shaped prefix ("v1") is echoed.
+     */
+    public function testAnUnencryptedValueIsNotEchoedInTheEnvelopeError(): void
+    {
+        foreach (['decryptDataDB' => fn ($v) => Security::decryptDataDB($v, self::KEY_K, Security::dbContext('t', 'c', 1)),
+                  'decryptLocal' => fn ($v) => Security::decryptLocal($v, self::KEY_K)] as $method => $call) {
+            try {
+                $call('mysecret:rest');
+                $this->fail("{$method} must refuse a non-envelope.");
+            } catch (\Exception $e) {
+                $this->assertStringNotContainsString('mysecret', $e->getMessage(), $method);
+                $this->assertStringContainsString('(not a version tag)', $e->getMessage(), $method);
+            }
+        }
+    }
+
+    /**
+     * PHP's strict base64_decode() still skips whitespace, accepts missing padding and ignores
+     * non-zero bits under the padding, so several strings decoded to the same ciphertext and
+     * decrypted. The envelope is CANONICAL now: an attacker with write access cannot rewrite a
+     * value into an equivalent spelling that an equality check on the stored text would miss.
+     */
+    #[DataProvider('nonCanonicalEnvelopeProvider')]
+    public function testANonCanonicalBase64EnvelopeIsRejected(string $method, string $variant): void
+    {
+        $aad = Security::dbContext('t', 'c', 1);
+        $envelope = ($method === 'db' ? Security::encryptDataDB('x', self::KEY_K, $aad) : Security::encryptLocal('x', self::KEY_K));
+        [$version, $keyId, $payload] = explode(':', $envelope, 3);
+
+        $mutated = self::nonCanonicalVariant($payload, $variant);
+        if ($mutated === null) {
+            $this->markTestSkipped("The payload has no padding, so '{$variant}' does not apply.");
+        }
+        $this->assertSame(base64_decode($payload, true), base64_decode($mutated, true), 'premise: PHP decodes the variant to the same bytes');
+        $this->assertNotSame($payload, $mutated);
+
+        try {
+            $method === 'db'
+                ? Security::decryptDataDB("{$version}:{$keyId}:{$mutated}", self::KEY_K, $aad)
+                : Security::decryptLocal("{$version}:{$keyId}:{$mutated}", self::KEY_K);
+            $this->fail("A non-canonical envelope must be rejected ({$variant}).");
+        } catch (\Exception $e) {
+            $this->assertStringContainsStringIgnoringCase('invalid base64', $e->getMessage());
+        }
+    }
+
+    public static function nonCanonicalEnvelopeProvider(): array
+    {
+        $cases = [];
+        foreach (['db', 'local'] as $method) {
+            foreach (['newline inside', 'trailing CRLF', 'padding stripped', 'non-zero padding bits'] as $variant) {
+                $cases["{$method}: {$variant}"] = [$method, $variant];
+            }
+        }
+
+        return $cases;
+    }
+
+    /** A base64 string that PHP's strict decoder reads as the same bytes as $payload, or null when $variant cannot be built. */
+    private static function nonCanonicalVariant(string $payload, string $variant): ?string
+    {
+        $alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+        $padding = strlen($payload) - strlen(rtrim($payload, '='));
+
+        return match ($variant) {
+            'newline inside' => substr_replace($payload, "\n", 10, 0),
+            'trailing CRLF' => $payload . "\r\n",
+            'padding stripped' => $padding === 0 ? null : rtrim($payload, '='),
+            'non-zero padding bits' => (function () use ($payload, $padding, $alphabet): ?string {
+                if ($padding === 0) {
+                    return null;
+                }
+                $position = strlen($payload) - $padding - 1;
+                $index = strpos($alphabet, $payload[$position]);
+
+                return substr_replace($payload, $alphabet[$index | 1], $position, 1);
+            })(),
+        };
     }
 
     /** The rotation migration: re-encrypt what is still under the old key, until nothing is. */
@@ -426,7 +729,11 @@ final class SecurityKeysTest extends TestCase
         $this->assertSame('local after', Security::decryptLocal($new, self::rotated()));
     }
 
-    /** The HMAC covers the prefix: re-pointing the key id is a MAC failure, not a silent key switch. */
+    /**
+     * Re-pointing the key id is a MAC failure, not a silent key switch. (The MAC would fail here
+     * from the key switch alone; that the prefix is COVERED by the MAC is pinned by
+     * testTheLocalEnvelopeFollowsItsDocumentedFormat.)
+     */
     public function testRewritingTheKeyIdOfALocalEnvelopeIsDetected(): void
     {
         [, , $payload] = explode(':', Security::encryptLocal('x', self::KEY_K), 3);
@@ -434,6 +741,32 @@ final class SecurityKeysTest extends TestCase
         $this->expectException(\Exception::class);
         $this->expectExceptionMessage('MAC does not match');
         Security::decryptLocal('l1:' . Security::keyId(self::KEY_Z) . ':' . $payload, self::rotated());
+    }
+
+    /**
+     * Independent check of the documented local format: "l1:{key id}:" + base64(mac || iv || ct),
+     * HMAC-SHA256 over prefix || iv || ct under HKDF(master, salt, "local") -> "local-authentication",
+     * AES-256-CTR under -> "local-encryption". Pinned with nothing but hash_hkdf/hash_hmac/openssl,
+     * so the prefix binding cannot quietly disappear (the fixed vector alone would still pass a
+     * regenerated vector).
+     */
+    public function testTheLocalEnvelopeFollowsItsDocumentedFormat(): void
+    {
+        $envelope = Security::encryptLocal('documented', self::KEY_K, 'salt-1');
+        [$version, $keyId, $payload] = explode(':', $envelope, 3);
+        $this->assertSame(['l1', self::KEY_K_ID], [$version, $keyId]);
+
+        $raw = base64_decode($payload, true);
+        $key = hash_hkdf('sha256', self::KEY_K, 32, 'local', 'salt-1');
+        $encryptionKey = hash_hkdf('sha256', $key, 32, 'local-encryption');
+        $authenticationKey = hash_hkdf('sha256', $key, 32, 'local-authentication');
+        $mac = substr($raw, 0, 32);
+        $iv = substr($raw, 32, 16);
+        $ciphertext = substr($raw, 48);
+
+        $this->assertTrue(hash_equals(hash_hmac('sha256', "{$version}:{$keyId}:" . $iv . $ciphertext, $authenticationKey, true), $mac), 'HMAC over prefix || iv || ct');
+        $this->assertFalse(hash_equals(hash_hmac('sha256', $iv . $ciphertext, $authenticationKey, true), $mac), 'the prefix IS covered');
+        $this->assertSame('documented', openssl_decrypt($ciphertext, 'aes-256-ctr', $encryptionKey, OPENSSL_RAW_DATA, $iv));
     }
 
     public function testALocalValueUnderAMissingKeyNamesItsKeyId(): void
@@ -524,6 +857,25 @@ final class SecurityKeysTest extends TestCase
     public function testGenerateSearchHashUsesTheCurrentKey(): void
     {
         $this->assertSame(Security::generateSearchHash('a@b.com', self::KEY_Z), Security::generateSearchHash('a@b.com', self::rotated()));
+    }
+
+    /**
+     * The blind index is a persisted format: pinned by fixed vectors AND by its documented
+     * derivation, HMAC-SHA256(value, HKDF-SHA256(master, salt, "search-hash")). Every other test of
+     * it compared generateSearchHash() with itself, so a changed label or salt placement passed.
+     */
+    public function testTheBlindIndexMatchesItsFixedVectorsAndDocumentedDerivation(): void
+    {
+        foreach (self::SEARCH_HASH_VECTORS as [$value, $salt, $expected]) {
+            $label = json_encode([$value, $salt]);
+            $this->assertSame($expected, Security::generateSearchHash($value, self::KEY_K, $salt), "vector {$label}");
+            $this->assertSame(
+                hash_hmac('sha256', (string) $value, hash_hkdf('sha256', self::KEY_K, 32, 'search-hash', $salt)),
+                Security::generateSearchHash($value, self::KEY_K, $salt),
+                "derivation {$label}"
+            );
+        }
+        $this->assertSame(self::SEARCH_HASH_VECTORS[0][2], Security::generateSearchHashes('a@b.com', self::rotated())[self::KEY_K_ID]);
     }
 
     /** During a rotation, WHERE hash IN (...) must find rows hashed under either key. */

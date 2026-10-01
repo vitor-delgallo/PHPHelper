@@ -15,9 +15,31 @@ class Security {
      * Default for the largest length-encoded block of an encrypted file, measured as it sits on
      * disk (base64). See setFileMaxEncodedBlockBytes().
      *
+     * 16 MiB: decryptFile holds about 1.75x one encoded block in memory while it reads it, so this
+     * default keeps a hostile (or merely large-block) file within a 128M memory_limit. It used to
+     * be 256 MiB, which let a ~48 MB upload kill a worker with an uncatchable memory fatal.
+     *
      * @var int
      */
-    private const DEFAULT_FILE_MAX_ENCODED_BLOCK_BYTES = 268435456; // 256 MiB
+    private const DEFAULT_FILE_MAX_ENCODED_BLOCK_BYTES = 16777216; // 16 MiB
+
+    /**
+     * Longest salt deriveKey() accepts, in bytes: the SHA-256 block size. HKDF-Extract uses the
+     * salt as an HMAC key, and HMAC pads a shorter key with NUL bytes to the block size and hashes
+     * a longer one — so "salt" and "salt\0" (and S and SHA-256(S) for a long S) would derive the
+     * SAME key. Refusing NUL bytes and over-long salts keeps every salt a distinct key.
+     *
+     * @var int
+     */
+    private const MAX_SALT_BYTES = 64;
+
+    /**
+     * Cipher the removed encryptFileV1 wrote as the first header block. Recognized only to name
+     * the format in the "unsupported file format" error.
+     *
+     * @var string
+     */
+    private const FILE_V1_CIPHER = 'aes-128-cbc';
 
     /**
      * Plaintext bytes read per data block by encryptFile. 0 = not set (the default applies).
@@ -155,13 +177,16 @@ class Security {
      * @throws \Exception On a malformed envelope, an unsupported version or an unknown key id
      * @return array{0: string, 1: string, 2: string} [key id, raw master key, payload]
      */
-    private static function openEnvelope(string $envelope, string $version, Keyring $keys): array {
+    private static function openEnvelope(string $envelope, string $version, #[\SensitiveParameter] Keyring $keys): array {
         $parts = explode(":", $envelope, 3);
         if (count($parts) < 2) {
             throw new \Exception("Malformed envelope: missing version prefix.");
         }
         if ($parts[0] !== $version) {
-            throw new \Exception("Unsupported envelope version '" . substr($parts[0], 0, 8) . "' (expected '{$version}').");
+            // Only a version-shaped prefix is echoed: a value that was never encrypted ("secret:1")
+            // would otherwise have its first bytes copied into the exception message, hence logs.
+            $found = (preg_match('/\A[a-z][0-9]\z/', $parts[0]) === 1 ? "'{$parts[0]}'" : "(not a version tag)");
+            throw new \Exception("Unsupported envelope version {$found} (expected '{$version}').");
         }
         if (count($parts) !== 3 || !preg_match('/\A[0-9a-f]{' . (2 * self::KEY_ID_BYTES) . '}\z/', $parts[1])) {
             throw new \Exception("Malformed envelope: missing or invalid key id.");
@@ -184,14 +209,18 @@ class Security {
      *
      * @param string $key Base key to derive from
      * @param int $length Desired length of the derived key in bytes
-     * @param string|null $salt Optional salt value to add randomness to the derived key
+     * @param string|null $salt Optional salt value to add randomness to the derived key. At most
+     *                          MAX_SALT_BYTES bytes and no NUL byte: HMAC (HKDF-Extract) would make
+     *                          "s", "s\0" and "s\0\0" the same salt, and hash a longer one.
      * @param string $info Domain label: keys derived for different purposes never coincide
      *
+     * @throws \InvalidArgumentException For a short key, or a salt with a NUL byte or over 64 bytes
      * @throws \Exception
      * @return string
      */
     private static function deriveKey(#[\SensitiveParameter] string $key, int $length, ?string $salt = "", string $info = 'derived-key'): string {
         self::assertKeyLength($key);
+        self::assertSalt($salt);
 
         return hash_hkdf(
             'sha256',
@@ -200,6 +229,30 @@ class Security {
             $info,
             ($salt ?? "")
         );
+    }
+
+    /**
+     * Refuses a salt that would not be a distinct HKDF salt: one with a NUL byte (HMAC pads a
+     * short key with NULs, so "s" and "s\0" derive the same key) or longer than 64 bytes (hashed
+     * to 32 by HMAC, so S and SHA-256(S) derive the same key). Every derivation — DB cells, local
+     * values, blind indexes, cross-platform passphrases and file keys (whose salt is read from the
+     * file header) — goes through this, so a salt names exactly one key everywhere.
+     *
+     * @param string|null $salt Salt as given to a public method (NULL is "")
+     *
+     * @throws \InvalidArgumentException
+     * @return void
+     */
+    private static function assertSalt(?string $salt): void {
+        if ($salt === null) {
+            return;
+        }
+        if (strlen($salt) > self::MAX_SALT_BYTES) {
+            throw new \InvalidArgumentException("Invalid salt: at most " . self::MAX_SALT_BYTES . " bytes (" . strlen($salt) . " given).");
+        }
+        if (str_contains($salt, "\0")) {
+            throw new \InvalidArgumentException("Invalid salt: it must not contain a NUL byte.");
+        }
     }
 
     /**
@@ -216,7 +269,7 @@ class Security {
      * @throws \InvalidArgumentException For an array, a non-Stringable object or a resource
      * @return string
      */
-    private static function scalarToString(mixed $value, string $method): string {
+    private static function scalarToString(#[\SensitiveParameter] mixed $value, string $method): string {
         if (is_string($value)) {
             return $value;
         }
@@ -275,7 +328,7 @@ class Security {
      *
      * A v3 data block is the ciphertext AND its 16-byte tag, so its encoded size is
      * 4*ceil((blockBytes + 16) / 3), and the largest block size a limit L allows is
-     * 3*floor(L/4) - 16 — 201.326.576 bytes under the default limit.
+     * 3*floor(L/4) - 16 — 12.582.896 bytes under the default limit.
      *
      * @param int $blockBytes Plaintext bytes per data block
      * @param string $salt Salt as it will be written to the header
@@ -396,8 +449,27 @@ class Security {
             throw new \Exception("Error on reading {$what}: the file ends inside a block (truncated).");
         }
 
+        // Canonical base64, checked WITHOUT re-encoding the whole block (a second block-sized copy
+        // that raised the peak memory of a read): the alphabet, the length, the padding and the
+        // final bits are checked separately. PHP's strict base64_decode() alone would still skip
+        // whitespace and ignore non-zero padding bits.
+        $padding = $length - strlen(rtrim($data, "="));
+        if (
+            $length % 4 !== 0
+            || $padding > 2
+            || strspn($data, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/") !== $length - $padding
+        ) {
+            throw new \Exception("Error on reading {$what}: the block is not canonical base64.");
+        }
+
         $decoded = base64_decode($data, true);
-        if ($decoded === false || $decoded === "" || base64_encode($decoded) !== $data) {
+        if ($decoded === false || $decoded === "") {
+            throw new \Exception("Error on reading {$what}: the block is not canonical base64.");
+        }
+
+        // Non-zero bits under the padding decode to the same bytes: re-encode only the last quantum.
+        $tail = strlen($decoded) % 3;
+        if (base64_encode(substr($decoded, -($tail === 0 ? 3 : $tail))) !== substr($data, -4)) {
             throw new \Exception("Error on reading {$what}: the block is not canonical base64.");
         }
 
@@ -452,7 +524,7 @@ class Security {
      * @throws \Exception When the block did not reach the stream in full
      * @return void
      */
-    private static function writeLengthEncodedBlock($fp, string $raw, string $what): void {
+    private static function writeLengthEncodedBlock($fp, #[\SensitiveParameter] string $raw, string $what): void {
         $encoded = base64_encode($raw);
 
         // Two writes rather than one concatenation: no third copy of a multi-megabyte block.
@@ -475,7 +547,7 @@ class Security {
      * @throws \Exception
      * @return void
      */
-    private static function writeAll($fp, string $data, string $what): void {
+    private static function writeAll($fp, #[\SensitiveParameter] string $data, string $what): void {
         $length = strlen($data);
         $written = @fwrite($fp, $data);
         if ($written === false || $written !== $length) {
@@ -526,7 +598,7 @@ class Security {
      * @throws \Exception
      * @return void
      */
-    private static function writeFileV3Block($fp, #[\SensitiveParameter] string $key, string $fileId, string $kind, int $index, string $plaintext): void {
+    private static function writeFileV3Block($fp, #[\SensitiveParameter] string $key, string $fileId, string $kind, int $index, #[\SensitiveParameter] string $plaintext): void {
         $tag = "";
         $ciphertext = openssl_encrypt(
             $plaintext,
@@ -883,6 +955,13 @@ class Security {
      * once every block has been verified. If it comes up short, the destination is truncated back
      * to the length it had, so parts appended by earlier calls survive.
      *
+     * A destination that is a SYMLINK is refused. Append is the one step that writes into the
+     * destination instead of renaming over it, and fopen('ab') follows links: the verified
+     * plaintext would be appended to — and $mode applied to — whatever the link points at. ("w"
+     * mode replaces a link with a regular file.) After the open, the file actually opened is
+     * compared (device + inode) with the directory entry, so a link planted in between is caught
+     * too.
+     *
      * @param string $stagingPath Finished staging file
      * @param string $destination Resolved destination path
      * @param int|null $mode Parsed permission mode
@@ -895,6 +974,13 @@ class Security {
         if (!is_file($destination)) {
             self::commitStagingFile($stagingPath, $destination, $mode);
             return;
+        }
+
+        if (is_link($destination)) {
+            throw new \Exception(
+                "The destination is a symbolic link: append mode writes into the destination file itself and never through "
+                . "a link. Replace the link, or decrypt in \"w\" mode."
+            );
         }
 
         if ($mode !== null) {
@@ -913,7 +999,21 @@ class Security {
             throw new \Exception("Error while writing to the destination file.");
         }
 
-        $entryLength = (int) (fstat($fpDestination)['size'] ?? 0);
+        // The file opened must be the directory entry checked above. Skipped when the platform
+        // reports no inode (0) rather than guessing.
+        clearstatcache(true, $destination);
+        $entryStat = @lstat($destination);
+        $openStat = @fstat($fpDestination);
+        if (
+            $entryStat === false || $openStat === false || !empty($entryStat['ino']) && !empty($openStat['ino'])
+            && ($entryStat['ino'] !== $openStat['ino'] || $entryStat['dev'] !== $openStat['dev'])
+        ) {
+            @fclose($fpStaging);
+            @fclose($fpDestination);
+            throw new \Exception("Error while writing to the destination file: it changed while it was being opened.");
+        }
+
+        $entryLength = (int) ($openStat['size'] ?? 0);
         $expected = (int) (fstat($fpStaging)['size'] ?? -1);
         $copied = @stream_copy_to_stream($fpStaging, $fpDestination);
         $complete = ($copied === $expected && @fflush($fpDestination));
@@ -959,7 +1059,7 @@ class Security {
      * base64), so this is also what bounds its memory use. The block size is not recorded in the
      * file: decryptFile needs no setting to match it — except that every block, ciphertext plus its
      * 16-byte tag, must fit getFileMaxEncodedBlockBytes() (4*ceil((size+16)/3) <= limit, i.e. at
-     * most 201.326.576 bytes under the default limit). That is checked when encryptFile runs, not
+     * most 12.582.896 bytes under the default limit). That is checked when encryptFile runs, not
      * here, so the two setters can be called in either order.
      *
      * Any size is safe for the cipher: v3 files number their blocks under a key of their own, so a
@@ -995,7 +1095,7 @@ class Security {
      * file may contain — see setFileMaxEncodedBlockBytes().
      *
      * When no value is set (initial state, or after setFileMaxEncodedBlockBytes(null)), the default
-     * of 268.435.456 (256 MiB) is installed and returned.
+     * of 16.777.216 (16 MiB) is installed and returned.
      *
      * @return int Always >= 44
      */
@@ -1012,13 +1112,17 @@ class Security {
      * Sets the largest length-encoded block (bytes, base64 as written on disk) an encrypted file
      * may contain. It is enforced on BOTH sides:
      *  - decryptFile refuses a block that declares more, BEFORE allocating anything, so a corrupt
-     *    or hostile file cannot force a huge allocation ahead of authentication. It is therefore
-     *    also the largest single read decryptFile makes: keep it within memory_limit.
+     *    or hostile file cannot force a huge allocation ahead of authentication. While it reads a
+     *    block that IS within the limit it holds about 1.75x the encoded size (the encoded bytes,
+     *    the decoded ciphertext and the plaintext of one block): a file with a block at the limit
+     *    needs memory_limit above ~1.75 x limit, or the process dies with a memory fatal that no
+     *    catch can see (and the staging file stays behind). The default, 16 MiB, fits a 128M
+     *    memory_limit; raise the limit only together with memory_limit.
      *  - encryptFile refuses, before touching the destination, a configuration that could write
      *    a larger block: a plaintext block size (setFileEncryptBlocksBytes) whose block — the
      *    ciphertext plus its 16-byte tag, base64-encoded, 4*ceil((n+16)/3) bytes — or a salt whose
      *    base64 form exceeds it. The largest plaintext block a limit L allows is
-     *    3*floor(L/4) - 16 bytes — 201.326.576 under the default.
+     *    3*floor(L/4) - 16 bytes — 12.582.896 under the default.
      *
      * CROSS-PROCESS: the limit is not recorded in the file. A file written under a raised limit
      * must be decrypted under a limit at least as large; decryptFile's error names the size it
@@ -1031,7 +1135,7 @@ class Security {
      *                                       file id). Below that no file — not even an empty one —
      *                                       could be written or read, so such a value is rejected
      *                                       here rather than failing on every call. NULL resets to
-     *                                       the default.
+     *                                       the default of 16 MiB.
      *
      * @throws \InvalidArgumentException When a non-null value below the minimum is given. The value
      *                                   in effect is kept.
@@ -1095,12 +1199,19 @@ class Security {
      * The id of a master key: 16 hex characters derived from the key with HKDF (info "key-id").
      * It is written into every DB and local envelope, and it reveals nothing about the key.
      *
-     * @param string $key Raw master key (>= 32 bytes)
+     * An id can be all decimal digits (about one key in 2.000): then PHP turns it into an INT when
+     * it is used as an array key — in Keyring::all() and generateSearchHashes() — so compare ids
+     * as strings ((string) $id === $other), never with === on array keys.
+     *
+     * @param string|Keyring $key Raw master key (>= 32 bytes), or a keyring (the id of its current key)
      *
      * @throws \InvalidArgumentException For a key shorter than 32 bytes
      * @return string 16 lowercase hex characters
      */
-    public static function keyId(#[\SensitiveParameter] string $key): string {
+    public static function keyId(#[\SensitiveParameter] string|Keyring $key): string {
+        if ($key instanceof Keyring) {
+            return $key->currentId();
+        }
         self::assertKeyLength($key);
 
         return bin2hex(hash_hkdf('sha256', $key, self::KEY_ID_BYTES, 'key-id'));
@@ -1124,13 +1235,24 @@ class Security {
      *
      * @param string $table Table name (non-empty)
      * @param string $column Column name (non-empty)
-     * @param string|int $rowId Primary key of the row (non-empty)
+     * @param string|int $rowId Primary key of the row (non-empty). A string or an int ONLY: a
+     *                          float is refused rather than coerced (1.5 would silently become
+     *                          row "1", and two rows would share one context), and so is a bool.
      * @param int|null $version Version of the value (>= 0), or null for a value that is not versioned
      *
-     * @throws \InvalidArgumentException For an empty name or id, a negative version, or invalid UTF-8
+     * @throws \InvalidArgumentException For an empty name or id, a float or bool id, a negative
+     *                                   version, or invalid UTF-8
      * @return string The AAD to pass to encryptDataDB/decryptDataDB (a JSON array)
      */
-    public static function dbContext(string $table, string $column, string|int $rowId, ?int $version = null): string {
+    public static function dbContext(string $table, string $column, string|int|float|bool $rowId, ?int $version = null): string {
+        // float|bool are in the signature only so that PHP hands them over unchanged (in coercive
+        // mode a float passed to string|int becomes an int, with just a deprecation) — and they
+        // are refused here.
+        if (!is_string($rowId) && !is_int($rowId)) {
+            throw new \InvalidArgumentException(
+                "dbContext(): row id must be a string or an int; " . get_debug_type($rowId) . " given (it would be coerced, and two rows could share one context)."
+            );
+        }
         $rowId = (string) $rowId;
         if ($table === '' || $column === '' || $rowId === '') {
             throw new \InvalidArgumentException("dbContext(): table, column and row id must be non-empty.");
@@ -1192,7 +1314,8 @@ class Security {
      * @param string|null $salt Salt, as for generateSearchHash()
      *
      * @throws \InvalidArgumentException As generateSearchHash()
-     * @return array<string, string> Key id => hash; [] for null/""
+     * @return array<int|string, string> Key id => hash; [] for null/"". An all-digit id is an INT
+     *                                   key (PHP's array semantics): compare with (string) $id.
      */
     public static function generateSearchHashes(#[\SensitiveParameter] mixed $str, #[\SensitiveParameter] string|Keyring $key, ?string $salt = ""): array {
         $hashes = [];
@@ -1277,7 +1400,8 @@ class Security {
      *                            A missing directory is created with File::getDefaultMode().
      * @param string|null $salt Optional salt for key derivation. It is stored in the file header —
      *                          decryptFile needs no salt argument — so it separates keys, it is not
-     *                          a secret. NULL and "" are stored as "?".
+     *                          a secret. NULL and "" are stored as "?". At most 64 bytes and no NUL
+     *                          byte (see deriveKey()), so the header names exactly one key.
      * @param string|null $permissionMode Octal mode for the destination file (e.g. "0600"). The
      *                                    output is written owner-only and given this mode once it
      *                                    is complete, just before it replaces the destination. NULL:
@@ -1287,6 +1411,8 @@ class Security {
      *                                    never used for the directory.
      *
      * @return string Returns the resolved path of the encrypted file
+     * @throws \InvalidArgumentException For a short key, a malformed $permissionMode, or a salt
+     *                                   with a NUL byte or over 64 bytes
      * @throws \Exception If $destination is the same file as $source, on an over-limit block or
      *                    salt, or if encryption or file handling fails. An \Error raised midway is
      *                    rethrown wrapped in an \Exception, after the cleanup.
@@ -1462,15 +1588,15 @@ class Security {
             throw new \Exception("Invalid \$outReadMode '{$outReadMode}': expected 'w'/'wb' (truncate) or 'a'/'ab' (append).");
         }
 
-        // Everything that needs no file is validated before the destination directory can be
-        // created by getRealDestination().
+        // Everything that needs no file is validated first; the destination (whose missing
+        // directory getRealDestination() creates) is only resolved once the source has been read
+        // far enough to know it is a v3 file under a key the keyring holds. A refused file — not
+        // encrypted at all, an earlier format, an unknown key — therefore creates nothing, not
+        // even an empty directory.
         $mode = self::parseFileMode($permissionMode);
         $keys = self::keyring($key);
 
         $source = self::getRealSource($source);
-        $destination = self::getRealDestination($destination);
-        self::assertDestinationIsNotSource($source, $destination);
-        self::assertDestinationReplaceable($destination, $mode);
 
         $fpIn = @fopen($source, 'rb');
         if ($fpIn === false) {
@@ -1480,22 +1606,15 @@ class Security {
         $stagingPath = null;
         $fpOut = false;
         try {
-            $fCipher = self::readRequiredLengthEncodedBlock($fpIn, "cipher type");
-            if ($fCipher !== self::FILE_CIPHER) {
-                throw new \Exception("Cipher type does not match with the one used in function");
-            }
-
-            $fVersion = self::readRequiredLengthEncodedBlock($fpIn, "cipher version");
-            if ($fVersion !== self::FILE_VERSION) {
-                throw new \Exception(
-                    "Cipher version does not match with the one used in function: only file format v3 is supported "
-                    . "(files written by the removed encryptFileV2 are v2 and can no longer be decrypted)."
-                );
-            }
+            self::assertFileHeaderIsV3($fpIn);
 
             // The rest of the header is validated in full, and the key resolved, before anything is
             // created next to the destination.
             $decryptBody = self::fileV3BodyDecryptor($fpIn, $keys);
+
+            $destination = self::getRealDestination($destination);
+            self::assertDestinationIsNotSource($source, $destination);
+            self::assertDestinationReplaceable($destination, $mode);
 
             [$stagingPath, $fpOut] = self::openStagingFile($destination);
             $decryptBody($fpOut);
@@ -1558,13 +1677,7 @@ class Security {
         }
 
         try {
-            if (self::readRequiredLengthEncodedBlock($fp, "cipher type") !== self::FILE_CIPHER) {
-                throw new \Exception("Cipher type does not match with the one used in function");
-            }
-
-            if (self::readRequiredLengthEncodedBlock($fp, "cipher version") !== self::FILE_VERSION) {
-                throw new \Exception("Cipher version does not match with the one used in function: only file format v3 is supported.");
-            }
+            self::assertFileHeaderIsV3($fp);
 
             $keyId = self::readRequiredLengthEncodedBlock($fp, "key id");
             if (!preg_match('/\A[0-9a-f]{' . (2 * self::KEY_ID_BYTES) . '}\z/', $keyId)) {
@@ -1578,6 +1691,48 @@ class Security {
     }
 
     /**
+     * Reads the cipher and version blocks and refuses anything but a v3 file. The earlier formats
+     * are named: a v1 file (the removed encryptFileV1) is recognized by its cipher block,
+     * "aes-128-cbc", a v2 file by its version block.
+     *
+     * @param resource $fp Source, positioned at its start
+     *
+     * @throws \Exception
+     * @return void
+     */
+    private static function assertFileHeaderIsV3($fp): void {
+        $cipher = self::readRequiredLengthEncodedBlock($fp, "cipher type");
+        if ($cipher === self::FILE_V1_CIPHER) {
+            throw self::unsupportedFileFormatException("v1");
+        }
+        if ($cipher !== self::FILE_CIPHER) {
+            throw new \Exception("Cipher type does not match with the one used in function");
+        }
+
+        $version = self::readRequiredLengthEncodedBlock($fp, "cipher version");
+        if ($version !== self::FILE_VERSION) {
+            throw self::unsupportedFileFormatException($version);
+        }
+    }
+
+    /**
+     * The error for a file in an earlier format.
+     *
+     * @param string $found Version found ("v1", "v2", or whatever the version block held)
+     *
+     * @return \Exception
+     */
+    private static function unsupportedFileFormatException(string $found): \Exception {
+        $found = (preg_match('/\A[a-z][0-9]\z/', $found) === 1 ? "'{$found}'" : "(not a version tag)");
+
+        return new \Exception(
+            "Cipher version does not match with the one used in function: only file format v3 is supported, {$found} found "
+            . "(files written by the removed encryptFileV1/encryptFileV2 are v1/v2 and can no longer be decrypted: decrypt them "
+            . "with the library version that wrote them and encrypt them again)."
+        );
+    }
+
+    /**
      * Reads the rest of a v3 header (key id, salt, file id) and returns the function that decrypts
      * the blocks that follow into a stream, verifying each one and the end marker.
      *
@@ -1587,7 +1742,7 @@ class Security {
      * @throws \Exception On a malformed header or a key id the keyring does not hold
      * @return \Closure(resource): void
      */
-    private static function fileV3BodyDecryptor($fpIn, Keyring $keys): \Closure {
+    private static function fileV3BodyDecryptor($fpIn, #[\SensitiveParameter] Keyring $keys): \Closure {
         $keyId = self::readRequiredLengthEncodedBlock($fpIn, "key id");
         if (!preg_match('/\A[0-9a-f]{' . (2 * self::KEY_ID_BYTES) . '}\z/', $keyId)) {
             throw new \Exception("Error on reading key id: malformed key id.");
@@ -1755,10 +1910,13 @@ class Security {
         [$keyId, $masterKey, $payload] = self::openEnvelope($str, self::DB_ENVELOPE_VERSION, self::keyring($key));
 
         // Native strict decode: encryptDataDB emits plain base64 and nothing else, and the GCM tag
-        // authenticates the bytes, so no data-URI or other leniency is wanted here.
+        // authenticates the bytes, so no data-URI or other leniency is wanted here. The decode is
+        // also required to be CANONICAL (PHP's strict mode still skips whitespace and ignores
+        // non-zero padding bits), so exactly one string is the envelope of a given ciphertext —
+        // a rewritten-but-equivalent value cannot slip past an equality check on the stored text.
         $decoded = base64_decode($payload, true);
-        if ($decoded === false) {
-            throw new \Exception("Failed to decode the secret message. Invalid base64.");
+        if ($decoded === false || base64_encode($decoded) !== $payload) {
+            throw new \Exception("Failed to decode the secret message. Invalid base64 (not the canonical encoding encryptDataDB emits).");
         }
 
         // An empty plaintext has an empty ciphertext: IV + tag is the minimum.
@@ -1907,10 +2065,11 @@ class Security {
         [$keyId, $masterKey, $encoded] = self::openEnvelope($str, self::LOCAL_ENVELOPE_VERSION, self::keyring($key));
         [$encKey, $authKey] = self::localKeys($masterKey, $salt);
 
-        // Native strict decode: encryptLocal emits plain base64, and the MAC authenticates the bytes.
+        // Native strict decode, and CANONICAL (see decryptDataDB): encryptLocal emits plain base64,
+        // and the MAC authenticates the bytes.
         $decoded = base64_decode($encoded, true);
-        if ($decoded === false) {
-            throw new \Exception("Failed to decode encrypted message. Invalid Base64.");
+        if ($decoded === false || base64_encode($decoded) !== $encoded) {
+            throw new \Exception("Failed to decode encrypted message. Invalid Base64 (not the canonical encoding encryptLocal emits).");
         }
 
         $ivLength = openssl_cipher_iv_length('aes-256-ctr');

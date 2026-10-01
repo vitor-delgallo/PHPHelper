@@ -7,11 +7,17 @@ namespace VD\PHPHelper;
  * any number of previous keys, which are only ever used to DECRYPT values written before a key
  * rotation.
  *
- * Every Security method that takes a key accepts either a plain string (a keyring of one) or a
- * Keyring. Each key is identified by its key id (Security::keyId()): a fingerprint derived from the
- * key itself, so there is nothing to name or number by hand. The DB and local envelopes carry the
- * id of the key that wrote them, which is how decryption picks the right key and how a migration
- * finds the values still written under an old one.
+ * Every Security encryption, decryption and hashing method that takes a key accepts either a plain
+ * string (a keyring of one) or a Keyring; Security::keyId() accepts one too and returns the id of
+ * its current key. Each key is identified by its key id (Security::keyId()): a fingerprint derived
+ * from the key itself, so there is nothing to name or number by hand. The DB and local envelopes
+ * and the v3 file header carry the id of the key that wrote them, which is how decryption picks
+ * the right key and how a migration finds the values still written under an old one.
+ *
+ * A key id is 16 hex characters; about one key in 2.000 gets an id made only of decimal digits,
+ * which PHP turns into an INT when it is an array key. ids() and currentId() always return
+ * strings; the KEYS of all() (and of Security::generateSearchHashes()) may be ints — compare
+ * them as (string) $id, never with === on the raw key.
  *
  * ```php
  * $keys = Keyring::fromBase64(getenv('APP_KEY'), getenv('APP_KEY_OLD'));
@@ -26,9 +32,10 @@ namespace VD\PHPHelper;
  */
 final class Keyring {
     /**
-     * Key id => raw key, the current key first.
+     * Key id => raw key, the current key first. An all-digit id is an int key (PHP array
+     * semantics); get() still finds it, since PHP applies the same conversion to the lookup.
      *
-     * @var array<string, string>
+     * @var array<int|string, string>
      */
     private array $keys = [];
 
@@ -58,7 +65,7 @@ final class Keyring {
             $this->keys[$id] = $key;
         }
 
-        $this->currentId = array_key_first($this->keys);
+        $this->currentId = (string) array_key_first($this->keys);
     }
 
     /**
@@ -119,22 +126,25 @@ final class Keyring {
     }
 
     /**
-     * Every raw key, keyed by id, the current key first. For the methods that must try each key
-     * in turn (formats that carry no key id: files and cross-platform values).
+     * Every raw key, keyed by id, the current key first. For what must try (or use) every key:
+     * decryptCrossPlatform(), whose aes-bridge format carries no key id, and
+     * generateSearchHashes(), one blind index per key. DB and local envelopes and v3 files name
+     * their key, so their decrypt methods use get() instead.
      *
-     * @return array<string, string>
+     * @return array<int|string, string> An all-digit id is an int key: compare with (string) $id
      */
     public function all(): array {
         return $this->keys;
     }
 
     /**
-     * Every key id, the current one first.
+     * Every key id, the current one first — always as strings, whatever PHP made of them as
+     * array keys.
      *
      * @return string[]
      */
     public function ids(): array {
-        return array_keys($this->keys);
+        return array_map('strval', array_keys($this->keys));
     }
 
     /**
