@@ -39,7 +39,16 @@ final class ParserTest extends TestCase {
      * is the positive control that keeps that from happening again.
      */
     private function xxeDocument(string $canaryFile): string {
-        $uri = 'file:///' . ltrim(str_replace('\\', '/', (string) realpath($canaryFile)), '/');
+        // Every path segment is percent-encoded ("file:///C:/Users/Vitor%20Delgallo/..."): with a
+        // raw space libxml refused the URI ("Invalid URI"), the positive control below failed and
+        // BOTH XXE tests were SKIPPED on any Windows account whose profile path has a space —
+        // the XXE hardening ran untested there, under a skip message that blamed libxml.
+        $path = str_replace('\\', '/', (string) realpath($canaryFile));
+        $encoded = implode('/', array_map(
+            static fn (string $segment): string => preg_match('/^[A-Za-z]:$/', $segment) === 1 ? $segment : rawurlencode($segment),
+            explode('/', $path)
+        ));
+        $uri = 'file:///' . ltrim($encoded, '/');
 
         return '<?xml version="1.0"?>'
             . '<!DOCTYPE r [<!ENTITY xxe SYSTEM "' . $uri . '">]>'
@@ -53,6 +62,18 @@ final class ParserTest extends TestCase {
         libxml_clear_errors();
 
         if ($unguarded === false || (string) $unguarded->a !== $canary) {
+            // Only a build that expands NO entity at all makes the control meaningless. If an
+            // INTERNAL entity expands while the external one does not, the canary URI (this
+            // test's own doing) is what is broken — and that must fail, never skip.
+            $internal = simplexml_load_string(
+                '<?xml version="1.0"?><!DOCTYPE r [<!ENTITY i "internal-ok">]><r><a>&i;</a></r>',
+                \SimpleXMLElement::class,
+                LIBXML_NOENT
+            );
+            libxml_clear_errors();
+            if ($internal !== false && (string) $internal->a === 'internal-ok') {
+                self::fail('The XXE control did not resolve although entities expand here: the canary URI is wrong, so the hardening would go untested.');
+            }
             self::markTestSkipped('This libxml build does not resolve the XXE payload at all, so its absence proves nothing.');
         }
     }
@@ -598,6 +619,14 @@ final class ParserTest extends TestCase {
 
         $this->assertSame(['a' => '1', 'b' => 'two'], Parser::xmlFileToArray($path));
         $this->assertSame(['a' => '1', 'b' => 'two'], Parser::xmlFileToArray('file:///' . ltrim(str_replace('\\', '/', $path), '/')));
+
+        if (DIRECTORY_SEPARATOR === '\\') {
+            // "C://dir/x.xml" — a drive letter followed by a doubled separator — is a PATH. The
+            // wrapper filter took the single letter for a scheme and returned [] in silence.
+            $doubled = substr($path, 0, 2) . '/' . str_replace('\\', '/', substr($path, 2));
+            $this->assertStringStartsWith(substr($path, 0, 2) . '//', $doubled, 'premise');
+            $this->assertSame(['a' => '1', 'b' => 'two'], Parser::xmlFileToArray($doubled));
+        }
     }
 
     public function testXmlFileToArrayAndXmlToArrayAgree(): void {

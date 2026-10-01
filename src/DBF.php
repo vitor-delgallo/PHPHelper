@@ -126,8 +126,11 @@ class DBF {
      *               returned records against the header's RecordCount themselves.
      *
      * @throws \InvalidArgumentException When $encoding is not an encoding mbstring or iconv knows.
-     * @throws \UnexpectedValueException When a value is not valid in a (multibyte) $encoding that
-     *                                   only iconv supports.
+     * @throws \UnexpectedValueException When a value holds a byte that is not valid in an $encoding
+     *                                   only iconv supports — single-byte code pages included: CP1250
+     *                                   leaves 0x81, 0x83, 0x88, 0x90 and 0x98 undefined, and one such
+     *                                   byte in any record aborts the whole read. (Code pages mbstring
+     *                                   serves substitute the byte and carry on.)
      *
      * @ref https://www.php.net/manual/en/book.dbase.php
      */

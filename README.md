@@ -59,6 +59,7 @@ container, no configuration file.
 | `ext-dom`, `ext-libxml`, `ext-simplexml` | `Security::xssCleanRecursive`, `Parser` XML helpers, `Validator::validateXml`, `Mailer` embedded images |
 | `ext-curl` | `HTTP::callWebService` |
 | `ext-zip` | `File` zip/unzip helpers |
+| `ext-ctype` | `Validator::isHex` (falls back to a regex without it), `S3Storage` mode parsing |
 | `ext-intl` | *(optional)* `URL` — converts internationalized hosts (`münchen.de`) to punycode |
 | `ext-fileinfo` | *(optional)* `S3Storage` — content-type detection on upload |
 | `ext-iconv` | *(optional)* `DBF` — code pages mbstring lacks (CP437, CP852, CP1250) |
@@ -170,7 +171,7 @@ setters and `File::setDownloadBlockSize()` accept `null` to restore their defaul
 | Setting | Default |
 |---|---|
 | `Security::setFileEncryptBlocksBytes()` — plaintext bytes per encrypted file block | 3,200,000 |
-| `Security::setFileMaxEncodedBlockBytes()` — largest encoded block accepted when encrypting and decrypting files | 256 MiB |
+| `Security::setFileMaxEncodedBlockBytes()` — largest encoded block accepted when encrypting and decrypting files (decryption holds ~1.75x one block in memory) | 16 MiB |
 | `DateTime::setDefaultTimezone()` / `setDefaultFormat()` | PHP's default timezone / `Y-m-d` |
 | `File::setDefaultMode()` / `setDownloadBlockSize()` | `0755` / 3 MiB |
 | `S3Storage::setKey()`, `setSecret()`, `setRegion()`, `setBucket()`, `setEndpoint()` … (`reset()` clears them) | — |
@@ -186,7 +187,8 @@ vendor/bin/phpunit --exclude-group slow     # skips the exhaustive bit-flip and 
 vendor/bin/phpunit tests/SecurityFileEncryptionTest.php
 ```
 
-- The dev dependencies need `ext-zip` enabled.
+- The dev dependencies need `ext-zip` enabled (`composer install` checks it). Running the suite also
+  needs `ext-openssl`, `ext-dom`/`ext-simplexml`/`ext-libxml`, `ext-curl` and `pdo_sqlite`.
 - No test touches the network: HTTP and Mailer run against loopback servers, and S3 runs on the AWS
   SDK's `MockHandler`.
 - `tests/SQLEngineTest.php` checks the SQL escaping against a real SQLite (`pdo_sqlite`), and

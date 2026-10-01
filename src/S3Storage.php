@@ -1532,7 +1532,8 @@ class S3Storage
      * - If $mode begins with "DOWNLOAD_TEXT": sends HTTP headers and echoes the contents (forcing a browser download as text).
      * - If $mode begins with "DOWNLOAD_STREAM:[MiB]": sends HTTP headers and relays the object
      *   from S3 to the client as it arrives, in chunks of the given MiB — an integer from 1 to
-     *   64, default 8 when omitted. Anything else ("0", "-5", "1.5", "99999") is rejected: a
+     *   64, default 8 when omitted; "DOWNLOAD_STREAM:16" and "DOWNLOAD_STREAM:[16]" both work.
+     *   Anything else ("0", "-5", "1.5", "99999") is rejected: a
      *   huge chunk makes fread() allocate the whole chunk up front and exhaust memory, and the
      *   old parser read "1.5" as 15 and "0" as the default.
      * - If $mode begins with "SAVE:/path/to/file": saves the requested file locally. The
@@ -1604,6 +1605,11 @@ class S3Storage
             }
         } elseif ($realMode === 'DOWNLOAD_STREAM') {
             $mbArg = trim(explode(':', trim($mode), 2)[1] ?? '');
+            // "DOWNLOAD_STREAM:[16]": the brackets of the documented notation are accepted
+            // literally, as SAVE's are (the old parser took them too).
+            if (strlen($mbArg) >= 2 && $mbArg[0] === '[' && $mbArg[strlen($mbArg) - 1] === ']') {
+                $mbArg = trim(substr($mbArg, 1, -1));
+            }
             $mbStream = $mbArg === '' ? 8 : (ctype_digit($mbArg) && strlen($mbArg) <= 2 ? (int) $mbArg : 0);
 
             if ($mbStream < 1 || $mbStream > 64) {

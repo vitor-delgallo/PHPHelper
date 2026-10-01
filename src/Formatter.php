@@ -254,9 +254,12 @@ class Formatter {
      * $childrenField is only SET on elements that actually have children; a leaf does not carry
      * an empty $childrenField key. Test with isset(), not array_key_exists() on every node.
      *
-     * Every element is placed AT MOST ONCE, so malformed data terminates: a self-parented row,
-     * a parent cycle, or a root whose id equals $parentId (e.g. {id: null, idFather: null})
-     * is nested once and the cycle is cut there. (These used to recurse until memory ran out.)
+     * Every element is placed AT MOST ONCE, so malformed data terminates: a self-parented row or
+     * a parent cycle is nested once and the cycle is cut there. (These used to recurse until
+     * memory ran out.) An element whose OWN id equals the parent id being built (an unsaved row
+     * {id: null, idFather: null} among the roots, or a row that is its own parent) is placed as a
+     * LEAF: descending into it would re-select the level it sits in and nest every later sibling
+     * under it, with the result depending on the row order.
      *
      * @param array $items Flat list of elements, by reference and consumed (see above). EVERY
      *                     element must contain both $idField and $parentField; a missing key
@@ -298,7 +301,9 @@ class Formatter {
                 // can now be placed at most once, so the depth is bounded by count($items).
                 unset($items[$key]);
 
-                $children = self::buildNestedArray(
+                // Its own id IS the level being built: the "children" query would return this
+                // very level, swallowing every remaining sibling. A leaf, by definition.
+                $children = ($element[$idField] === $parentId) ? [] : self::buildNestedArray(
                     $items,
                     $parentField,
                     $idField,

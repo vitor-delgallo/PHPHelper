@@ -1886,6 +1886,10 @@ SINK;
         return [
             'CRLF header injection' => ["UTF-8\r\nX-Evil-Part: 1\r\n\r\nINJECTED-BODY"],
             'bare LF'               => ["UTF-8\nX-Evil: 1"],
+            // The ONE input that tells \z from $: a trailing newline alone. With $ the guard
+            // accepted it and PHPMailer wrote "charset=UTF-8\n" into every MIME part header.
+            'trailing LF only'      => ["UTF-8\n"],
+            'trailing CR only'      => ["UTF-8\r"],
             'parameter smuggling'   => ['UTF-8; format=flowed'],
             'quoted'                => ['"UTF-8"'],
             'empty'                 => [''],
@@ -2005,6 +2009,64 @@ SINK;
 
         self::assertFalse($ok);
         self::assertStringContainsStringIgnoringCase('address', (string) $error);
+    }
+
+    /**
+     * An address with CR/LF or whitespace at its ENDS used to pass: PHPMailer trim()s before it
+     * validates, so the message went out (to the trimmed address) while the documentation — and
+     * Validator::validateMail() — said such addresses are refused. Every recipient list, and the
+     * sender, go through validateMail() now.
+     */
+    #[DataProvider('untrimmedAddressProvider')]
+    public function testSendMailRefusesAnAddressWithWhitespaceOrALineBreakAtItsEnds(string $address): void
+    {
+        [$ok, $error] = self::send($this->configs(1), [['email' => $address]], 'Subject', '<p>Body</p>');
+
+        self::assertFalse($ok);
+        self::assertSame("\$sendTo[0]['email'] is not a valid e-mail address.", $error);
+
+        [$ok, $error] = self::send($this->configs(1), [['email' => 'to@example.com']], 'Subject', '<p>Body</p>', ['cc' => [['email' => $address]]]);
+
+        self::assertFalse($ok);
+        self::assertSame("\$cc[0]['email'] is not a valid e-mail address.", $error);
+    }
+
+    public static function untrimmedAddressProvider(): array
+    {
+        return [
+            'trailing CRLF'  => ["to@example.com\r\n"],
+            'trailing LF'    => ["to@example.com\n"],
+            'leading space'  => [' to@example.com'],
+            'trailing tab'   => ["to@example.com\t"],
+            'not an address' => ['nope'],
+        ];
+    }
+
+    public function testSendMailRefusesAnInvalidSenderAddress(): void
+    {
+        $configs = $this->configs(1);
+        $configs['email'] = "from@example.com\r\n";
+
+        [$ok, $error] = self::send($configs, [['email' => 'to@example.com']], 'Subject', '<p>Body</p>');
+
+        self::assertFalse($ok);
+        self::assertSame("\$configs['email'] is not a valid e-mail address.", $error);
+    }
+
+    /**
+     * The SMTP password travels in $configs['pass']. maskSecret() keeps it out of $error, but an
+     * exception that ESCAPES sendMail (a strict error handler turning a warning into one) carried
+     * the whole $configs array in its trace: both parameters are #[\SensitiveParameter] now.
+     */
+    public function testTheConfigsArrayAndTheMaskedSecretAreSensitiveParameters(): void
+    {
+        $configs = (new \ReflectionMethod(Mailer::class, 'sendMail'))->getParameters()[0];
+        self::assertSame('configs', $configs->getName());
+        self::assertNotEmpty($configs->getAttributes(\SensitiveParameter::class));
+
+        $secret = (new \ReflectionMethod(Mailer::class, 'maskSecret'))->getParameters()[1];
+        self::assertSame('secret', $secret->getName());
+        self::assertNotEmpty($secret->getAttributes(\SensitiveParameter::class));
     }
 
     /** A missing attachment fails the WHOLE send, and $error says so. */

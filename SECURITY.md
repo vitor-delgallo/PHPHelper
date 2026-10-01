@@ -35,11 +35,18 @@ $keys = Keyring::fromBase64(getenv('APP_CRYPTO_KEY'), getenv('APP_CRYPTO_KEY_OLD
   which also limits what an SQL injection can write (see *Replay*).
 
 **Key ids.** `Security::keyId($key)` is a 16-hex fingerprint of a key (HKDF, info `key-id`); it
-reveals nothing about the key. The DB and local envelopes carry the id of the key that wrote them.
+reveals nothing about the key. Given a `Keyring` it returns the id of the current key. The DB and
+local envelopes and the v3 file header carry the id of the key that wrote them. About one key in
+2,000 gets an id made only of decimal digits, which PHP turns into an **int** when it is an array
+key: `Keyring::ids()` and `currentId()` always give strings, but the keys of `Keyring::all()` and
+`generateSearchHashes()` may be ints — compare them as `(string) $id`.
 
-**Hygiene.** Every key and plaintext parameter is marked `#[\SensitiveParameter]`, so it is redacted
-from stack traces. A `Keyring` shows only its key ids in `var_dump()`/`print_r()` and cannot be
-serialized; do not `var_export()` it (PHP offers no hook to hide private properties there).
+**Hygiene.** Every key and plaintext parameter is marked `#[\SensitiveParameter]` — in the public
+methods and in the private helpers they hand the value to, so the frame that throws (a refused
+array, a disk-full write) is redacted too. A `Keyring` shows only its key ids in
+`var_dump()`/`print_r()` and cannot be serialized; do not `var_export()` it (PHP offers no hook to
+hide private properties there). Note that `zend.exception_ignore_args=Off` (the development default)
+is what puts arguments into traces at all; in production keep it `On`.
 
 ### Key rotation — `Keyring`
 
@@ -75,15 +82,24 @@ keys, used only to decrypt what they wrote. Every method that takes `$key` accep
 - **Keys are >= 32 bytes.** HKDF cannot add entropy, so the AES-256 paths require a 32-byte master
   key. Derivation is HKDF-SHA256 with **per-domain** `info` labels (`db-cell`, `file-v3`, `local`,
   `search-hash`, …) so unrelated subsystems never share a key.
+- **A salt names exactly one key.** A salt is a label, not a secret: at most 64 bytes and no NUL
+  byte, on every method. HKDF-Extract is HMAC keyed with the salt, and HMAC NUL-pads a short key and
+  hashes a long one, so `"s"` and `"s\0"` (and `S` and `SHA-256(S)` past 64 bytes) would otherwise
+  derive the same key — and a file header could be rewritten in dozens of equivalent spellings.
 - **Randomness fails closed.** Nonces come from `random_bytes()` with no weak fallback; if no strong
   RNG is available the call throws instead of encrypting with a predictable nonce.
 - **Decryption of a tampered/relocated value THROWS.** It never returns a value a caller could
   mistake for success. This includes `decryptCrossPlatform` (aes-bridge itself returns `""` on an
   authentication failure; the library parses the format itself and throws instead).
+- **Envelopes are canonical.** The base64 of a DB or local envelope must be exactly what the
+  library emitted: whitespace, missing padding and non-zero padding bits — which PHP's strict
+  decoder tolerates — are refused, so one ciphertext has one stored spelling and an equality check
+  on the stored text cannot be fooled by a rewritten-but-equivalent value.
 - **`null` is "no value"; `""` is a value.** `null` passes through every encrypt/decrypt method
-  unchanged. An empty string is **encrypted like any other value**, so no method ever produces
-  `""` — and decrypting `""` **throws** (`Empty value: …`). A column someone blanked out is
-  therefore detected instead of reading back as a legitimately empty value.
+  unchanged — **unauthenticated**: nothing checks a null against its context, key or version. An
+  empty string is **encrypted like any other value**, so no method ever produces `""` — and
+  decrypting `""` **throws** (`Empty value: …`). A column someone blanked to `''` is therefore
+  detected; a column someone set to **NULL is not** (see *Replay*).
 - **Non-scalar input is refused.** Arrays and plain objects throw `InvalidArgumentException` instead
   of being encrypted (or blind-indexed) as the literal text `"Array"`.
 
@@ -108,7 +124,9 @@ $pt  = Security::decryptDataDB($ct, $keys, $aad, $userSalt);
 Without the AAD, a valid ciphertext could be copied from one row/column to another and still
 decrypt. An empty AAD is rejected. Use the **same** salt on both sides. The AAD must not include
 anything that changes over the row's life other than the version (not an e-mail, not a status), or
-the value stops decrypting when it changes.
+the value stops decrypting when it changes. The row id must be a string or an int: a float is
+refused rather than coerced (`1.5` would have silently become row `"1"`, and two rows would have
+shared one context), and so is a bool.
 
 #### Replay — and the version in the AAD
 
@@ -128,6 +146,11 @@ another AAD → exception), or invent a value (no key). Replay is limited to val
 existed **in that cell** — and without encryption they could simply write any number. It only
 matters for fields where an old value is worth something: balances and limits, roles and
 permissions, a revoked 2FA secret, a rotated token.
+
+What the attacker **can** also do, and no version stops: set the cell to **NULL**. `null` is "no
+value" and is never authenticated, so a nulled `totp_secret_enc` reads back as "2FA not set up". For
+a value whose absence is itself a decision, make the column `NOT NULL` and encrypt an explicit
+"none" sentinel instead of storing NULL.
 
 **Level 1 — a version in the AAD.** Keep a version column next to the protected value, increment it
 on every write, and bind it with `dbContext(..., $version)`. The version is an ordinary column of
@@ -227,26 +250,42 @@ AAD       = "{file id}|v3|D|{i}"   ("{file id}|v3|F|{n}" for the end marker)
 - The header is not authenticated on its own, but every field of it selects the key (key id, salt,
   file id) or is checked for equality (cipher, version), so tampering with it fails every block.
   The container encoding (`{len}-{base64}` blocks) is parsed strictly, so non-canonical encodings
-  (leading zeros, `+`, whitespace, bad padding) are rejected too. The salt is stored in clear (a
-  salt is not a secret); the key never is.
+  (leading zeros, `+`, whitespace, bad padding) are rejected too, and a salt with a NUL byte or over
+  64 bytes is refused (see the contract above) — so exactly one byte sequence is the file. The salt
+  is stored in clear (a salt is not a secret); the key never is.
+- A file in an earlier format is refused with "only file format v3 is supported, 'v1'/'v2' found"
+  — a v1 file is recognized by its `aes-128-cbc` cipher block. `decryptFile` reads and checks the
+  whole header and resolves its key **before** it resolves the destination, so a refused file
+  creates nothing, not even the destination's missing directory.
 
 Two process-global settings (reset with `null`):
 
 | Setting | Default | Meaning |
 |---|---|---|
 | `setFileEncryptBlocksBytes()` | 3,200,000 | Plaintext bytes per encrypted block (min 1). Any size is safe for the cipher; it trades memory against file size and speed. |
-| `setFileMaxEncodedBlockBytes()` | 268,435,456 (256 MiB) | Largest encoded block accepted, on **both** encrypt and decrypt (min 44 — the size of the file-id block every file contains). |
+| `setFileMaxEncodedBlockBytes()` | 16,777,216 (16 MiB) | Largest encoded block accepted, on **both** encrypt and decrypt (min 44 — the size of the file-id block every file contains). |
 
 `encryptFile` refuses, before creating anything, a block size or salt whose encoded block would
 exceed the limit — it never writes a file that `decryptFile` could not read back. A block is written
-with its 16-byte tag, so the largest usable block size is `3*floor(limit/4) - 16`: 201,326,576 bytes
+with its 16-byte tag, so the largest usable block size is `3*floor(limit/4) - 16`: 12,582,896 bytes
 under the default limit. A file encrypted under a raised limit needs that limit on the decrypting
 side as well; the error message names the size required.
+
+The limit is also a **memory** promise. `decryptFile` refuses a block that *declares* more than the
+limit before allocating anything, and while it reads a block within the limit it holds about 1.75x
+its encoded size (the encoded bytes, the decoded ciphertext, the plaintext). A hostile upload with
+a block at the limit therefore costs ~28 MB under the default, which a 128M `memory_limit` absorbs
+with a clean exception. (The former 256 MiB default let a ~48 MB upload kill the worker with a
+memory fatal — which no `catch` sees — and leave the staging file behind.) Raise the limit only
+together with `memory_limit`.
 
 Output is written to a hidden staging file next to the destination and renamed into place only on
 success, so a failure (wrong key, tamper, full disk, crash) never destroys an existing destination
 and never leaves unauthenticated plaintext behind. In-place operation (destination == source, by
-any spelling, symlink or hard link) is refused.
+any spelling, symlink or hard link) is refused. **Append mode** (`"a"`) is the one step that writes
+into the destination instead of renaming over it: a destination that is a symlink is refused there
+(`fopen` would follow it and append — and apply `$permissionMode` — to its target), and the file
+actually opened is checked to be the directory entry that was examined.
 
 What the format does not hide, and what to do about it:
 - **Size and name.** The ciphertext reveals the plaintext size (to the block), and the file name is
@@ -282,21 +321,37 @@ Argon2id via `password_hash`/`password_verify`. Never use the encryption helpers
   backslash, and writes NUL as `\0`. No value can leave its literal under MySQL (either `sql_mode`),
   standard-conforming PostgreSQL or SQLite; outside MySQL's default mode a backslash or NUL is stored
   doubled, so the value changes but nothing is injected. It is **not** safe on
-  big5/cp932/gbk/gb18030/sjis connections. Prefer prepared statements.
+  big5/cp932/gbk/gb18030/sjis connections. A negative number is rendered bare (`-5`): concatenated
+  straight after a minus (`"credit-" . escapeString(-5)`) it reads `credit--5`, and in SQLite and
+  PostgreSQL `--` opens a comment that swallows the rest of the statement — put a space or
+  parentheses between an operator and a concatenated value. Prefer prepared statements.
 - **XSS** — `Security::xssCleanRecursive` is a DOM-based **allowlist** sanitizer (elements,
   attributes and URL schemes). Array keys and private/protected object state are not walked;
   escape them on output.
 - **Files** — `File::unzipFile` rejects zip-slip entries, refuses to write through links inside the
-  destination and verifies each entry's CRC. `File::deleteFoldersRecursively`/`resetFolder` never
-  follow links and refuse blank paths (a blank path used to resolve to the working directory).
-  `File::deleteFiles` accepts only plain leaf names. `File::downloadFile` builds a safe
-  `Content-Disposition` (quotes escaped, RFC 5987 `filename*`).
+  destination (re-checked, uncached, right before each write and rename), verifies each entry's
+  CRC, and refuses a second entry that lands on a file it already wrote — by device + inode, so a
+  non-ASCII case variant on NTFS (`Ä.txt`/`ä.txt`) or an 8.3 short name (`LONGFI~1.TXT`) cannot
+  silently replace the first. `File::deleteFoldersRecursively`/`resetFolder` never follow links,
+  re-check the directory's identity before every delete, and refuse blank paths (a blank path used
+  to resolve to the working directory). `File::zipDirectory` skips links and reads each small file
+  itself (checked by inode) rather than letting libzip open the path later. `File::deleteFiles`
+  accepts only plain leaf names. `File::downloadFile` builds a safe `Content-Disposition` (quotes
+  escaped, RFC 5987 `filename*`). See *Caller responsibilities* for the threat boundary of all of
+  these: a directory other users can write to concurrently.
 - **HTTP** — `HTTP::callWebService` allows only `http`/`https`, for the request and for redirects;
   CR/LF in the method or header values is rejected; TLS verification is on unless the caller turns
   it off. `HTTP::getClientIpAddresses` lists `REMOTE_ADDR` first; forwarded headers follow.
+- **URLs** — `URL::getFormattedUrl` rejects every scheme but `http`/`https`, including the
+  `javascript:1/alert(1)` shape that `parse_url()` reads as a host and a port. It is a formatter,
+  not an HTML sanitizer: escape the result for the context it goes into, and pass `$protocol` for an
+  href or redirect (a browser reads a scheme-less `host:port/...` as a scheme).
 - **Headers/mail** — `URL::buildHttpHeaderArray` rejects CR/LF/NUL; `Validator::validateMail` and
-  `Mailer` reject addresses carrying whitespace or control characters; Mailer debug output goes to
-  `error_log`, never to stdout, with the SMTP password masked.
+  `Mailer` reject addresses carrying whitespace or control characters anywhere, ends included —
+  every recipient list and the sender go through `validateMail()`, since PHPMailer would otherwise
+  trim and send; Mailer debug output goes to `error_log`, never to stdout, with the SMTP password
+  masked, and `$configs` is a `#[\SensitiveParameter]` so an exception that escapes `sendMail`
+  does not carry the password in its trace.
 - **XML** — `Parser::xmlToArray` parses **content only** (files go through `xmlFileToArray`),
   blocks external entities with `LIBXML_NONET`, and restores the previous entity loader afterwards.
   `Parser::arrayToXml` serializes only public object state, validates the root name, and writes a
@@ -312,6 +367,14 @@ Argon2id via `password_hash`/`password_verify`. Never use the encryption helpers
   are design decisions. See *Replay*.
 - **Blind-index lookups** — verify the decrypted value after a lookup, and make unique hashes
   `UNIQUE`. See *Blind index*.
+- **Directories other users can write to.** Every link check in `File` (and in `decryptFile`'s
+  append mode) describes the tree as it is when each entry is examined; PHP cannot open a path
+  relative to a directory handle (`openat`), so another user who can write to the same tree while
+  a delete, a zip or an extraction runs can still swap a directory for a link in the microseconds
+  between a check and the operation (a TOCTOU race). The walkers re-check identities to narrow
+  that window; they cannot close it. Delete, zip, extract and decrypt in directories that only
+  your process writes to, never with privileges over a shared `/tmp` or another account's upload
+  folder.
 - **SSRF** — `HTTP::callWebService` has no private-IP/allowlist guard. Do not pass user-controlled
   URLs without an egress allowlist; never disable peer verification in production.
 - **Forwarded client IPs** — only `REMOTE_ADDR` is trustworthy; trust `X-Forwarded-For` only behind

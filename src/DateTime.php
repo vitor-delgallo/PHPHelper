@@ -436,11 +436,18 @@ class DateTime {
      * Element N is computed as start + N x interval — not by adding the interval to the previous
      * element — with the month clamping of applyInterval(). A monthly range from Jan 31 therefore
      * yields Jan 31, Feb 29, Mar 31, Apr 30... (cumulative PHP arithmetic yielded Jan 31, Mar 2,
-     * Apr 2: February skipped, every later month drifted). It also keeps a DST gap from
-     * accumulating: a daily range from a midnight that did not exist locally still lands on the
-     * end date instead of stepping one hour past it and dropping it.
+     * Apr 2: February skipped, every later month drifted).
      *
-     * Parsing follows the rules on validateDate(); the arithmetic runs in PHP's default timezone.
+     * A CALENDAR interval (days, months, years, no time part) steps the calendar, not the clock:
+     * the arithmetic runs on the wall-clock fields as written, in a zone without DST, and each
+     * element is only moved back into PHP's default timezone to be formatted. So a daily range
+     * never loses its first or last date to a DST gap — a start date whose local midnight did not
+     * exist used to be read as 01:00, and every element then fell one hour past the end date, so
+     * the end date was dropped (America/Santiago, America/Havana, and Brazil until 2019). A TIME
+     * interval (hours, minutes, seconds) steps real time in PHP's default timezone, as before: an
+     * hour that did not exist is not listed, a repeated one is listed twice.
+     *
+     * Parsing follows the rules on validateDate(); a string that carries its own offset keeps it.
      *
      * NOTE: the list is built in memory. Its size is (end - start) / interval, so do not let an
      * untrusted caller pick a wide range together with a tiny interval.
@@ -470,8 +477,14 @@ class DateTime {
     ): array {
         $outputFormat = self::resolveFormat($outputFormat);
 
-        $start = self::parseStrict($startDate, self::resolveFormat($formatStart));
-        $end = self::parseStrict($endDate, self::resolveFormat($formatEnd));
+        // A calendar interval is computed on floating wall-clock values: the strings are read in
+        // UTC (no DST, no gaps), unless they carry an offset of their own, which they keep.
+        $interval = self::parseInterval($intervalSpec);
+        $calendarStep = $interval !== null && $interval->h === 0 && $interval->i === 0 && $interval->s === 0 && $interval->f == 0;
+        $floatingZone = $calendarStep ? new \DateTimeZone('UTC') : null;
+
+        $start = self::parseStrict($startDate, self::resolveFormat($formatStart), $floatingZone);
+        $end = self::parseStrict($endDate, self::resolveFormat($formatEnd), $floatingZone);
         if ($start === null || $end === null) {
             return [];
         }
@@ -479,17 +492,22 @@ class DateTime {
             [$start, $end] = [$end, $start];
         }
 
-        $interval = self::parseInterval($intervalSpec);
         if ($interval === null || self::shiftDate($start, $interval, 1) <= $start) {
             throw new \InvalidArgumentException(
                 "Interval specification '{$intervalSpec}' is invalid or does not advance the date."
             );
         }
 
+        // Floating values are formatted in PHP's default timezone, so a zone token in the output
+        // format shows the zone the caller works in, not the UTC the arithmetic borrowed.
+        $renderZone = ($floatingZone !== null && $start->getTimezone()->getName() === 'UTC')
+            ? new \DateTimeZone(date_default_timezone_get())
+            : null;
+
         $dates = [];
         $current = $start;
         for ($step = 1; $current <= $end; $step++) {
-            $dates[] = $current->format($outputFormat);
+            $dates[] = ($renderZone === null ? $current : self::withWallClock($current, $renderZone))->format($outputFormat);
 
             $next = self::shiftDate($start, $interval, $step);
             if ($next <= $current) {
@@ -647,13 +665,27 @@ class DateTime {
             return PHP_INT_MAX;
         }
 
-        // Microsecond resolution fits comfortably in 64 bits for any year \DateTime can hold.
-        $microseconds = abs(
-            ($end->getTimestamp() - $start->getTimestamp()) * 1_000_000
-            + ((int) $end->format('u') - (int) $start->format('u'))
-        );
+        // Seconds and microseconds are kept apart: multiplying the difference by 1e6 overflowed
+        // past ~292.000 years (a "never expires" PHP_INT_MAX timestamp, which the parser accepts)
+        // into a float, and intdiv() then threw a TypeError. Saturates at PHP_INT_MAX instead.
+        $seconds = $end->getTimestamp() - $start->getTimestamp();
+        if (!is_int($seconds) || $seconds === PHP_INT_MIN) {
+            return PHP_INT_MAX;
+        }
+        $microseconds = (int) $end->format('u') - (int) $start->format('u');
+        if ($seconds < 0 || ($seconds === 0 && $microseconds < 0)) {
+            $seconds = -$seconds;
+            $microseconds = -$microseconds;
+        }
+        if ($microseconds < 0) {
+            $seconds -= 1;
+            $microseconds += 1_000_000;
+        }
+        if ($microseconds >= 500_000) {
+            return $seconds === PHP_INT_MAX ? PHP_INT_MAX : $seconds + 1;
+        }
 
-        return intdiv($microseconds + 500_000, 1_000_000);
+        return $seconds;
     }
 
     /**
@@ -959,6 +991,16 @@ class DateTime {
         );
 
         return intdiv($utcMidnight->getTimestamp(), 86400);
+    }
+
+    /**
+     * The same wall-clock fields (date and time of day) as $date, read in $zone. A time of day
+     * that does not exist in $zone (a DST gap) moves forward, as PHP always does.
+     */
+    private static function withWallClock(\DateTime $date, \DateTimeZone $zone): \DateTime {
+        return (new \DateTime('now', $zone))
+            ->setDate((int) $date->format('Y'), (int) $date->format('n'), (int) $date->format('j'))
+            ->setTime((int) $date->format('G'), (int) $date->format('i'), (int) $date->format('s'), (int) $date->format('u'));
     }
 
     /**

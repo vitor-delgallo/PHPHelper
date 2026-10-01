@@ -665,6 +665,39 @@ final class DateTimeTest extends TestCase {
         );
     }
 
+    /**
+     * The gap at the START: 2018-11-04 00:00 did not exist in America/Sao_Paulo, so the start
+     * date was read as 01:00, every daily element inherited that hour, the last one fell past the
+     * end date's midnight — and the end date was dropped (6 dates instead of 7). A calendar range
+     * must not care what time it is: America/Santiago and America/Havana still shift at midnight.
+     */
+    public function testGetDateRangeListIncludesTheEndDateWhenTheStartSitsOnAMidnightDstGap(): void {
+        $week = ['2018-11-04', '2018-11-05', '2018-11-06', '2018-11-07', '2018-11-08', '2018-11-09', '2018-11-10'];
+        date_default_timezone_set('America/Sao_Paulo');
+        $this->assertSame($week, DateTime::getDateRangeList('2018-11-04', '2018-11-10'));
+        $this->assertSame($week, DateTime::getDateRangeList('2018-11-10', '2018-11-04'), 'reversed dates');
+
+        date_default_timezone_set('America/Santiago');
+        $this->assertSame(['2026-09-06', '2026-09-07', '2026-09-08'], DateTime::getDateRangeList('2026-09-06', '2026-09-08'));
+
+        date_default_timezone_set('America/Havana');
+        $this->assertSame(['2026-03-08', '2026-03-09', '2026-03-10'], DateTime::getDateRangeList('2026-03-08', '2026-03-10'));
+    }
+
+    /**
+     * Calendar steps are computed on floating wall-clock values and rendered in the default zone:
+     * a time or zone token in the output shows the local reading (01:00 -02:00 for the midnight
+     * that did not exist), never the UTC the arithmetic borrowed.
+     */
+    public function testGetDateRangeListCalendarStepsRenderInTheDefaultTimezone(): void {
+        date_default_timezone_set('America/Sao_Paulo');
+
+        $this->assertSame(
+            ['2018-11-03 00:00 -03:00', '2018-11-04 01:00 -02:00', '2018-11-05 00:00 -02:00'],
+            DateTime::getDateRangeList('2018-11-03', '2018-11-05', 'Y-m-d', 'Y-m-d', 'P1D', 'Y-m-d H:i P')
+        );
+    }
+
     /** Hourly steps are elapsed hours: 02:00 did not exist in New York on 2024-03-10. */
     public function testGetDateRangeListHourlyStepsFollowElapsedTimeAcrossDst(): void {
         date_default_timezone_set('America/New_York');
@@ -838,6 +871,18 @@ final class DateTimeTest extends TestCase {
     }
 
     // ---------------------------------------------------------------- getDateDifferenceInSeconds
+
+    /**
+     * The difference used to be multiplied by 1e6: past ~292.000 years (a "never expires"
+     * PHP_INT_MAX timestamp, which the parser accepts) it overflowed into a float and intdiv()
+     * threw a TypeError. It saturates at PHP_INT_MAX now, and stays exact below that.
+     */
+    public function testGetDateDifferenceInSecondsSaturatesInsteadOfOverflowing(): void {
+        $this->assertSame(PHP_INT_MAX - 1700000000, DateTime::getDateDifferenceInSeconds('1700000000', (string) PHP_INT_MAX, 'U', 'U'));
+        $this->assertSame(PHP_INT_MAX - 1700000000, DateTime::getDateDifferenceInSeconds((string) PHP_INT_MAX, '1700000000', 'U', 'U'));
+        $this->assertSame(9300000000000, DateTime::getDateDifferenceInSeconds('0', '9300000000000', 'U', 'U'));
+        $this->assertSame(PHP_INT_MAX, DateTime::getDateDifferenceInSeconds('-1', (string) PHP_INT_MAX, 'U', 'U'), 'a difference past PHP_INT_MAX saturates');
+    }
 
     public function testGetDateDifferenceInSecondsIsExactAcrossYears(): void {
         $this->assertSame(

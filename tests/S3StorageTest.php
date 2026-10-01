@@ -805,6 +805,24 @@ final class S3StorageTest extends TestCase
         $this->assertStringContainsString('chunk size in MiB was specified incorrectly', (string)S3Storage::getLastError());
     }
 
+    /**
+     * "DOWNLOAD_STREAM:[16]" is the documented notation taken literally, with its brackets — as
+     * "SAVE:[path]" is. The rewritten parser (ctype_digit) refused it, so a caller who followed
+     * the docblock went from a working stream to a silent false.
+     */
+    public function testDownloadStreamAcceptsTheBracketedChunkSizeNotation(): void
+    {
+        S3Storage::setNoOperation(true);
+
+        $this->assertTrue(S3Storage::download('a/b.txt', 'DOWNLOAD_STREAM:[16]'));
+        $this->assertTrue(S3Storage::download('a/b.txt', 'DOWNLOAD_STREAM:16'));
+        $this->assertTrue(S3Storage::download('a/b.txt', 'DOWNLOAD_STREAM:[ 8 ]'));
+
+        $this->assertFalse(S3Storage::download('a/b.txt', 'DOWNLOAD_STREAM:[0]'));
+        $this->assertStringContainsString('chunk size in MiB was specified incorrectly', (string)S3Storage::getLastError());
+        $this->assertFalse(S3Storage::download('a/b.txt', 'DOWNLOAD_STREAM:[[16]]'));
+    }
+
     // ---------------------------------------------------------------------
     // FINDING: download() documented the SaveAs/key extension match as merely
     // "recommended ... for consistency". It is a hard precondition: on a mismatch

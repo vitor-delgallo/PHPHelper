@@ -507,6 +507,36 @@ final class FormatterTest extends TestCase {
     }
 
     /**
+     * An unsaved row {id: null, idFather: null} among the roots: descending into it re-selected
+     * the ROOT level (its id IS the parent id being built), so every root after it became its
+     * child and the tree depended on the row order — the old infinite loop had merely turned
+     * into a wrong tree. It is a leaf now, wherever it sits; the same goes for a self-parented row.
+     */
+    public function testBuildNestedArrayKeepsARowWhoseIdIsTheParentIdAsALeaf(): void {
+        $unsaved = ['id' => null, 'idFather' => null, 'name' => 'unsaved'];
+        $a = ['id' => 1, 'idFather' => null, 'name' => 'a'];
+        $a1 = ['id' => 2, 'idFather' => 1, 'name' => 'a.1'];
+        $b = ['id' => 3, 'idFather' => null, 'name' => 'b'];
+
+        $first = [$unsaved, $a, $a1, $b];
+        $last = [$a, $a1, $b, $unsaved];
+        $treeFirst = Formatter::buildNestedArray($first);
+        $treeLast = Formatter::buildNestedArray($last);
+
+        self::assertSame(['unsaved', 'a', 'b'], array_column($treeFirst, 'name'));
+        self::assertSame(['a', 'b', 'unsaved'], array_column($treeLast, 'name'));
+        self::assertArrayNotHasKey('children', $treeFirst[0], 'the unsaved row must not absorb its siblings');
+        self::assertSame('a.1', $treeFirst[1]['children'][0]['name']);
+        self::assertSame([], $first);
+        self::assertSame([], $last);
+
+        $rows = [['id' => 5, 'idFather' => 5, 'name' => 'self-parented'], ['id' => 6, 'idFather' => 5, 'name' => 'child of 5']];
+        $tree = Formatter::buildNestedArray($rows, parentId: 5);
+        self::assertSame(['self-parented', 'child of 5'], array_column($tree, 'name'));
+        self::assertArrayNotHasKey('children', $tree[0]);
+    }
+
+    /**
      * Documented: $items is consumed. Everything placed in the tree is removed from it, so what
      * remains is exactly the orphans — the only way a caller can detect dropped rows.
      */

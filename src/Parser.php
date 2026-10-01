@@ -375,7 +375,9 @@ class Parser {
      *
      * The file is read as bytes and parsed as a string, so the same entity hardening applies. Only
      * local paths are accepted: a stream-wrapper URL (http://, ftp://, php://, phar://, …) returns
-     * [] without being opened; file:// is allowed.
+     * [] without being opened; file:// is allowed. A wrapper name has at least two characters —
+     * PHP's own rule, so that a Windows drive letter ("C://dir/x.xml", a path with a doubled
+     * separator) is a path, not a scheme.
      *
      * @param string $path Path to the XML file. Treat it like any path: never build it from
      *                     untrusted input without confining it to a directory you control.
@@ -386,7 +388,7 @@ class Parser {
         if ($path === '' || str_contains($path, "\0")) {
             return [];
         }
-        if (preg_match('#^([a-z][a-z0-9+.\-]*)://#i', $path, $scheme) === 1 && strtolower($scheme[1]) !== 'file') {
+        if (preg_match('#^([a-z][a-z0-9+.\-]+)://#i', $path, $scheme) === 1 && strtolower($scheme[1]) !== 'file') {
             return [];
         }
         if (!is_file($path) || !is_readable($path)) {

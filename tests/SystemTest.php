@@ -266,12 +266,23 @@ final class SystemTest extends TestCase {
      * /proc/meminfo, i.e. it tested nothing there. The parsing and assembly steps are covered
      * deterministically in SystemHardeningTest; here a null host is reported as a skip.
      */
-    public function testGetServerMemoryUsageReturnsNullOrAFullyConsistentArray(): void {
-        $result = System::getServerMemoryUsage();
-
-        if ($result === null) {
-            $this->markTestSkipped('The OS did not expose physical memory numbers on this host (documented as routine).');
+    /**
+     * Null is routine on a host without the probe — but where /proc/meminfo IS readable, null is a
+     * parsing/assembly regression and must FAIL, not turn into a skip that hides it on every OS.
+     */
+    private function requireMemoryFigures(?array $result): array {
+        if ($result !== null) {
+            return $result;
         }
+        if (PHP_OS_FAMILY !== 'Windows' && @is_readable('/proc/meminfo')) {
+            $this->fail('/proc/meminfo is readable on this host, so getServerMemoryUsage() must not return null.');
+        }
+
+        $this->markTestSkipped('The OS did not expose physical memory numbers on this host (documented as routine; wmic is gone from current Windows).');
+    }
+
+    public function testGetServerMemoryUsageReturnsNullOrAFullyConsistentArray(): void {
+        $result = $this->requireMemoryFigures(System::getServerMemoryUsage());
 
         $this->assertSame(
             ['totalBytes', 'freeBytes', 'usageBytes', 'total', 'usage', 'free', 'freePercent'],
@@ -295,11 +306,7 @@ final class SystemTest extends TestCase {
      * 100 - free/total*100, i.e. the USED share, under a key named freePercent.
      */
     public function testGetServerMemoryUsageFreePercentIsTheFreeShareNotTheUsedShare(): void {
-        $result = System::getServerMemoryUsage();
-
-        if ($result === null) {
-            $this->markTestSkipped('The OS did not expose physical memory numbers on this host.');
-        }
+        $result = $this->requireMemoryFigures(System::getServerMemoryUsage());
 
         $expectedFreeShare = Number::roundDecimal(
             $result['freeBytes'] * 100 / $result['totalBytes'],

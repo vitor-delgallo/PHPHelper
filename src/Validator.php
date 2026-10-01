@@ -561,7 +561,9 @@ class Validator {
 
         // Whitespace-only collapses to "" here — it used to stay "not empty" even though the
         // same stripping already made "  n o  " empty.
-        $normalized = strtoupper(preg_replace('/\s+/', '', $stringValue));
+        // Explicit ASCII classes rather than \s/\d: without /u, PCRE builds those from the current
+        // LC_CTYPE, so under a cp1252 locale \s also matched 0xA0 and \d matched ²³¹ (0xB2/B3/B9).
+        $normalized = strtoupper(preg_replace('/[\t\n\x0B\f\r ]+/', '', $stringValue));
 
         return $normalized === '' || in_array($normalized, self::COMPLETELY_EMPTY_SENTINELS, true);
     }
@@ -597,7 +599,7 @@ class Validator {
             return false;
         }
 
-        $compact = preg_replace('/\s+/', '', (string) $value);
+        $compact = preg_replace('/[\t\n\x0B\f\r ]+/', '', (string) $value);
 
         return str_starts_with($compact, '-') || str_starts_with($compact, "\u{2212}");
     }
@@ -626,7 +628,7 @@ class Validator {
      */
     public static function validateCpf(string $cpf): bool {
         $cpf = self::stripDocumentMask($cpf);
-        if ($cpf === null || preg_match('/^\d{11}$/D', $cpf) !== 1 || preg_match('/^(\d)\1{10}$/', $cpf)) {
+        if ($cpf === null || preg_match('/^[0-9]{11}$/D', $cpf) !== 1 || preg_match('/^([0-9])\1{10}$/', $cpf)) {
             return false;
         }
 
@@ -670,7 +672,7 @@ class Validator {
      */
     public static function validateCnpj(string $cnpj): bool {
         $cnpj = self::stripDocumentMask($cnpj);
-        if ($cnpj === null || preg_match('/^[0-9A-Z]{12}\d{2}$/D', $cnpj) !== 1 || preg_match('/^(.)\1{13}$/', $cnpj)) {
+        if ($cnpj === null || preg_match('/^[0-9A-Z]{12}[0-9]{2}$/D', $cnpj) !== 1 || preg_match('/^(.)\1{13}$/', $cnpj)) {
             return false;
         }
 
@@ -725,10 +727,14 @@ class Validator {
     /**
      * Drops the separators a CPF/CNPJ mask may carry ("." "-" "/" and ASCII whitespace).
      *
+     * The whitespace class is spelled out: \s (and \d, in the callers) are built from the current
+     * LC_CTYPE when /u is off, so under a cp1252 locale \s swallowed a 0xA0 byte and \d accepted
+     * the superscript digits ²³¹ — "\xB21234567890" validated as a CPF.
+     *
      * @return string|null The remaining characters, or null when nothing is left.
      */
     private static function stripDocumentMask(string $document): ?string {
-        $stripped = preg_replace('/[.\-\/\s]+/', '', $document);
+        $stripped = preg_replace('/[.\-\/\t\n\x0B\f\r ]+/', '', $document);
         return ($stripped === null || $stripped === '') ? null : $stripped;
     }
 }

@@ -1166,4 +1166,32 @@ final class ValidatorTest extends TestCase {
         $this->assertFalse(Validator::validateHtml('&amp;'));
         $this->assertFalse(Validator::validateHtml('&lt;script&gt;'));
     }
+
+    // ----------------------------------------------------- locale independence
+
+    /**
+     * Without /u, PCRE builds \s and \d from the process LC_CTYPE: under a cp1252 locale "\xB2"
+     * (the superscript ²) counted as a digit and "\xA0" as whitespace, so "\xB21234567890" and
+     * "52998224725\xA0" validated as CPFs and "\xA0\xA0" read as completely empty. The classes
+     * are spelled out as ASCII now, so the locale cannot change what a document is.
+     */
+    public function testDocumentValidationDoesNotDependOnTheProcessLocale(): void {
+        $previous = setlocale(LC_CTYPE, '0');
+        $cp1252 = setlocale(LC_CTYPE, 'Portuguese_Brazil.1252', 'pt_BR.CP1252', 'pt_BR.cp1252', 'en_US.CP1252', 'English_United States.1252');
+        try {
+            if ($cp1252 === false) {
+                $this->markTestSkipped('No cp1252 locale is installed on this host.');
+            }
+
+            $this->assertFalse(Validator::validateCpf("\xB21234567890"), 'a superscript digit is not a digit');
+            $this->assertFalse(Validator::validateCpf("52998224725\xA0"), 'a non-breaking space is not a mask separator');
+            $this->assertFalse(Validator::validateCnpj("11222333000181\xA0"));
+            $this->assertFalse(Validator::isCompletelyEmpty("\xA0\xA0"));
+            $this->assertFalse(Validator::isNegativeNumber("\xA0-5") === true && !str_starts_with("\xA0-5", "\xA0"), 'sanity');
+            $this->assertTrue(Validator::validateCpf('529.982.247-25'));
+            $this->assertTrue(Validator::validateCnpj('11.222.333/0001-81'));
+        } finally {
+            setlocale(LC_CTYPE, $previous);
+        }
+    }
 }

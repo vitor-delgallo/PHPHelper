@@ -149,7 +149,9 @@ class URL {
      * This is a FORMATTER guarded by an input-domain check — NOT an HTML/XSS sanitizer:
      *  - It REJECTS any $url carrying an explicit scheme other than http/https, and any $url
      *    containing control characters, so 'javascript:'/'data:' payloads and their "java\tscript:"
-     *    obfuscations cannot pass through. Rejection is an exception, never a quiet empty string.
+     *    obfuscations cannot pass through — including the "javascript:1/alert(1)" shape, which
+     *    parse_url() reads as a HOST and a PORT (no scheme at all) while a browser executes it.
+     *    Rejection is an exception, never a quiet empty string.
      *  - It does NOT make the result safe to embed in a page. Reserved characters survive by
      *    design (see urlEncode()), so escape at the point of use — htmlspecialchars() for an href.
      *  - It does NOT check that the host exists, resolves, or is one you trust. For a host
@@ -157,7 +159,10 @@ class URL {
      *
      * A $url with no scheme at all ('example.com', 'example.com:8443/x') is valid input: the
      * scheme is then taken from $protocol, or left off entirely when $protocol is false. A $url
-     * with no host at all (a bare path such as '/a/b') never gets a scheme prefix.
+     * with no host at all (a bare path such as '/a/b') never gets a scheme prefix. NOTE that a
+     * browser reads a scheme-less result that carries a port ('example.com:8443/x') as the scheme
+     * "example.com": for an href or a redirect, always pass $protocol so the result starts with
+     * http(s)://.
      *
      * The host is converted with idn_to_ascii() when ext-intl is available ('münchen.de' →
      * 'xn--mnchen-3ya.de'); without ext-intl a non-ASCII host is percent-encoded instead.
@@ -217,6 +222,16 @@ class URL {
         if ($scheme !== '' && !in_array($scheme, self::ALLOWED_SCHEMES, true)) {
             throw new \InvalidArgumentException(
                 'Unsupported URL scheme "' . $scheme . '": only http and https are supported.'
+            );
+        }
+
+        // parse_url() reads "javascript:1/alert(1)" as host "javascript" with port 1 — NO scheme —
+        // while a browser reads the same bytes as a javascript: URL (and "1/alert(1)" is valid
+        // JavaScript). The check above never saw it. A leading word that spells a scheme a
+        // browser would execute or open locally is refused whatever parse_url() made of it.
+        if ($scheme === '' && preg_match('#^(javascript|vbscript|data|file|blob|about|filesystem|jar|ms-[a-z0-9]+):#i', $url, $dangerous) === 1) {
+            throw new \InvalidArgumentException(
+                'Unsupported URL scheme "' . strtolower($dangerous[1]) . '": only http and https are supported.'
             );
         }
 

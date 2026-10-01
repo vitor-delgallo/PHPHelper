@@ -80,6 +80,11 @@ class SQL {
      *    and use this only when a bound parameter is genuinely impossible.
      *  - It escapes VALUES only — never identifiers (table/column names), never SQL fragments,
      *    and it does not escape the LIKE wildcards % and _.
+     *  - TOKEN FUSION: a negative number is rendered bare ("-5"). Concatenated straight after a
+     *    minus operator ("credit-" . escapeString(-5)) that is "credit--5", and in SQLite and
+     *    PostgreSQL "--" opens a comment that swallows the rest of the statement — the WHERE
+     *    included. (MySQL requires whitespace after "--" precisely for this case.) Put a space or
+     *    parentheses between an operator and a value you concatenate, in every dialect.
      *
      * BEHAVIOUR CHANGE: the quote used to be rendered as \' (injectable under NO_BACKSLASH_ESCAPES)
      * and control characters used to be stripped; both are gone, see above.

@@ -121,6 +121,12 @@ final class URLTest extends TestCase {
         $this->assertSame('https://evil.com', URL::getFormattedUrl('https://trusted.com@evil.com/x'));
         $this->assertSame('https://example.com', URL::getFormattedUrl('https://user:secret@www.example.com/'));
         $this->assertSame('evil.com', URL::getFormattedUrl('user@evil.com'));
+
+        // The LAST '@' ends the userinfo (RFC 3986): with several, a first-'@' split would have
+        // reported 'trusted.com' as the start of the host while the browser goes to evil.com.
+        $this->assertSame('https://evil.com', URL::getFormattedUrl('https://trusted.com@trusted.com@evil.com/x'));
+        $this->assertSame('https://evil.com', URL::getFormattedUrl('https://u:p@ss@evil.com/'));
+        $this->assertSame('https://u:p@ss@evil.com', URL::getFormattedUrl('https://u:p@ss@evil.com/', false), 'full mode keeps the whole userinfo');
     }
 
     public function testFullUrlModeKeepsUserinfoAsPartOfTheUrl(): void {
@@ -209,6 +215,35 @@ final class URLTest extends TestCase {
         $this->expectException(\InvalidArgumentException::class);
         $this->expectExceptionMessage('Unsupported URL scheme "javascript"');
         URL::getFormattedUrl('javascript:alert(document.cookie)');
+    }
+
+    /**
+     * parse_url() reads "javascript:1/alert(1)" as HOST "javascript" with PORT 1 — no scheme at
+     * all — so the scheme check never saw it and the string came back verbatim, while a browser
+     * reads the same bytes as a javascript: URL and "1/alert(1)" is valid JavaScript.
+     */
+    #[DataProvider('schemeDisguisedAsHostAndPortProvider')]
+    public function testGetFormattedUrlRejectsADangerousSchemeThatParsesAsHostAndPort(string $url, string $scheme): void {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Unsupported URL scheme "' . $scheme . '"');
+        URL::getFormattedUrl($url, false);
+    }
+
+    public static function schemeDisguisedAsHostAndPortProvider(): array {
+        return [
+            'javascript then digits' => ['javascript:1/alert(document.domain)', 'javascript'],
+            'mixed case, comment'    => ['JavaScript:0/alert(1)//', 'javascript'],
+            'vbscript'               => ['vbscript:1/msgbox(1)', 'vbscript'],
+            'data'                   => ['data:1/x', 'data'],
+            'file'                   => ['file:1/etc/passwd', 'file'],
+            'blob'                   => ['blob:1/x', 'blob'],
+        ];
+    }
+
+    /** A real host with a port is still valid scheme-less input (and gets $protocol in front). */
+    public function testGetFormattedUrlStillAcceptsARealHostWithAPort(): void {
+        $this->assertSame('localhost:8080/x', URL::getFormattedUrl('localhost:8080/x', false));
+        $this->assertSame('https://example.com:8443/x', URL::getFormattedUrl('example.com:8443/x', false, 'https'));
     }
 
     public function testGetFormattedUrlRejectsJavascriptSchemeRegardlessOfCaseOrOnlyDomain(): void {

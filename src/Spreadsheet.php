@@ -18,15 +18,20 @@ class Spreadsheet {
      * phpoffice/phpspreadsheet can identify is accepted (.xlsx, .xls, .ods, .csv, .html, ...).
      *
      * What a value looks like. Every cell comes back as a string, or null when it is empty.
-     *  - Binary/XML workbooks (.xlsx, .xls, .ods, ...) are read DATA-ONLY, and a data-only load does
-     *    not read number formats. So a value is its raw content rendered as General — NOT what
-     *    Excel displays: a date is its Excel serial number ('45322' for 2024-01-31; convert with
+     *  - Excel workbooks (.xlsx, .xls) are read DATA-ONLY, and a data-only load does not read
+     *    number formats. So a value is its raw content rendered as General — NOT what Excel
+     *    displays: a date is its Excel serial number ('45322' for 2024-01-31; convert with
      *    \PhpOffice\PhpSpreadsheet\Shared\Date::excelToDateTimeObject((float) $v)), a percentage is
      *    its fraction ('0.125'), a currency has no symbol or separators, a boolean is 'TRUE' /
      *    'FALSE'. A float is PhpSpreadsheet's General rendering, which round-trips through
      *    (float) but need not be the shortest form (1234567.891234 reads '1234567.89123399998061').
      *    Formulas are recalculated by PhpSpreadsheet (not Excel's cached result, except for
      *    functions it does not implement), so volatile ones (NOW(), RAND()) reflect read time.
+     *  - OpenDocument (.ods) is DIFFERENT: its reader assigns a number format from each cell's
+     *    declared type even in a data-only load, so typed cells come back as DISPLAY TEXT — a date
+     *    as '31-Jan-24', a percentage as '12.50%', a currency as '$1,234.50 '. Do not feed those to
+     *    excelToDateTimeObject((float) $v): '31-Jan-24' casts to 31 and silently becomes 1900-01-31.
+     *    Parse the text, or save the sheet as .xlsx first.
      *  - Text formats (.csv/.txt and HTML tables) are returned VERBATIM: every cell is exactly the
      *    text in the file. They used to go through PhpSpreadsheet's default value binder, which
      *    treats text as typed input — "=A2&B2" was EVALUATED as a formula, "+5511987654321" (a

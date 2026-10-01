@@ -148,7 +148,7 @@ class Mailer {
      *              strict error handler makes out of a PHP warning — and PROPAGATES.
      */
     public static function sendMail(
-        array $configs,
+        #[\SensitiveParameter] array $configs,
         array $sendTo,
         string $subject,
         string $body,
@@ -250,6 +250,11 @@ class Mailer {
             empty($body)
         ) {
             $error = 'A required value is missing: $configs host/port/user/pass/email/name, $sendTo, $subject or $body.';
+            return false;
+        }
+
+        if (!self::validateMail($configs['email'])) {
+            $error = '$configs[\'email\'] is not a valid e-mail address.';
             return false;
         }
 
@@ -533,6 +538,12 @@ class Mailer {
             if (!isset($entry[$requiredKey]) || !is_string($entry[$requiredKey]) || (!$allowEmptyRequired && $entry[$requiredKey] === '')) {
                 return "{$label}[{$index}]['{$requiredKey}'] must be a non-empty string.";
             }
+            // The address itself, not just its type: PHPMailer trim()s before it validates, so
+            // "to@example.com\r\n" and " to@example.com" went out (to the trimmed address) while the
+            // documentation — and Validator::validateMail() — said they are refused.
+            if ($requiredKey === 'email' && !self::validateMail($entry['email'])) {
+                return "{$label}[{$index}]['email'] is not a valid e-mail address.";
+            }
             if (isset($entry['name']) && !is_string($entry['name'])) {
                 return "{$label}[{$index}]['name'] must be a string.";
             }
@@ -549,7 +560,7 @@ class Mailer {
      * @param string|null $secret The SMTP password, if any.
      * @return string
      */
-    private static function maskSecret(string $message, ?string $secret): string {
+    private static function maskSecret(string $message, #[\SensitiveParameter] ?string $secret): string {
         if ($secret === null || $secret === '') {
             return $message;
         }
