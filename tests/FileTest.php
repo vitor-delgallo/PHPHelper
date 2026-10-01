@@ -866,14 +866,28 @@ final class FileTest extends TestCase {
             'data/../../evil.txt' => 'pwned',
             'data/ok.txt' => 'fine',
         ]);
-        $dest = $this->path('out');
-        $escapeTarget = $this->path('evil.txt');
+        // Two levels deep, so that "data/../../evil.txt" lands INSIDE the scratch directory
+        // (<tmp>/a/evil.txt) where it can be asserted on and cleaned up. The old test used
+        // <tmp>/out and asserted on <tmp>/evil.txt — one level short of where the escape really
+        // went (the system temp directory), so that assertion could never fail.
+        $dest = $this->path('a', 'b', 'out');
+        $escapeTarget = $this->path('a', 'evil.txt');
 
         $result = File::unzipFile($zip, $dest, 'data');
 
-        $this->assertIsArray($result, 'A refused Zip Slip entry must be reported, not silently ignored.');
+        $this->assertSame(
+            ['data' . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . 'evil.txt'],
+            $result,
+            'Exactly the Zip Slip entry must be reported, not silently ignored.'
+        );
         $this->assertFileDoesNotExist($escapeTarget, 'A "../" entry must never be written outside the destination.');
         $this->assertSame('fine', file_get_contents($dest . DIRECTORY_SEPARATOR . 'ok.txt'), 'Safe siblings must still extract.');
+
+        // Nothing named evil.txt anywhere under the scratch directory — not even written-then-reported.
+        $iterator = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($this->tmp, \FilesystemIterator::SKIP_DOTS));
+        foreach ($iterator as $file) {
+            $this->assertNotSame('evil.txt', $file->getFilename(), 'The escaping entry was written at ' . $file->getPathname());
+        }
     }
 
     public function testUnzipFileReturnsTrueWhenNothingIsRequested(): void {

@@ -353,6 +353,12 @@ class File {
             return $realPath;
         }
 
+        // A UNC path is never resolved ABOVE its share: dirname("\\server\share") is "\\server"
+        // and then "\", which realpath() reads as the root of the CURRENT DRIVE — so a missing or
+        // unreachable share resolved to C:\server\share\... and, with createPath, got created
+        // there. The share is the floor; below it the path is kept as given (normalized).
+        $uncShare = self::uncShareRoot($path);
+
         $segments = [];
         $currentPath = $path;
         while ($currentPath !== "" && $currentPath !== ".") {
@@ -362,6 +368,10 @@ class File {
             }
 
             $parentPath = dirname($currentPath);
+            if ($uncShare !== null && strlen($parentPath) < strlen($uncShare)) {
+                break;
+            }
+
             $parentRealPath = realpath($parentPath);
             if ($parentRealPath !== false) {
                 return self::appendPathSegments($parentRealPath, $segments);
@@ -379,6 +389,20 @@ class File {
         }
 
         return self::normalizeResolvedPath($path);
+    }
+
+    /**
+     * The "\\server\share" root of a Windows UNC path, or null when $path is not one.
+     *
+     * @param string $path Path with the platform separator
+     * @return string|null
+     */
+    private static function uncShareRoot(string $path): ?string {
+        if (DIRECTORY_SEPARATOR !== "\\" || preg_match('/^\\\\\\\\([^\\\\]+)\\\\([^\\\\]+)/', $path, $m) !== 1) {
+            return null;
+        }
+
+        return "\\\\" . $m[1] . "\\" . $m[2];
     }
 
     /**
@@ -491,6 +515,45 @@ class File {
         }
 
         return $real === $root || str_starts_with($real . DIRECTORY_SEPARATOR, $root . DIRECTORY_SEPARATOR);
+    }
+
+    /**
+     * Device + inode of an existing path ("dev:ino"), or null when it does not exist or the
+     * platform reports no inode. Two names with the same identity are one file: a non-ASCII case
+     * variant on a case-insensitive volume, an 8.3 short name, a hard link.
+     *
+     * @param string $path Path (links are followed: the identity is the target's)
+     * @return string|null
+     */
+    private static function fileIdentity(string $path): ?string {
+        clearstatcache(true, $path);
+        $stat = @stat($path);
+        if ($stat === false || empty($stat['ino'])) {
+            return null;
+        }
+
+        return $stat['dev'] . ":" . $stat['ino'];
+    }
+
+    /**
+     * The identity (see fileIdentity()) of a directory that is NOT a link, or null when it is a
+     * link, is gone, is not a directory or reports no inode. The tree walkers compare it before
+     * every operation on the directory, so a link (or another directory) swapped into the
+     * directory's place while they run is noticed instead of followed.
+     *
+     * @param string $dir Directory path
+     * @return string|null
+     */
+    private static function walkableDirectoryIdentity(string $dir): ?string {
+        if (self::isLinkOrJunction($dir)) {
+            return null;
+        }
+        clearstatcache(true, $dir);
+        if (!is_dir($dir)) {
+            return null;
+        }
+
+        return self::fileIdentity($dir) ?? "no-inode";
     }
 
     /**
@@ -752,20 +815,37 @@ class File {
      * entered, and nothing is ever resolved through realpath() — the old iterator unlink()ed
      * getRealPath(), i.e. the TARGET of a file symlink, anywhere on the filesystem.
      *
+     * CONCURRENT CHANGES: every entry is addressed by its path, which the OS resolves again on
+     * each call, so a subdirectory that is replaced by a link WHILE the walk runs (by someone
+     * with write access to the tree) would redirect the remaining unlink()s to the link's target.
+     * $dir's identity (not a link, same device + inode) is therefore re-checked before every
+     * operation, which shrinks that window to the gap between the check and the call that follows
+     * it; PHP has no openat()/unlinkat(), so it cannot be closed. See deleteFoldersRecursively().
+     *
      * @param string $dir Existing directory, not itself a link
-     * @return bool TRUE if every entry was removed
+     * @return bool TRUE if every entry was removed; FALSE when something failed or $dir changed
+     *              identity midway (the walk stops where it is)
      */
     private static function removeDirectoryContents(string $dir): bool {
+        $dir = rtrim($dir, "\\/");
+        $identity = self::walkableDirectoryIdentity($dir);
+        if ($identity === null) {
+            return false;
+        }
+
         $entries = @scandir($dir);
         if ($entries === false) {
             return false;
         }
 
-        $dir = rtrim($dir, "\\/");
         $success = true;
         foreach ($entries as $entry) {
             if ($entry === "." || $entry === "..") {
                 continue;
+            }
+
+            if (self::walkableDirectoryIdentity($dir) !== $identity) {
+                return false;
             }
 
             $path = $dir . DIRECTORY_SEPARATOR . $entry;
@@ -788,6 +868,14 @@ class File {
      * only the link is removed and its target is left untouched — it used to be resolved first,
      * so deleting a link wiped the directory it pointed to. Links found inside the tree are
      * likewise removed as links, never walked.
+     *
+     * THREAT BOUNDARY: that guarantee is about the tree as it IS when each entry is examined.
+     * Another user who can write to the tree while this runs can swap a subdirectory for a link
+     * between the check and the delete (a TOCTOU race); the walk re-checks the directory's identity
+     * before every operation and stops when it changed, which narrows the window to microseconds
+     * but cannot close it in PHP. Do not run this with privileges over a tree that other users can
+     * write to (a shared /tmp, an upload folder owned by another account); run it as the owner of
+     * the tree, or on a directory only this process writes.
      *
      * @param string $dir Directory path to delete. A blank path is refused (it used to resolve to
      *                    the current working directory), and so is a filesystem root.
@@ -820,7 +908,9 @@ class File {
      *
      * The folder itself is KEPT: only its contents are removed, so its mode, owner, ACL and
      * identity survive. It used to be deleted and re-created with the DEFAULT mode, which silently
-     * widened a 0700 folder to 0755. Links inside it are removed as links, never followed.
+     * widened a 0700 folder to 0755. Links inside it are removed as links, never followed — with
+     * the same threat boundary as deleteFoldersRecursively(): a tree other users can write to
+     * concurrently is not a tree this can clean safely.
      *
      * @param string $dir Directory to be reset. Refused (FALSE, nothing touched) when blank, a
      *                    filesystem root, or itself a symlink/junction — emptying through a link
@@ -1223,6 +1313,36 @@ class File {
             return $verified[$relativeDirectory];
         }
 
+        $current = self::walkDirectoryInside($root, $relativeDirectory, $permissionMode, true);
+        if ($current === null) {
+            return null;
+        }
+
+        // The cache only saves the createDir() calls: extractZipEntry() re-walks the path (with
+        // directoryIsStillInside()) right before it writes, so the trust never outlives a check.
+        return $verified[$relativeDirectory] = $current;
+    }
+
+    /**
+     * Re-checks, with no cache, that $root/$relativeDirectory still has no link in it and still
+     * resolves inside $root — right before a write, so a link swapped in after the directory was
+     * first verified is caught.
+     *
+     * @param string $root Resolved extraction root
+     * @param string $relativeDirectory Normalized relative directory ("" for $root itself)
+     * @return bool
+     */
+    private static function directoryIsStillInside(string $root, string $relativeDirectory): bool {
+        return self::walkDirectoryInside($root, $relativeDirectory, null, false) !== null;
+    }
+
+    /**
+     * Walks $root/$relativeDirectory segment by segment, refusing a link at any level and (with
+     * $create) creating what is missing, then checks the result resolves inside $root.
+     *
+     * @return string|null The directory path, or NULL when it is unsafe, missing or could not be created
+     */
+    private static function walkDirectoryInside(string $root, string $relativeDirectory, ?string $permissionMode, bool $create): ?string {
         $current = $root;
         foreach (explode(DIRECTORY_SEPARATOR, $relativeDirectory) as $segment) {
             if ($segment === "") {
@@ -1233,7 +1353,8 @@ class File {
             if (self::isLinkOrJunction($current)) {
                 return null;
             }
-            if (!is_dir($current) && self::createDir($current, $permissionMode, false) < 0) {
+            clearstatcache(true, $current);
+            if (!is_dir($current) && (!$create || self::createDir($current, $permissionMode, false) < 0)) {
                 return null;
             }
         }
@@ -1243,7 +1364,7 @@ class File {
             return null;
         }
 
-        return $verified[$relativeDirectory] = $current;
+        return $current;
     }
 
     /**
@@ -1264,7 +1385,8 @@ class File {
     private static function extractZipEntry(\ZipArchive $zip, int $index, string $root, string $relativePath, ?string $permissionMode, array &$verified): bool {
         $slash = strrpos($relativePath, DIRECTORY_SEPARATOR);
         $leaf = $slash === false ? $relativePath : substr($relativePath, $slash + 1);
-        $parent = self::ensureDirectoryInside($root, $slash === false ? "" : substr($relativePath, 0, $slash), $permissionMode, $verified);
+        $relativeDirectory = $slash === false ? "" : substr($relativePath, 0, $slash);
+        $parent = self::ensureDirectoryInside($root, $relativeDirectory, $permissionMode, $verified);
         if ($parent === null) {
             return false;
         }
@@ -1277,6 +1399,14 @@ class File {
         $stat = $zip->statIndex($index);
         $input = $stat === false ? false : $zip->getStreamIndex($index);
         if ($input === false) {
+            return false;
+        }
+
+        // Re-walked WITHOUT the cache right before the temporary file is created (and again before
+        // the rename below): the directory was verified once, possibly long ago in a large
+        // extraction, and a link swapped into it since would receive the write.
+        if (!self::directoryIsStillInside($root, $relativeDirectory)) {
+            fclose($input);
             return false;
         }
 
@@ -1316,7 +1446,12 @@ class File {
             && $size === (int) $stat['size']
             && hash_final($hash) === sprintf('%08x', $stat['crc']);
 
-        if (!$success || !@rename($temporary, $target)) {
+        if (
+            !$success
+            || !self::directoryIsStillInside($root, $relativeDirectory)
+            || self::isLinkOrJunction($target)
+            || !@rename($temporary, $target)
+        ) {
             @unlink($temporary);
             return false;
         }
@@ -1337,9 +1472,18 @@ class File {
      * destination root ("..", absolute or drive-qualified), when it would be written THROUGH a
      * symlink or junction already present in the destination, when (on Windows) a segment is not
      * a plain file name — a device name such as NUL, an alternate data stream "a:b", a trailing
-     * '.' or ' ' — or when two different entries would land on the same file (e.g. two exact
-     * names with the same base name). Each entry is streamed and verified against its recorded
-     * size and CRC-32; a corrupt entry is a failure and never replaces an existing file.
+     * '.' or ' ' — or when two different entries would land on the same file: two exact names
+     * with the same base name, two names that differ only in case on a case-insensitive volume
+     * (ASCII or not: "Ä.txt" and "ä.txt"), or an 8.3 short name ("LONGFI~1.TXT") of a long name
+     * already extracted — the file written is identified by device + inode, not by its spelling.
+     * Each entry is streamed and verified against its recorded size and CRC-32; a corrupt entry is
+     * a failure and never replaces an existing file.
+     *
+     * THREAT BOUNDARY: the link checks describe the destination as it is when each entry is
+     * written (the path is re-verified, uncached, right before every write and rename). Another
+     * user who can write to the destination while the extraction runs can still swap a directory
+     * for a link in the microseconds between a check and the write — PHP cannot open relative to
+     * a directory handle. Extract into a directory other users cannot write to.
      *
      * @param string $zipPath Path to the .zip file
      * @param string $destinationPath Directory the entries are extracted into; created if missing.
@@ -1422,6 +1566,7 @@ class File {
 
         $errors = [];
         $written = [];  // target key => index of the entry that produced it
+        $identities = []; // "dev:ino" of every file this call wrote => index of the entry
         $verified = []; // directory cache for ensureDirectoryInside()
         $aborted = false;
         try {
@@ -1481,8 +1626,22 @@ class File {
                         continue;
                     }
 
+                    // Spellings the string comparison above cannot see — a non-ASCII case variant
+                    // on a case-insensitive volume, an 8.3 short name — still land on ONE file:
+                    // a target that already IS a file this call wrote is a collision too.
+                    $target = $destinationRoot . DIRECTORY_SEPARATOR . $relativePath;
+                    $existing = (is_file($target) && !is_link($target)) ? self::fileIdentity($target) : null;
+                    if ($existing !== null && isset($identities[$existing]) && $identities[$existing] !== $i) {
+                        $errors[$i] = $filename;
+                        continue;
+                    }
+
                     if (self::extractZipEntry($zip, $i, $destinationRoot, $relativePath, $permissionMode, $verified)) {
                         $written[$targetKey] = $i;
+                        $identity = self::fileIdentity($target);
+                        if ($identity !== null) {
+                            $identities[$identity] = $i;
+                        }
                     } else {
                         $errors[$i] = $filename;
                     }
@@ -1573,11 +1732,31 @@ class File {
     }
 
     /**
+     * Largest file writeZipArchive() reads into memory itself (so that what it checked is what it
+     * archives), and the most it buffers per archive; bigger or later files go through
+     * ZipArchive::addFile(), which libzip reads from the PATH when the archive is closed.
+     *
+     * @var int
+     */
+    private const ZIP_BUFFERED_FILE_BYTES = 4194304;   // 4 MiB
+    private const ZIP_BUFFERED_TOTAL_BYTES = 33554432; // 32 MiB
+
+    /**
      * Writes a zip archive through a temporary sibling, replacing $outputFile only on success.
      *
      * ZipArchive::CREATE alone OPENS an existing archive and adds to it, so re-running a backup to
      * the same path kept every entry since deleted from the source. The archive is now always built
      * fresh, and a failure leaves any previous archive at $outputFile untouched.
+     *
+     * WHAT IS CHECKED IS WHAT IS ARCHIVED, as far as PHP allows. ZipArchive::addFile() records a
+     * path and libzip only opens it at close(), long after the caller's link check: a file swapped
+     * for a symlink in between (by someone who can write to the source tree) was read through the
+     * link and its target archived. Each source is therefore opened here, verified to be a regular
+     * file and the same inode the directory entry names, and — up to ZIP_BUFFERED_FILE_BYTES per
+     * file and ZIP_BUFFERED_TOTAL_BYTES per archive, to bound memory — its CONTENT is handed to
+     * libzip (addFromString). Larger files use addFile() with FL_OPEN_FILE_NOW where PHP has it
+     * (8.3+), so libzip opens them immediately; on older PHP the window between this check and
+     * libzip's open remains for those files only. See zipDirectory() for the threat boundary.
      *
      * @param string $outputFile Final archive path
      * @param array<string, string> $files Entry name => source file
@@ -1600,8 +1779,30 @@ class File {
         foreach ($directories as $name => $unused) {
             $success = $zip->addEmptyDir((string) $name) && $success;
         }
+
+        $buffered = 0;
+        $addFileFlags = \ZipArchive::FL_OVERWRITE | (defined('ZipArchive::FL_OPEN_FILE_NOW') ? \ZipArchive::FL_OPEN_FILE_NOW : 0);
         foreach ($files as $name => $source) {
-            $success = $zip->addFile($source, (string) $name) && $success;
+            $fp = self::openRegularFileForArchive($source);
+            if ($fp === null) {
+                $success = false;
+                break;
+            }
+
+            $size = (int) (fstat($fp)['size'] ?? -1);
+            if ($size >= 0 && $size <= self::ZIP_BUFFERED_FILE_BYTES && $buffered + $size <= self::ZIP_BUFFERED_TOTAL_BYTES) {
+                $content = stream_get_contents($fp);
+                fclose($fp);
+                if ($content === false || strlen($content) !== $size) {
+                    $success = false;
+                    break;
+                }
+                $buffered += $size;
+                $success = $zip->addFromString((string) $name, $content) && $success;
+            } else {
+                fclose($fp);
+                $success = $zip->addFile($source, (string) $name, 0, 0, $addFileFlags) && $success;
+            }
         }
         if (!$success) {
             $zip->unchangeAll();
@@ -1618,12 +1819,50 @@ class File {
     }
 
     /**
+     * Opens $source for the archive writer: a regular file, not a link, and — after the open —
+     * the very inode the directory entry names, so a link swapped in between is not read through.
+     *
+     * @param string $source Path listed by zipDirectory()/zipMultipleFiles()
+     * @return resource|null Handle opened for reading, or null when the file must not be archived
+     */
+    private static function openRegularFileForArchive(string $source) {
+        clearstatcache(true, $source);
+        $entry = @lstat($source);
+        if ($entry === false || is_link($source) || !is_file($source) || self::isLinkOrJunction($source)) {
+            return null;
+        }
+
+        $fp = @fopen($source, "rb");
+        if ($fp === false) {
+            return null;
+        }
+
+        $opened = @fstat($fp);
+        if (
+            $opened === false
+            || (!empty($entry['ino']) && !empty($opened['ino']) && ($entry['ino'] !== $opened['ino'] || $entry['dev'] !== $opened['dev']))
+        ) {
+            fclose($fp);
+            return null;
+        }
+
+        return $fp;
+    }
+
+    /**
      * Compresses a folder into a .zip file, with the option to include or exclude the root folder.
      *
      * The archive is built FRESH: an existing archive at the output path is replaced (only once the
      * new one is complete), never appended to. Symlinks and junctions inside $source are SKIPPED —
      * following them put files from outside $source into the archive — and so is the output
      * archive itself when it lives inside $source. A link passed AS $source is followed.
+     *
+     * THREAT BOUNDARY: "skipped" describes the tree as it is when it is listed and when each file
+     * is opened for the archive (see writeZipArchive(): small files are read right after that
+     * check; large ones are opened by libzip at once on PHP 8.3+, or at close() on older PHP).
+     * Another user who can write to $source while this runs can still, in that window, replace a
+     * listed file with a link to something outside the tree and have it archived. Zip only trees
+     * other users cannot write to concurrently.
      *
      * @param string $source Directory path to be zipped. A filesystem root is refused.
      * @param string $outputPath Destination path for the .zip file. A directory (or a path without

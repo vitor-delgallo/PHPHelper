@@ -336,22 +336,57 @@ final class FileHardeningTest extends TestCase {
     }
 
     /**
-     * The umask is process-wide. createDir() sets it to 0 around mkdir(); a ValueError thrown by
-     * mkdir() used to skip the restore, leaving every file the process created afterwards
-     * world-writable.
+     * A NUL byte is refused BEFORE the umask is touched (mkdir() would throw a ValueError on it,
+     * and it used to escape with the umask still at 0).
      */
-    public function testCreateDirRestoresTheUmaskWhenMkdirWouldThrow(): void {
+    public function testCreateDirRejectsANulByteBeforeTouchingTheUmask(): void {
         $previous = umask(0o022);
         try {
             if (umask() !== 0o022) {
                 $this->markTestSkipped('umask() is not honoured on this platform (Windows ZTS keeps it at 0).');
             }
 
-            File::createDir($this->path("a\0b"));
+            $this->assertSame(-2, File::createDir($this->path("a\0b")));
 
             $this->assertSame(0o022, umask(), 'createDir() must leave the process umask as it found it.');
         } finally {
             umask($previous);
+        }
+    }
+
+    /**
+     * The umask is process-wide. createDir() sets it to 0 around mkdir(), and a THROW out of
+     * mkdir() — here a strict error handler turning its warning into an exception, as frameworks
+     * do — must still restore it: otherwise every file the process creates afterwards is
+     * world-writable. (The NUL-byte test above never reaches mkdir(), so it never exercised this.)
+     */
+    public function testCreateDirRestoresTheUmaskWhenMkdirThrows(): void {
+        if (PHP_OS_FAMILY === 'Windows') {
+            $this->markTestSkipped('umask() is not honoured on Windows.');
+        }
+        if (function_exists('posix_geteuid') && posix_geteuid() === 0) {
+            $this->markTestSkipped('Running as root: mkdir() in a read-only directory succeeds.');
+        }
+
+        $locked = $this->seedDir('locked');
+        chmod($locked, 0555);
+        $previous = umask(0o022);
+        set_error_handler(static function (int $errno, string $message): bool {
+            throw new \ErrorException($message, 0, $errno);
+        });
+        try {
+            try {
+                File::createDir($locked . DIRECTORY_SEPARATOR . 'child');
+                $this->fail('Premise: the strict handler must turn the mkdir() warning into an exception.');
+            } catch (\ErrorException $e) {
+                $this->assertStringContainsString('mkdir', $e->getMessage());
+            }
+
+            $this->assertSame(0o022, umask(), 'createDir() must restore the umask even when mkdir() throws.');
+        } finally {
+            restore_error_handler();
+            umask($previous);
+            chmod($locked, 0755);
         }
     }
 
@@ -1114,6 +1149,75 @@ final class FileHardeningTest extends TestCase {
         $zip = $this->makeZip($this->path('e.zip'), ['data/r.txt' => 'R']);
 
         $this->assertTrue(File::unzipFile($zip, $this->path('dest'), ['data', 'data/r.txt']));
+    }
+
+    /**
+     * The collision check used to compare strtolower()ed names, which folds ASCII only: "Ä.txt"
+     * and "ä.txt" compared different, both were extracted, and NTFS — which folds them — kept
+     * only the second, silently. The file written is identified by device + inode now.
+     */
+    #[RequiresOperatingSystemFamily('Windows')]
+    public function testUnzipFileReportsANonAsciiCaseCollisionOnACaseInsensitiveVolume(): void {
+        $dest = $this->seedDir('dest');
+        file_put_contents($dest . DIRECTORY_SEPARATOR . 'Ä.probe', 'x');
+        $folds = file_exists($dest . DIRECTORY_SEPARATOR . 'ä.probe');
+        unlink($dest . DIRECTORY_SEPARATOR . 'Ä.probe');
+        if (!$folds) {
+            $this->markTestSkipped('This directory is case-sensitive.');
+        }
+        $zip = $this->makeZip($this->path('c.zip'), ['data/Ä.txt' => 'FIRST', 'data/ä.txt' => 'SECOND']);
+
+        $result = File::unzipFile($zip, $dest, 'data');
+
+        $this->assertSame(['data' . DIRECTORY_SEPARATOR . 'ä.txt'], $result, 'The second spelling must be reported as a collision.');
+        $this->assertSame('FIRST', file_get_contents($dest . DIRECTORY_SEPARATOR . 'Ä.txt'), 'The first entry must survive.');
+        $this->assertCount(1, $this->entriesIn($dest));
+    }
+
+    /**
+     * An entry named with the 8.3 short name of a long name extracted just before it ("LONGFI~1.TXT"
+     * for "longfilename-report.txt") is the same file to NTFS: it overwrote the long name and the
+     * call reported TRUE.
+     */
+    #[RequiresOperatingSystemFamily('Windows')]
+    public function testUnzipFileReportsAnEntryThatIsThe83AliasOfAFileItJustWrote(): void {
+        $probeDir = $this->seedDir('probe');
+        file_put_contents($probeDir . DIRECTORY_SEPARATOR . 'longfilename-report.txt', 'x');
+        exec('cmd /c for %I in (' . escapeshellarg($probeDir . DIRECTORY_SEPARATOR . 'longfilename-report.txt') . ') do @echo %~snxI', $output, $code);
+        $alias = trim(implode('', $output));
+        if ($code !== 0 || $alias === '' || strcasecmp($alias, 'longfilename-report.txt') === 0) {
+            $this->markTestSkipped('8.3 short names are not generated on this volume.');
+        }
+        $this->assertSame('LONGFI~1.TXT', strtoupper($alias), 'Premise: the first long name in a fresh directory gets ~1.');
+
+        $dest = $this->seedDir('dest');
+        $zip = $this->makeZip($this->path('s.zip'), ['data/longfilename-report.txt' => 'FIRST', 'data/LONGFI~1.TXT' => 'SECOND']);
+
+        $result = File::unzipFile($zip, $dest, 'data');
+
+        $this->assertSame(['data' . DIRECTORY_SEPARATOR . 'LONGFI~1.TXT'], $result, 'The alias must be reported as a collision.');
+        $this->assertSame('FIRST', file_get_contents($dest . DIRECTORY_SEPARATOR . 'longfilename-report.txt'));
+        $this->assertSame(['longfilename-report.txt'], $this->entriesIn($dest));
+    }
+
+    /**
+     * REGRESSION: getPathInfo() climbed a UNC path above its share — dirname("\\server\share") is
+     * "\\server", then "\" — and realpath("\") is the root of the CURRENT DRIVE, so a path on an
+     * unreachable share resolved to C:\server\share\... and, with createPath, was CREATED there:
+     * a backup aimed at a NAS that was down landed on the local disk. The share is now the floor.
+     */
+    #[RequiresOperatingSystemFamily('Windows')]
+    public function testAnUnreachableUncShareIsNeverResolvedOntoTheLocalDrive(): void {
+        $share = '\\\\localhost\\phphelper-no-such-share-' . bin2hex(random_bytes(4));
+        $localGhost = substr(getcwd(), 0, 2) . '\\localhost\\' . basename($share);
+
+        $info = File::getPathInfo($share . '\\backups\\db.sql', keepFileNotExists: true, createPath: true);
+
+        $this->assertSame($share . '\\backups\\', $info['dir']);
+        $this->assertSame($share . '\\backups\\db.sql', $info['path']);
+        $this->assertFalse($info['exists']);
+        $this->assertDirectoryDoesNotExist($localGhost, 'The share must not be re-rooted on the local drive.');
+        $this->assertDirectoryDoesNotExist(substr(getcwd(), 0, 2) . '\\' . basename($share));
     }
 
     public function testUnzipFileNormalisesDotSegments(): void {
