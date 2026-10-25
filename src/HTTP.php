@@ -673,9 +673,14 @@ class HTTP {
      *     the "original client" — is whatever the client itself chose to send.
      *  3. HTTP_CLIENT_IP, in header order.
      * Each value is split on ',', trimmed, validated with FILTER_VALIDATE_IP and de-duplicated
-     * (first occurrence wins). Entries that are not syntactically valid IP addresses — including
-     * an address with a ":port" suffix — are DROPPED, so the result may legitimately be empty (it
-     * always is under the CLI SAPI, where none of these keys exist).
+     * (first occurrence wins). An X-Forwarded-For entry may carry the port some proxies append
+     * ("203.0.113.7:4711", "[2001:db8::1]:443"): the address is kept, the port dropped. Entries
+     * that are not syntactically valid IP addresses are DROPPED, so the result may legitimately be
+     * empty (it always is under the CLI SAPI, where none of these keys exist).
+     *
+     * BEHAVIOUR CHANGE (2.3): an X-Forwarded-For entry with a port used to be dropped. Behind a
+     * proxy that writes ports (IIS ARR, Azure App Service), every entry after it moved one place
+     * up, so the "index N" rule below picked an entry the CLIENT had written.
      *
      * BEHAVIOUR CHANGE: this used to return the client-controlled headers FIRST (Client-IP, then
      * X-Forwarded-For left to right, then REMOTE_ADDR), so the natural `$ips[0]` was attacker-chosen
@@ -684,7 +689,9 @@ class HTTP {
      *
      * SECURITY: entries after the first are still only as trustworthy as the proxies in front of
      * you. Behind N trusted reverse proxies, the real client is the entry at index N; anything
-     * beyond that was supplied by the client.
+     * beyond that was supplied by the client. Counting is fragile, though: a proxy that writes
+     * something unreadable, or the de-duplication, still shifts the indices. For the one address
+     * a rate limit or a log should use, call getClientIp() with the proxies you trust instead.
      *
      * @return array<int, string> Unique, syntactically valid IP addresses, in the order described
      *                            above. Possibly empty.
@@ -712,8 +719,8 @@ class HTTP {
             }
 
             foreach ($candidates as $candidate) {
-                $candidate = trim($candidate);
-                if ($candidate === '' || filter_var($candidate, FILTER_VALIDATE_IP) === false) {
+                $candidate = $rightToLeft ? self::forwardedHop($candidate) : trim($candidate);
+                if ($candidate === null || filter_var($candidate, FILTER_VALIDATE_IP) === false) {
                     continue;
                 }
                 if (in_array($candidate, $ipList, true)) {
@@ -725,6 +732,194 @@ class HTTP {
         }
 
         return $ipList;
+    }
+
+    /**
+     * One X-Forwarded-For entry as a bare address: "203.0.113.7" and "2001:db8::1" as they are, and
+     * the forms with the port some proxies append — "203.0.113.7:4711", "[2001:db8::1]:443" and
+     * "[2001:db8::1]" — without it. NULL for anything else, including a port above 65535 and an
+     * IPv4 address in brackets.
+     */
+    private static function forwardedHop(string $hop): ?string {
+        $hop = trim($hop);
+        if (filter_var($hop, FILTER_VALIDATE_IP) !== false) {
+            return $hop;
+        }
+
+        if (preg_match('/^\[([0-9A-Fa-f:.]+)\](?::(\d{1,5}))?$/', $hop, $match) === 1) {
+            $address = $match[1];
+            $flag = FILTER_FLAG_IPV6;
+        } elseif (preg_match('/^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$/', $hop, $match) === 1) {
+            $address = $match[1];
+            $flag = FILTER_FLAG_IPV4;
+        } else {
+            return null;
+        }
+        $port = $match[2] ?? '';
+        if ($port !== '' && (int) $port > 65535) {
+            return null;
+        }
+
+        return filter_var($address, FILTER_VALIDATE_IP, $flag) !== false ? $address : null;
+    }
+
+    /**
+     * The ONE address of the client a rate limit or an audit log should use: REMOTE_ADDR, unless
+     * the connection comes from one of $trustedProxies. Then X-Forwarded-For is read from the
+     * RIGHT — each proxy APPENDS the address it received the request from —, every hop that is
+     * itself a trusted proxy is skipped, and the first one left is the client. What lies to the
+     * left of it was written by the client itself and is never read, whatever it holds.
+     *
+     * - A hop may carry the port some proxies append ("203.0.113.7:4711", "[2001:db8::1]:443"):
+     *   the address is used, the port dropped. A hop that has to be read (from the right up to
+     *   the client) and is not an address ("unknown", an empty entry, a hostname) makes the whole
+     *   header unusable: REMOTE_ADDR is returned.
+     * - When every hop is a trusted proxy, the leftmost one is the client: it was written by the
+     *   first proxy, which saw the connection. So list your PROXIES, not whole networks that also
+     *   hold clients: a client inside a trusted range is taken for a proxy and skipped.
+     * - An IPv4 address mapped into IPv6 ("::ffff:10.0.0.1") matches IPv4 ranges (ipInRange()).
+     * - Only X-Forwarded-For is read: not Client-IP, not Forwarded.
+     *
+     * getClientIpAddresses() lists every candidate instead and leaves the choice to the caller.
+     * Reading X-Forwarded-For from the LEFT (its "original client") is the classic mistake: one
+     * forged header is then enough to dodge an IP rate limit or plant an address in a log.
+     *
+     * @param string|array<int, string>|null $trustedProxies The proxies in front of the site: IPs
+     *        and CIDR blocks, IPv4 or IPv6, as a list or as one comma-separated string (the usual
+     *        TRUSTED_PROXIES setting). "*" trusts every CONNECTION, whatever REMOTE_ADDR is: only
+     *        for a site that is reached EXCLUSIVELY through a proxy that writes X-Forwarded-For
+     *        itself. It does not make the addresses in the header trusted: the rightmost hop that
+     *        is not in one of the other entries is the client. Entries that are not an address or
+     *        a block are ignored. NULL, "" or []: no proxy is trusted, and the answer is
+     *        REMOTE_ADDR.
+     * @return string|null The address as REMOTE_ADDR or the header spells it; NULL when
+     *        REMOTE_ADDR is missing or not an IP address (the CLI SAPI, a Unix socket).
+     */
+    public static function getClientIp(string|array|null $trustedProxies = null): ?string {
+        $remote = $_SERVER['REMOTE_ADDR'] ?? null;
+        if (!is_string($remote) || filter_var(trim($remote), FILTER_VALIDATE_IP) === false) {
+            return null;
+        }
+        $remote = trim($remote);
+
+        // "*" trusts the CONNECTION only. Were it also to make every hop of the header a trusted
+        // proxy, every hop would be skipped and the leftmost one — the client's own text — would
+        // be the answer.
+        $ranges = self::proxyRanges($trustedProxies);
+        $trustsEveryConnection = in_array('*', $ranges, true);
+        $ranges = array_values(array_diff($ranges, ['*']));
+        if (!$trustsEveryConnection && !self::isTrustedProxy($remote, $ranges)) {
+            return $remote;
+        }
+
+        $header = $_SERVER['HTTP_X_FORWARDED_FOR'] ?? null;
+        if (!is_string($header) || trim($header) === '') {
+            return $remote;
+        }
+
+        $client = $remote;
+        foreach (array_reverse(explode(',', $header)) as $hop) {
+            $hop = self::forwardedHop($hop);
+            if ($hop === null) {
+                return $remote;
+            }
+            $client = $hop;
+            if (!self::isTrustedProxy($hop, $ranges)) {
+                return $hop;
+            }
+        }
+
+        return $client;
+    }
+
+    /**
+     * Whether $ip is $range: one address ("203.0.113.9", "2001:db8::1") or a CIDR block
+     * ("10.0.0.0/8", "2001:db8::/32"). Both are compared as IPv6, with IPv4 mapped into
+     * ::ffff:0:0/96, so "::ffff:10.0.0.1" is in "10.0.0.0/8" and "10.0.0.1" is in
+     * "::ffff:10.0.0.0/104"; an IPv6 address is never in an IPv4 block. "::/0" holds every address.
+     *
+     * FALSE for anything that is not an address or a block: a hostname, a prefix longer than the
+     * family allows ("10.0.0.0/33"), a prefix that is not a plain number ("/x", "/", "/+8").
+     */
+    public static function ipInRange(string $ip, string $range): bool {
+        $ipBinary = self::ipAs16Bytes($ip);
+        [$network, $prefix] = array_pad(explode('/', trim($range), 2), 2, null);
+        $networkBinary = self::ipAs16Bytes((string) $network);
+        if ($ipBinary === null || $networkBinary === null) {
+            return false;
+        }
+
+        $isIpv4 = filter_var(trim((string) $network), FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false;
+        $maxBits = $isIpv4 ? 32 : 128;
+        if ($prefix === null) {
+            $bits = $maxBits;
+        } elseif (ctype_digit($prefix) && strlen($prefix) <= 3 && (int) $prefix <= $maxBits) {
+            $bits = (int) $prefix;
+        } else {
+            return false;
+        }
+        if ($isIpv4) {
+            $bits += 96;
+        }
+
+        $fullBytes = intdiv($bits, 8);
+        if (substr($ipBinary, 0, $fullBytes) !== substr($networkBinary, 0, $fullBytes)) {
+            return false;
+        }
+        $remainder = $bits % 8;
+        if ($remainder === 0) {
+            return true;
+        }
+        $mask = (0xFF << (8 - $remainder)) & 0xFF;
+
+        return (ord($ipBinary[$fullBytes]) & $mask) === (ord($networkBinary[$fullBytes]) & $mask);
+    }
+
+    /** An address as 16 bytes, IPv4 mapped into ::ffff:0:0/96; NULL for anything else. */
+    private static function ipAs16Bytes(string $ip): ?string {
+        $ip = trim($ip);
+        if (filter_var($ip, FILTER_VALIDATE_IP) === false) {
+            return null;
+        }
+        $packed = inet_pton($ip);
+        if ($packed === false) {
+            return null;
+        }
+
+        return strlen($packed) === 4 ? str_repeat("\0", 10) . "\xff\xff" . $packed : $packed;
+    }
+
+    /**
+     * The entries of a trusted-proxy setting, trimmed, empty ones dropped.
+     *
+     * @param string|array<int, string>|null $trustedProxies
+     * @return array<int, string>
+     */
+    private static function proxyRanges(string|array|null $trustedProxies): array {
+        if ($trustedProxies === null) {
+            return [];
+        }
+        $entries = is_string($trustedProxies) ? explode(',', $trustedProxies) : $trustedProxies;
+
+        $ranges = [];
+        foreach ($entries as $entry) {
+            if (is_string($entry) && trim($entry) !== '') {
+                $ranges[] = trim($entry);
+            }
+        }
+
+        return $ranges;
+    }
+
+    /** @param array<int, string> $ranges IPs and CIDR blocks; "*" is handled by the caller. */
+    private static function isTrustedProxy(string $ip, array $ranges): bool {
+        foreach ($ranges as $range) {
+            if (self::ipInRange($ip, $range)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**

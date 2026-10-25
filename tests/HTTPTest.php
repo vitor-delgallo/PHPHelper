@@ -1228,7 +1228,8 @@ final class HTTPTest extends TestCase
 
         $ips = HTTP::getClientIpAddresses();
 
-        self::assertSame(['203.0.113.7'], $ips);
+        // The port is dropped, the address kept (it used to be dropped whole); "not-an-ip" goes.
+        self::assertSame(['198.51.100.2', '203.0.113.7'], $ips);
         foreach ($ips as $ip) {
             self::assertNotFalse(filter_var($ip, FILTER_VALIDATE_IP), 'Every element must be a real IP.');
         }
@@ -1267,6 +1268,186 @@ final class HTTPTest extends TestCase
 
         $_SERVER = ['REMOTE_ADDR' => '', 'HTTP_X_FORWARDED_FOR' => ' , , ', 'HTTP_CLIENT_IP' => ['1.1.1.1']];
         self::assertSame([], HTTP::getClientIpAddresses());
+    }
+
+    /**
+     * BEHAVIOUR CHANGE (2.3): proxies such as IIS ARR append "address:port". Such an entry used
+     * to be dropped, which moved every entry after it one place up: behind one such proxy, index 1
+     * — "the client" by the documented rule — became an entry the client had written itself.
+     */
+    public function testGetClientIpAddressesKeepsTheAddressOfAForwardedEntryWithAPort(): void
+    {
+        $_SERVER = [
+            'REMOTE_ADDR' => '10.0.0.1',
+            'HTTP_X_FORWARDED_FOR' => '6.6.6.6, 203.0.113.7:4711',
+        ];
+
+        self::assertSame(['10.0.0.1', '203.0.113.7', '6.6.6.6'], HTTP::getClientIpAddresses());
+
+        $_SERVER = ['HTTP_X_FORWARDED_FOR' => '[2001:db8::2], [2001:db8::1]:443'];
+
+        self::assertSame(['2001:db8::1', '2001:db8::2'], HTTP::getClientIpAddresses());
+    }
+
+    public function testGetClientIpAddressesStillDropsMalformedPortForms(): void
+    {
+        $_SERVER = ['HTTP_X_FORWARDED_FOR' => '203.0.113.7:99999, [203.0.113.8]:80, 203.0.113.9:, [2001:db8::1]x, 203.0.113.10:80:80'];
+
+        self::assertSame([], HTTP::getClientIpAddresses());
+    }
+
+    // ------------------------------------------------------------------ getClientIp
+
+    public function testGetClientIpIsRemoteAddrWhenNoProxyIsTrusted(): void
+    {
+        $_SERVER = ['REMOTE_ADDR' => '198.51.100.2', 'HTTP_X_FORWARDED_FOR' => '6.6.6.6'];
+
+        self::assertSame('198.51.100.2', HTTP::getClientIp());
+        self::assertSame('198.51.100.2', HTTP::getClientIp(''));
+        self::assertSame('198.51.100.2', HTTP::getClientIp([]));
+        self::assertSame('198.51.100.2', HTTP::getClientIp('10.0.0.0/8'), 'REMOTE_ADDR is not a trusted proxy');
+    }
+
+    /**
+     * Behind a trusted proxy the header is read from the RIGHT: the leftmost entry is what the
+     * client sent, and a forged one must never become the answer.
+     */
+    public function testGetClientIpReadsForwardedForFromTheRightAndNeverTakesTheForgedLeft(): void
+    {
+        $_SERVER = ['REMOTE_ADDR' => '10.0.0.1', 'HTTP_X_FORWARDED_FOR' => '6.6.6.6, 203.0.113.7'];
+
+        self::assertSame('203.0.113.7', HTTP::getClientIp('10.0.0.1'));
+    }
+
+    public function testGetClientIpSkipsEveryTrustedHop(): void
+    {
+        $_SERVER = ['REMOTE_ADDR' => '10.0.0.1', 'HTTP_X_FORWARDED_FOR' => '6.6.6.6, 203.0.113.7, 10.0.0.2, 10.9.8.7'];
+
+        self::assertSame('203.0.113.7', HTTP::getClientIp(['10.0.0.0/8']));
+    }
+
+    public function testGetClientIpTakesACommaSeparatedSettingWithIpv6Blocks(): void
+    {
+        $_SERVER = ['REMOTE_ADDR' => '2001:db8:ffff::5', 'HTTP_X_FORWARDED_FOR' => '198.51.100.9'];
+
+        self::assertSame('198.51.100.9', HTTP::getClientIp(' 192.0.2.1 , 2001:db8:ffff::/48 ,'));
+    }
+
+    /**
+     * "*" trusts the connection, not the header. Found while writing this: when "*" also made
+     * every hop a trusted proxy, every hop was skipped and the forged leftmost entry came back.
+     */
+    public function testGetClientIpTrustsEveryConnectionWithAStarButNotTheHeader(): void
+    {
+        $_SERVER = ['REMOTE_ADDR' => '172.16.5.4', 'HTTP_X_FORWARDED_FOR' => '6.6.6.6, 198.51.100.9'];
+
+        self::assertSame('198.51.100.9', HTTP::getClientIp('*'));
+
+        $_SERVER['HTTP_X_FORWARDED_FOR'] = '6.6.6.6, 198.51.100.9, 10.0.0.2';
+
+        self::assertSame('198.51.100.9', HTTP::getClientIp('*, 10.0.0.0/8'), 'listed proxies are still skipped');
+    }
+
+    public function testGetClientIpUsesTheAddressOfAHopWithAPort(): void
+    {
+        $_SERVER = ['REMOTE_ADDR' => '10.0.0.1', 'HTTP_X_FORWARDED_FOR' => '[2001:db8::7]:51234'];
+
+        self::assertSame('2001:db8::7', HTTP::getClientIp('10.0.0.1'));
+    }
+
+    /** An unreadable hop on the proxies' side of the chain makes the header unusable. */
+    public function testGetClientIpFallsBackToRemoteAddrOnAnUnreadableHop(): void
+    {
+        $_SERVER = ['REMOTE_ADDR' => '10.0.0.1', 'HTTP_X_FORWARDED_FOR' => '203.0.113.7, unknown'];
+
+        self::assertSame('10.0.0.1', HTTP::getClientIp('10.0.0.1'));
+    }
+
+    /** What lies to the left of the client is the client's own text, and is never read. */
+    public function testGetClientIpNeverReadsPastTheClient(): void
+    {
+        $_SERVER = ['REMOTE_ADDR' => '10.0.0.1', 'HTTP_X_FORWARDED_FOR' => 'garbage, , 203.0.113.7'];
+
+        self::assertSame('203.0.113.7', HTTP::getClientIp('10.0.0.1'));
+    }
+
+    public function testGetClientIpTakesTheLeftmostHopWhenEveryHopIsTrusted(): void
+    {
+        $_SERVER = ['REMOTE_ADDR' => '10.0.0.1', 'HTTP_X_FORWARDED_FOR' => '10.0.0.7, 10.0.0.2'];
+
+        self::assertSame('10.0.0.7', HTTP::getClientIp('10.0.0.0/8'));
+    }
+
+    public function testGetClientIpMatchesAMappedRemoteAddrAgainstAnIpv4Block(): void
+    {
+        $_SERVER = ['REMOTE_ADDR' => '::ffff:10.0.0.1', 'HTTP_X_FORWARDED_FOR' => '203.0.113.7'];
+
+        self::assertSame('203.0.113.7', HTTP::getClientIp('10.0.0.0/8'));
+    }
+
+    public function testGetClientIpIsRemoteAddrWhenTrustedButWithoutTheHeader(): void
+    {
+        $_SERVER = ['REMOTE_ADDR' => '10.0.0.1'];
+
+        self::assertSame('10.0.0.1', HTTP::getClientIp('10.0.0.1'));
+    }
+
+    public function testGetClientIpIgnoresSettingEntriesThatAreNotAddresses(): void
+    {
+        $_SERVER = ['REMOTE_ADDR' => '10.0.0.1', 'HTTP_X_FORWARDED_FOR' => '6.6.6.6'];
+
+        self::assertSame('10.0.0.1', HTTP::getClientIp('proxy.local, 10.0.0.0/33, 10.0.0.0/x'));
+    }
+
+    public function testGetClientIpIsNullWithoutAUsableRemoteAddr(): void
+    {
+        $_SERVER = ['HTTP_X_FORWARDED_FOR' => '203.0.113.7'];
+        self::assertNull(HTTP::getClientIp('*'));
+
+        $_SERVER = ['REMOTE_ADDR' => 'unix:', 'HTTP_X_FORWARDED_FOR' => '203.0.113.7'];
+        self::assertNull(HTTP::getClientIp('*'));
+
+        $_SERVER = ['REMOTE_ADDR' => ['10.0.0.1']];
+        self::assertNull(HTTP::getClientIp());
+    }
+
+    // ------------------------------------------------------------------ ipInRange
+
+    /** @return array<string, array{0: string, 1: string, 2: bool}> */
+    public static function ipRangeCases(): array
+    {
+        return [
+            'ipv4 in /8'                   => ['10.1.2.3', '10.0.0.0/8', true],
+            'ipv4 outside /8'              => ['11.0.0.1', '10.0.0.0/8', false],
+            'ipv4 single, same'            => ['10.0.0.1', '10.0.0.1', true],
+            'ipv4 single, other'           => ['10.0.0.2', '10.0.0.1', false],
+            'ipv4 /25 upper half'          => ['192.0.2.130', '192.0.2.128/25', true],
+            'ipv4 /25 lower half'          => ['192.0.2.127', '192.0.2.128/25', false],
+            'ipv4 /0'                      => ['203.0.113.9', '0.0.0.0/0', true],
+            'ipv6 in /32'                  => ['2001:db8::1', '2001:db8::/32', true],
+            'ipv6 outside /32'             => ['2001:db9::1', '2001:db8::/32', false],
+            'ipv6 single, other spelling'  => ['2001:DB8:0::1', '2001:db8::1', true],
+            'mapped address, ipv4 block'   => ['::ffff:10.0.0.1', '10.0.0.0/8', true],
+            'ipv4 address, mapped block'   => ['10.0.0.1', '::ffff:10.0.0.0/104', true],
+            'ipv6 address, ipv4 block'     => ['2001:db8::1', '10.0.0.0/8', false],
+            'ipv6 address, ipv4 /0'        => ['2001:db8::1', '0.0.0.0/0', false],
+            'ipv4 address, ipv6 block'     => ['10.0.0.1', '2001:db8::/32', false],
+            'any address in ::/0'          => ['10.0.0.1', '::/0', true],
+            'ipv4 prefix too long'         => ['10.0.0.1', '10.0.0.0/33', false],
+            'ipv6 prefix too long'         => ['2001:db8::1', '2001:db8::/129', false],
+            'empty prefix'                 => ['10.0.0.1', '10.0.0.0/', false],
+            'prefix not a number'          => ['10.0.0.1', '10.0.0.0/x', false],
+            'prefix with a sign'           => ['10.0.0.1', '10.0.0.0/+8', false],
+            'hostname as range'            => ['10.0.0.1', 'localhost', false],
+            'hostname as address'          => ['localhost', '10.0.0.0/8', false],
+            'spaces around'                => [' 10.0.0.1 ', ' 10.0.0.0/8 ', true],
+        ];
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('ipRangeCases')]
+    public function testIpInRange(string $ip, string $range, bool $expected): void
+    {
+        self::assertSame($expected, HTTP::ipInRange($ip, $range));
     }
 
     // ------------------------------------------------------- getBrowserLanguage

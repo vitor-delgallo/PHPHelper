@@ -342,6 +342,14 @@ Argon2id via `password_hash`/`password_verify`. Never use the encryption helpers
 - **HTTP** — `HTTP::callWebService` allows only `http`/`https`, for the request and for redirects;
   CR/LF in the method or header values is rejected; TLS verification is on unless the caller turns
   it off. `HTTP::getClientIpAddresses` lists `REMOTE_ADDR` first; forwarded headers follow.
+  `HTTP::getClientIp` returns one address: `REMOTE_ADDR`, or, behind the proxies you name,
+  `X-Forwarded-For` read from the right past them — never its leftmost, client-written entries.
+  `"*"` trusts the connection only, never the addresses in the header.
+- **Rate limits** — `RateLimiter` names its counter files with an HMAC of the bucket under a
+  subkey of your secret, so the directory is not a list of addresses (a plain hash of an IPv4
+  address is reversed in minutes). It fails open (a counter it cannot write allows the hit) and
+  sweeps only its own files. Count IPv6 by its /64 (`RateLimiter::ipBucket`): one subscriber holds
+  2^64 addresses.
 - **URLs** — `URL::getFormattedUrl` rejects every scheme but `http`/`https`, including the
   `javascript:1/alert(1)` shape that `parse_url()` reads as a host and a port. It is a formatter,
   not an HTML sanitizer: escape the result for the context it goes into, and pass `$protocol` for an
@@ -382,7 +390,8 @@ Argon2id via `password_hash`/`password_verify`. Never use the encryption helpers
 - **SSRF** — `HTTP::callWebService` has no private-IP/allowlist guard. Do not pass user-controlled
   URLs without an egress allowlist; never disable peer verification in production.
 - **Forwarded client IPs** — only `REMOTE_ADDR` is trustworthy; trust `X-Forwarded-For` only behind
-  a known proxy.
+  a known proxy, and name the proxies to `HTTP::getClientIp` (not whole networks that also hold
+  clients).
 - **`filterValue(addSlashes: true)`** is not SQL escaping. `filterValue(escapeDB: true)` delegates to
   `SQL::escapeString` and has the same limits. Use prepared statements.
 - **S3 uploads** — `S3Storage::upload` detects the content type from the file's bytes; pass an

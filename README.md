@@ -32,11 +32,12 @@ container, no configuration file.
 | `DBF` | Reads dBase (`.dbf`) files, with a configurable text encoding |
 | `File` | Directories, temp files, `.env` read/update, zip/unzip, uploads, file downloads, recursive delete (never follows links) |
 | `Formatter` | Number formatting (`R$ 1.234,56`), CPF/CNPJ/CEP masks, flat list → nested tree |
-| `HTTP` | cURL requests (`callWebService`), status headers, client IP, `Accept-Language`, JSON/XML responses, downloads |
+| `HTTP` | cURL requests (`callWebService`), status headers, client IP behind trusted proxies, IP/CIDR matching, `Accept-Language`, JSON/XML responses, downloads |
 | `Keyring` | The keys `Security` uses: one current key plus previous keys, for key rotation |
 | `Mailer` | E-mail through PHPMailer: attachments, embedded images, your own text part, provider shortcuts (Gmail, Office 365, …), the server's reason on a failed send |
 | `Number` | Rounding (round/floor/ceil), random decimals, parity |
 | `Parser` | Conversions: array ↔ XML/object, JSON extraction, base64/base64url, hex/binary, booleans, text lines |
+| `RateLimiter` | Hits per bucket in fixed windows, in keyed files (no database); IPv6 counted by /64, networks by /24 and /48 |
 | `S3Storage` | Upload, download, copy, move, delete, list and find objects on Amazon S3 or an S3-compatible endpoint |
 | `Security` | Field, file and string encryption, key generation and rotation, blind-index hashes, passwords (Argon2id), XSS sanitizing, input filtering |
 | `Spreadsheet` | Reads `.xlsx` / `.xls` / `.ods` / `.csv` / `.html` into arrays |
