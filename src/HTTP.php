@@ -833,6 +833,78 @@ class HTTP {
     }
 
     /**
+     * Whether the request came from the site's own pages, as far as the browser tells. FALSE when
+     * Sec-Fetch-Site is "cross-site", when Origin is "null" (a sandboxed iframe, a data: or file:
+     * page, a redirect across origins — what a foreign page uses to hide where it is), or when
+     * Origin names a host that is not one of $site. TRUE otherwise, including a request with
+     * neither header (curl, a script, an old browser): this keeps foreign PAGES from submitting a
+     * form through a visitor's browser; it does not keep scripts out. Pair it with
+     * Security::verifyFormToken() and a RateLimiter.
+     *
+     * Hosts are compared without case and without a trailing dot; the scheme and the port of
+     * Origin are not compared. An Origin that is not "scheme://host" is a foreign one.
+     *
+     * @param string|array<int, string> $site The site's own host or hosts ("example.com",
+     *        ["example.com", "www.example.com"]), or its URL or origin, from which the host is
+     *        taken ("https://example.com/", an APP_URL setting).
+     * @throws \InvalidArgumentException When $site names no host: an empty setting would otherwise
+     *         refuse every browser request in silence.
+     */
+    public static function isSameSiteRequest(string|array $site): bool {
+        $hosts = [];
+        foreach ((array) $site as $entry) {
+            $host = is_string($entry) ? self::hostOf($entry, false) : null;
+            if ($host !== null) {
+                $hosts[] = $host;
+            }
+        }
+        if ($hosts === []) {
+            throw new \InvalidArgumentException('$site must name at least one host.');
+        }
+
+        $fetchSite = $_SERVER['HTTP_SEC_FETCH_SITE'] ?? null;
+        if (is_string($fetchSite) && strtolower(trim($fetchSite)) === 'cross-site') {
+            return false;
+        }
+
+        $origin = $_SERVER['HTTP_ORIGIN'] ?? null;
+        if ($origin === null || (is_string($origin) && trim($origin) === '')) {
+            return true;
+        }
+        if (!is_string($origin) || strtolower(trim($origin)) === 'null') {
+            return false;
+        }
+
+        $originHost = self::hostOf($origin, true);
+
+        return $originHost !== null && in_array($originHost, $hosts, true);
+    }
+
+    /**
+     * The host of a URL or origin ("https://Example.com:8443" → "example.com"), or of a bare host
+     * when $requireScheme is FALSE ("example.com", "example.com:8443"); NULL when there is none.
+     */
+    private static function hostOf(string $value, bool $requireScheme): ?string {
+        $value = trim($value);
+        if ($value === '') {
+            return null;
+        }
+        if (str_contains($value, '://')) {
+            $host = parse_url($value, PHP_URL_HOST);
+        } elseif ($requireScheme) {
+            return null;
+        } else {
+            $host = parse_url('http://' . $value, PHP_URL_HOST);
+        }
+        if (!is_string($host) || $host === '') {
+            return null;
+        }
+        $host = rtrim(strtolower($host), '.');
+
+        return $host !== '' ? $host : null;
+    }
+
+    /**
      * Whether $ip is $range: one address ("203.0.113.9", "2001:db8::1") or a CIDR block
      * ("10.0.0.0/8", "2001:db8::/32"). Both are compared as IPv6, with IPv4 mapped into
      * ::ffff:0:0/96, so "::ffff:10.0.0.1" is in "10.0.0.0/8" and "10.0.0.1" is in

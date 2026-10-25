@@ -1331,6 +1331,86 @@ class Security {
     }
 
     /**
+     * A token for a form, handed to the page when it is rendered and sent back with the form:
+     * "{unix time}.{64 hex}", the hex being generateSearchHash() of the time under $key, with
+     * $purpose as the salt. verifyFormToken() then tells a submission that came through the page —
+     * recently, and not faster than a person — from one posted straight at the endpoint. Nothing
+     * is stored on the server.
+     *
+     * It is NOT a CSRF token bound to a session: anyone may load the page and take a fresh one.
+     * What it stops is a script that posts without loading the page, a bot faster than a person,
+     * and a page left open for days. Pair it with HTTP::isSameSiteRequest() and a RateLimiter.
+     *
+     * @param string|Keyring $key Master key (>= 32 bytes) or keyring; the current key signs.
+     * @param string $purpose A label per form or per use ("contact", "signup"): a token made for
+     *                        one purpose does not verify for another. Not empty; at most 64 bytes,
+     *                        no NUL (it is a salt). The default makes the same token as
+     *                        `$time . '.' . generateSearchHash($time, $key, 'form-token')`.
+     * @param int|null $now The time to sign; NULL is now.
+     *
+     * @throws \InvalidArgumentException For a key shorter than 32 bytes or an invalid $purpose.
+     * @return string "{unix time}.{64 lowercase hex}"
+     */
+    public static function generateFormToken(#[\SensitiveParameter] string|Keyring $key, string $purpose = 'form-token', ?int $now = null): string {
+        self::assertFormTokenPurpose($purpose);
+        $time = (string) ($now ?? time());
+
+        return $time . '.' . self::generateSearchHash($time, $key, $purpose);
+    }
+
+    /**
+     * Whether $token came from generateFormToken() for $purpose, under ANY key of the keyring (a
+     * key rotation does not break the pages already open), and is between $minAgeSeconds and
+     * $maxAgeSeconds old, both inclusive. FALSE — never an exception — for whatever a client can
+     * send: no token, a malformed one, a forged signature, one made for another purpose, one from
+     * the future, one too young (faster than a person fills the form), one too old.
+     *
+     * @param mixed $token What the client sent, as it came.
+     * @param string|Keyring $key Master key or keyring.
+     * @param int $minAgeSeconds The least time between rendering the page and submitting it.
+     * @param int $maxAgeSeconds The longest a page may stay open; at least $minAgeSeconds.
+     * @param string $purpose As given to generateFormToken().
+     * @param int|null $now The time to judge the age by; NULL is now.
+     *
+     * @throws \InvalidArgumentException For the caller's mistakes, never the client's: a key
+     *                                   shorter than 32 bytes, an invalid $purpose, a negative
+     *                                   $minAgeSeconds or a $maxAgeSeconds below it.
+     */
+    public static function verifyFormToken(mixed $token, #[\SensitiveParameter] string|Keyring $key, int $minAgeSeconds = 3, int $maxAgeSeconds = 86400, string $purpose = 'form-token', ?int $now = null): bool {
+        $keyring = self::keyring($key);
+        self::assertFormTokenPurpose($purpose);
+        if ($minAgeSeconds < 0 || $maxAgeSeconds < $minAgeSeconds) {
+            throw new \InvalidArgumentException('$minAgeSeconds must be 0 or more and $maxAgeSeconds at least $minAgeSeconds.');
+        }
+
+        if (!is_string($token) || preg_match('/^([0-9]{9,11})\.([0-9a-f]{64})\z/', $token, $match) !== 1) {
+            return false;
+        }
+
+        // Every key is compared, with no early exit, so the time taken does not tell which key of
+        // the keyring (if any) matched.
+        $valid = false;
+        foreach (self::generateSearchHashes($match[1], $keyring, $purpose) as $expected) {
+            $valid = hash_equals($expected, $match[2]) || $valid;
+        }
+        if (!$valid) {
+            return false;
+        }
+
+        $age = ($now ?? time()) - (int) $match[1];
+
+        return $age >= $minAgeSeconds && $age <= $maxAgeSeconds;
+    }
+
+    /** A form-token purpose is a salt, and must not be the empty one every plain search hash uses. */
+    private static function assertFormTokenPurpose(string $purpose): void {
+        if ($purpose === '') {
+            throw new \InvalidArgumentException('$purpose must not be empty: it would be the salt of every plain search hash.');
+        }
+        self::assertSalt($purpose);
+    }
+
+    /**
      * generateSearchHash() under one given master key.
      *
      * @throws \InvalidArgumentException

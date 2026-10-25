@@ -1450,6 +1450,91 @@ final class HTTPTest extends TestCase
         self::assertSame($expected, HTTP::ipInRange($ip, $range));
     }
 
+    // ----------------------------------------------------------- isSameSiteRequest
+
+    public function testIsSameSiteRequestLetsARequestWithoutBrowserHeadersPass(): void
+    {
+        $_SERVER = [];
+
+        self::assertTrue(HTTP::isSameSiteRequest('example.com'), 'curl and scripts send neither header');
+    }
+
+    public function testIsSameSiteRequestRefusesACrossSiteFetch(): void
+    {
+        $_SERVER = ['HTTP_SEC_FETCH_SITE' => 'Cross-Site'];
+        self::assertFalse(HTTP::isSameSiteRequest('example.com'));
+
+        $_SERVER = ['HTTP_SEC_FETCH_SITE' => 'cross-site', 'HTTP_ORIGIN' => 'https://example.com'];
+        self::assertFalse(HTTP::isSameSiteRequest('example.com'), 'the browser saw a foreign page, whatever Origin says');
+    }
+
+    public function testIsSameSiteRequestAcceptsTheSitesOwnOrigin(): void
+    {
+        foreach (['same-origin', 'same-site', 'none'] as $fetchSite) {
+            $_SERVER = ['HTTP_SEC_FETCH_SITE' => $fetchSite, 'HTTP_ORIGIN' => 'https://Example.com'];
+            self::assertTrue(HTTP::isSameSiteRequest('example.com'), $fetchSite);
+        }
+
+        $_SERVER = ['HTTP_ORIGIN' => 'http://example.com:8443'];
+        self::assertTrue(HTTP::isSameSiteRequest('https://example.com/'), 'scheme and port are not compared');
+    }
+
+    public function testIsSameSiteRequestRefusesAnotherOrLookalikeHost(): void
+    {
+        foreach ([
+            'https://evil.example',
+            'https://example.com.evil.example',
+            'https://evilexample.com',
+            'https://example.com@evil.example',
+            'https://www.example.com',
+        ] as $origin) {
+            $_SERVER = ['HTTP_ORIGIN' => $origin];
+            self::assertFalse(HTTP::isSameSiteRequest('example.com'), $origin);
+        }
+    }
+
+    /**
+     * "null" is what a sandboxed iframe or a data: page sends: a foreign page hiding where it is.
+     * Treating it as "no Origin" let such a page through wherever Sec-Fetch-Site is not sent.
+     */
+    public function testIsSameSiteRequestRefusesTheOpaqueOriginNull(): void
+    {
+        $_SERVER = ['HTTP_ORIGIN' => 'null'];
+
+        self::assertFalse(HTTP::isSameSiteRequest('example.com'));
+    }
+
+    public function testIsSameSiteRequestRefusesAnOriginThatIsNotAnOrigin(): void
+    {
+        foreach (['example.com', 'garbage', '://', 'https://'] as $origin) {
+            $_SERVER = ['HTTP_ORIGIN' => $origin];
+            self::assertFalse(HTTP::isSameSiteRequest('example.com'), $origin);
+        }
+
+        $_SERVER = ['HTTP_ORIGIN' => ['https://example.com']];
+        self::assertFalse(HTTP::isSameSiteRequest('example.com'), 'a non-string value is not trusted');
+    }
+
+    public function testIsSameSiteRequestTakesSeveralHostsAndUrls(): void
+    {
+        $_SERVER = ['HTTP_ORIGIN' => 'https://www.example.com'];
+
+        self::assertTrue(HTTP::isSameSiteRequest(['https://example.com', 'www.example.com']));
+        self::assertTrue(HTTP::isSameSiteRequest(['example.com.', 'WWW.EXAMPLE.COM:443']));
+    }
+
+    public function testIsSameSiteRequestRefusesAConfigurationWithoutAHost(): void
+    {
+        foreach (['', '   ', [], ['', 'https://'], [42]] as $site) {
+            try {
+                HTTP::isSameSiteRequest($site);
+                self::fail('accepted ' . json_encode($site));
+            } catch (\InvalidArgumentException) {
+                $this->addToAssertionCount(1);
+            }
+        }
+    }
+
     // ------------------------------------------------------- getBrowserLanguage
 
     /**

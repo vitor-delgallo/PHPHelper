@@ -219,6 +219,21 @@ defenses, both on the application side:
   }
   ```
 
+### Form tokens — `generateFormToken` / `verifyFormToken`
+
+A form token is `"{unix time}.{HMAC}"`: the search hash of the time under your key, with the
+purpose as its salt. It proves the submission came through a page you rendered, not too fast and
+not too long ago, with nothing stored on the server. `verifyFormToken` tries every key of the
+keyring (pages rendered before a rotation still verify), compares with `hash_equals`, and answers
+FALSE for anything a client can send; only the caller's mistakes (a short key, a bad purpose or
+age range) throw.
+
+- **It is not a session-bound CSRF token.** Anyone can load the page and take a fresh token: it
+  stops scripts that post without the page, bots faster than a person and stale pages, not a
+  determined client. Pair it with `HTTP::isSameSiteRequest` (foreign pages) and a `RateLimiter`.
+- **One purpose per form** (`'contact'`, `'signup'`), so a token taken from one form does not
+  verify on another. Never the empty purpose: that is the salt of every plain search hash.
+
 ### Authenticated files — `encryptFile` / `decryptFile`
 
 Streaming AES-256-GCM in the **v3** format — the only file format: `encryptFile` writes it and
@@ -345,6 +360,9 @@ Argon2id via `password_hash`/`password_verify`. Never use the encryption helpers
   `HTTP::getClientIp` returns one address: `REMOTE_ADDR`, or, behind the proxies you name,
   `X-Forwarded-For` read from the right past them — never its leftmost, client-written entries.
   `"*"` trusts the connection only, never the addresses in the header.
+  `HTTP::isSameSiteRequest` refuses `Sec-Fetch-Site: cross-site`, the opaque `Origin: null` and an
+  Origin of another host; a request with neither header passes (it guards against foreign pages,
+  not scripts).
 - **Rate limits** — `RateLimiter` names its counter files with an HMAC of the bucket under a
   subkey of your secret, so the directory is not a list of addresses (a plain hash of an IPv4
   address is reversed in minutes). It fails open (a counter it cannot write allows the hit) and
