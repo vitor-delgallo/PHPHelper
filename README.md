@@ -45,7 +45,7 @@ container, no configuration file.
 | `Str` | Multibyte-safe string helpers: accents, casing, substrings, occurrences, random keys and GUIDs, e-mail addresses redacted from log text |
 | `System` | Memory units and usage, server memory, seeds, timers |
 | `URL` | HTTP header arrays, URL encoding and normalization, appending query parameters |
-| `Validator` | CPF, CNPJ, e-mail, password rules, JSON, XML, HTML, base64, dates, emptiness checks |
+| `Validator` | CPF, CNPJ, e-mail (syntax, and whether its domain receives mail), password rules, JSON, XML, HTML, base64, dates, emptiness checks |
 
 ---
 

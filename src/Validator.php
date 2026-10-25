@@ -116,6 +116,73 @@ class Validator {
     }
 
     /**
+     * Whether the DOMAIN of an e-mail address can receive mail at all, asked of the DNS: a domain
+     * with a mail server (MX), or without one but with an address of its own, which is where mail
+     * goes then (RFC 5321, 5.1). FALSE for a domain that does not exist and for one that says it
+     * takes no mail ("MX 0 .", RFC 7505). A letter to either would only come back, and letters
+     * that come back are what a mail provider counts against the mailbox that sent them — a typo
+     * such as "gmial.com" in a form that sends a confirmation costs that mailbox reputation.
+     *
+     * Whether the MAILBOX exists cannot be known without writing to it. Check the syntax first
+     * (validateMail()): this only looks at what follows the last "@".
+     *
+     * It FAILS OPEN when the DNS of this side is down: finding nothing only means "does not exist"
+     * while the resolver is answering, and a failed lookup looks the same as an empty one (on some
+     * systems PHP reports them alike). So before saying FALSE the root of the DNS is asked for; if
+     * not even that answers, the address passes. Nobody is turned away because the server's DNS
+     * is down. Likewise, an internationalized domain passes unchecked when the intl extension is
+     * missing (it cannot be put in the ASCII form the DNS needs).
+     *
+     * @param string $email The address; only the part after the last "@" is used.
+     * @param callable|null $lookup fn(string $name, int $type): array, the records found ([] for
+     *                              none and for a failed lookup); NULL asks the DNS through
+     *                              dns_get_record(). For tests, and for a resolver of your own.
+     * @return bool FALSE when the domain is missing, does not exist or takes no mail.
+     */
+    public static function emailDomainReceivesMail(string $email, ?callable $lookup = null): bool {
+        $at = strrpos($email, '@');
+        $domain = $at === false ? '' : rtrim(trim(substr($email, $at + 1)), '.');
+        if ($domain === '' || preg_match('/[\x00-\x20\x7F]/', $domain) === 1) {
+            return false;
+        }
+        if (preg_match('/[^\x21-\x7E]/', $domain) === 1) {
+            if (!function_exists('idn_to_ascii')) {
+                return true;
+            }
+            $ascii = idn_to_ascii($domain, IDNA_DEFAULT, INTL_IDNA_VARIANT_UTS46);
+            if ($ascii === false || $ascii === '') {
+                return false;
+            }
+            $domain = $ascii;
+        }
+
+        $lookup ??= static function (string $name, int $type): array {
+            $found = function_exists('dns_get_record') ? @dns_get_record($name, $type) : false;
+
+            return is_array($found) ? $found : [];
+        };
+
+        // The final dot makes the name absolute: the resolver must not try it inside its own domain.
+        $name = strtolower($domain) . '.';
+        $servers = $lookup($name, DNS_MX);
+        if ($servers !== []) {
+            foreach ($servers as $server) {
+                if (rtrim((string) ($server['target'] ?? ''), '.') !== '') {
+                    return true;
+                }
+            }
+
+            // Every MX is the null MX ("."): the domain says it takes no mail.
+            return false;
+        }
+        if ($lookup($name, DNS_A | DNS_AAAA) !== []) {
+            return true;
+        }
+
+        return $lookup('.', DNS_NS) === [];
+    }
+
+    /**
      * Validates whether the given password meets the configured strength requirements.
      *
      * RULES. Every rule is optional; only the keys below are accepted. Each value must be an

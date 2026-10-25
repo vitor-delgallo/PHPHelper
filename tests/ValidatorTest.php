@@ -249,6 +249,81 @@ final class ValidatorTest extends TestCase {
         $this->assertFalse(Validator::validateMail($email));
     }
 
+    // ---------------------------------------------- emailDomainReceivesMail
+
+    /**
+     * A fake resolver: $records maps "name|type" to the records found; anything else finds
+     * nothing. It also records every question, in order.
+     *
+     * @param array<string, array<int, array<string, mixed>>> $records
+     * @param list<string> $asked
+     */
+    private static function resolver(array $records, array &$asked = []): callable {
+        return static function (string $name, int $type) use ($records, &$asked): array {
+            $asked[] = $name . '|' . $type;
+
+            return $records[$name . '|' . $type] ?? [];
+        };
+    }
+
+    public function testEmailDomainReceivesMailWithAnMxRecord(): void {
+        $lookup = self::resolver(['example.com.|' . DNS_MX => [['target' => 'mx1.example.com']]]);
+
+        $this->assertTrue(Validator::emailDomainReceivesMail('ana@Example.com', $lookup));
+    }
+
+    /** RFC 7505: "MX 0 ." says the domain takes no mail; a letter there only comes back. */
+    public function testEmailDomainReceivesMailRefusesTheNullMx(): void {
+        $lookup = self::resolver(['example.com.|' . DNS_MX => [['target' => '.'], ['target' => '']]]);
+
+        $this->assertFalse(Validator::emailDomainReceivesMail('ana@example.com', $lookup));
+    }
+
+    /** RFC 5321, 5.1: without an MX, mail goes to the domain's own address. */
+    public function testEmailDomainReceivesMailFallsBackToTheDomainsAddress(): void {
+        $lookup = self::resolver(['example.com.|' . (DNS_A | DNS_AAAA) => [['ip' => '203.0.113.9']]]);
+
+        $this->assertTrue(Validator::emailDomainReceivesMail('ana@example.com', $lookup));
+    }
+
+    public function testEmailDomainReceivesMailRefusesADomainThatDoesNotExist(): void {
+        $asked = [];
+        $lookup = self::resolver(['.|' . DNS_NS => [['target' => 'a.root-servers.net']]], $asked);
+
+        $this->assertFalse(Validator::emailDomainReceivesMail('ana@gmial.com', $lookup));
+        $this->assertSame(['gmial.com.|' . DNS_MX, 'gmial.com.|' . (DNS_A | DNS_AAAA), '.|' . DNS_NS], $asked, 'absolute names, root asked last');
+    }
+
+    /** When not even the root answers, the fault is on this side: nobody is turned away for it. */
+    public function testEmailDomainReceivesMailFailsOpenWhenTheResolverIsDown(): void {
+        $this->assertTrue(Validator::emailDomainReceivesMail('ana@example.com', self::resolver([])));
+    }
+
+    public function testEmailDomainReceivesMailRefusesAnAddressWithoutADomain(): void {
+        $lookup = self::resolver(['.|' . DNS_NS => [['target' => 'a.root-servers.net']]]);
+
+        foreach (['ana', 'ana@', 'ana@.', "ana@exa mple.com", "ana@example.com\n"] as $email) {
+            $this->assertFalse(Validator::emailDomainReceivesMail($email, $lookup), json_encode($email));
+        }
+    }
+
+    public function testEmailDomainReceivesMailUsesTheLastAt(): void {
+        $asked = [];
+        $lookup = self::resolver(['example.org.|' . DNS_MX => [['target' => 'mx.example.org']]], $asked);
+
+        $this->assertTrue(Validator::emailDomainReceivesMail('"a@b"@example.org', $lookup));
+        $this->assertSame('example.org.|' . DNS_MX, $asked[0]);
+    }
+
+    #[RequiresPhpExtension('intl')]
+    public function testEmailDomainReceivesMailAsksForAnInternationalDomainInAscii(): void {
+        $asked = [];
+        $lookup = self::resolver(['xn--cafs-dpa.com.br.|' . DNS_MX => [['target' => 'mx.example.com']]], $asked);
+
+        $this->assertTrue(Validator::emailDomainReceivesMail('ana@cafés.com.br', $lookup));
+        $this->assertSame('xn--cafs-dpa.com.br.|' . DNS_MX, $asked[0]);
+    }
+
     // ----------------------------------------------------- validatePassword
 
     public function testValidatePasswordAcceptsAPasswordMeetingTheDocumentedDefaults(): void {

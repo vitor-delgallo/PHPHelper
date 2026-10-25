@@ -382,6 +382,10 @@ Argon2id via `password_hash`/`password_verify`. Never use the encryption helpers
   recipient the server refused: pass it through `Str::redactEmails()` before a log kept in clear.
   `$configs['timeout']` bounds the wait for each server reply as well as the connection, so a
   server that goes silent cannot hold the request for PHPMailer's default five minutes.
+- **E-mail domains** — `Validator::emailDomainReceivesMail` asks the DNS whether the domain takes
+  mail (MX, or an address when there is no MX; the null MX of RFC 7505 is a no). It fails OPEN when
+  the server's own resolver does not answer (the root is asked before saying no), so a DNS outage
+  on your side never turns visitors away; it says nothing about whether the mailbox exists.
 - **XML** — `Parser::xmlToArray` parses **content only** (files go through `xmlFileToArray`),
   blocks external entities with `LIBXML_NONET`, and restores the previous entity loader afterwards.
   `Parser::arrayToXml` serializes only public object state, validates the root name, and writes a
