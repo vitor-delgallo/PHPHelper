@@ -2374,7 +2374,7 @@ class Security {
 
         if (is_object($item)) {
             self::$applyWalkInProgress ??= new \SplObjectStorage();
-            if (self::$applyWalkInProgress->contains($item)) {
+            if (self::$applyWalkInProgress->offsetExists($item)) {
                 throw new \InvalidArgumentException(
                     "applySecurityFunctionArray cannot walk a cyclic object graph: " . $item::class . " contains itself."
                 );
@@ -2382,11 +2382,11 @@ class Security {
 
             // Held while the object's own array form is walked; released on every exit, so a
             // refusal cannot leave an instance marked for the caller's next call.
-            self::$applyWalkInProgress->attach($item);
+            self::$applyWalkInProgress->offsetSet($item);
             try {
                 return self::applySecurityFunctionArray((array) $item, $key, $salt, $method);
             } finally {
-                self::$applyWalkInProgress->detach($item);
+                self::$applyWalkInProgress->offsetUnset($item);
             }
         }
         if (!is_array($item)) {
@@ -2739,11 +2739,11 @@ class Security {
         // up the stack is skipped: it is the same instance, it is already being sanitized by that
         // frame, and re-entering it could never terminate.
         self::$objectWalkInProgress ??= new \SplObjectStorage();
-        if (self::$objectWalkInProgress->contains($object)) {
+        if (self::$objectWalkInProgress->offsetExists($object)) {
             return;
         }
 
-        self::$objectWalkInProgress->attach($object);
+        self::$objectWalkInProgress->offsetSet($object);
 
         try {
             // get_object_vars() is called from this scope, so private/protected properties are
@@ -2756,7 +2756,7 @@ class Security {
             // Detach on every exit, throw included: otherwise a refusal deep in the graph would
             // leave this instance marked forever and the caller's NEXT call would skip it
             // silently unsanitized — a fail-open manufactured by the cycle guard itself.
-            self::$objectWalkInProgress->detach($object);
+            self::$objectWalkInProgress->offsetUnset($object);
         }
     }
 

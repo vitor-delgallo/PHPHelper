@@ -348,16 +348,16 @@ class File {
             return "";
         }
 
-        $realPath = realpath($path);
-        if ($realPath !== false) {
-            return $realPath;
-        }
-
         // A UNC path is never resolved ABOVE its share: dirname("\\server\share") is "\\server"
         // and then "\", which realpath() reads as the root of the CURRENT DRIVE — so a missing or
         // unreachable share resolved to C:\server\share\... and, with createPath, got created
         // there. The share is the floor; below it the path is kept as given (normalized).
         $uncShare = self::uncShareRoot($path);
+
+        $realPath = self::realpathAtOrBelowShare($path, $uncShare);
+        if ($realPath !== false) {
+            return $realPath;
+        }
 
         $segments = [];
         $currentPath = $path;
@@ -372,7 +372,7 @@ class File {
                 break;
             }
 
-            $parentRealPath = realpath($parentPath);
+            $parentRealPath = self::realpathAtOrBelowShare($parentPath, $uncShare);
             if ($parentRealPath !== false) {
                 return self::appendPathSegments($parentRealPath, $segments);
             }
@@ -389,6 +389,25 @@ class File {
         }
 
         return self::normalizeResolvedPath($path);
+    }
+
+    /**
+     * realpath(), except that the "\\server\share" root of a share that does not answer is not
+     * resolved. Since PHP 8.5, realpath() on Windows returns that root (upper-cased) even when the
+     * share does not exist, where earlier versions returned false; taking it would rewrite the
+     * caller's path with the server's spelling while nothing there exists.
+     *
+     * @param string $path Path with the platform separator
+     * @param string|null $uncShare The share root of $path, from uncShareRoot()
+     * @return string|false
+     */
+    private static function realpathAtOrBelowShare(string $path, ?string $uncShare): string|false {
+        $realPath = realpath($path);
+        if ($realPath !== false && $uncShare !== null && strlen(rtrim($path, "\\")) <= strlen($uncShare) && !is_dir($path)) {
+            return false;
+        }
+
+        return $realPath;
     }
 
     /**

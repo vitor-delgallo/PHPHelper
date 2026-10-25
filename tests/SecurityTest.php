@@ -2332,7 +2332,7 @@ final class SecurityTest extends TestCase
         // ArrayAccess whose OFFSETS are objects while iteration yields integer positions. Pass 3
         // hard-coded a one-class exclusion and returned it unsanitized; it is refused now.
         $storage = new \SplObjectStorage();
-        $storage->attach(new \stdClass(), self::XSS_LIVE_PAYLOAD);
+        $storage->offsetSet(new \stdClass(), self::XSS_LIVE_PAYLOAD);
 
         $this->expectException(\InvalidArgumentException::class);
 
