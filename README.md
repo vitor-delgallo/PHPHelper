@@ -34,14 +34,14 @@ container, no configuration file.
 | `Formatter` | Number formatting (`R$ 1.234,56`), CPF/CNPJ/CEP masks, flat list → nested tree |
 | `HTTP` | cURL requests (`callWebService`), status headers, client IP, `Accept-Language`, JSON/XML responses, downloads |
 | `Keyring` | The keys `Security` uses: one current key plus previous keys, for key rotation |
-| `Mailer` | E-mail through PHPMailer: attachments, embedded images, provider shortcuts (Gmail, Office 365, …) |
+| `Mailer` | E-mail through PHPMailer: attachments, embedded images, your own text part, provider shortcuts (Gmail, Office 365, …), the server's reason on a failed send |
 | `Number` | Rounding (round/floor/ceil), random decimals, parity |
 | `Parser` | Conversions: array ↔ XML/object, JSON extraction, base64/base64url, hex/binary, booleans, text lines |
 | `S3Storage` | Upload, download, copy, move, delete, list and find objects on Amazon S3 or an S3-compatible endpoint |
 | `Security` | Field, file and string encryption, key generation and rotation, blind-index hashes, passwords (Argon2id), XSS sanitizing, input filtering |
 | `Spreadsheet` | Reads `.xlsx` / `.xls` / `.ods` / `.csv` / `.html` into arrays |
 | `SQL` | Literal escaping and batched MySQL `INSERT … ON DUPLICATE KEY UPDATE` builder |
-| `Str` | Multibyte-safe string helpers: accents, casing, substrings, occurrences, random keys and GUIDs |
+| `Str` | Multibyte-safe string helpers: accents, casing, substrings, occurrences, random keys and GUIDs, e-mail addresses redacted from log text |
 | `System` | Memory units and usage, server memory, seeds, timers |
 | `URL` | HTTP header arrays, URL encoding and normalization, appending query parameters |
 | `Validator` | CPF, CNPJ, e-mail, password rules, JSON, XML, HTML, base64, dates, emptiness checks |

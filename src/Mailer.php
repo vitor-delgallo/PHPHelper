@@ -27,9 +27,10 @@ class Mailer {
      *                       when the server advertises it. 'tls' never falls back: a server that
      *                       refuses STARTTLS fails the send before any credential is sent.
      *                       OPTIONAL: 'timeout' — seconds (positive int) for the SMTP connection and
-     *                       each command. PHPMailer's own default is 300, i.e. an unresponsive
-     *                       server holds the calling request for five minutes. Any other value
-     *                       returns FALSE.
+     *                       for each reply the server owes: it sets both PHPMailer's Timeout and the
+     *                       SMTP Timelimit. PHPMailer's own default is 300 for each, i.e. an
+     *                       unresponsive server holds the calling request for five minutes. Any
+     *                       other value returns FALSE.
      *                       A missing required key makes this function return FALSE without
      *                       sending, throwing, or logging.
      * @param array $sendTo List of recipients, each ['email' => string (required), 'name' => string
@@ -133,9 +134,20 @@ class Mailer {
      *                    a price for reading nicely in the signature.
      * @param string|null $error BY REFERENCE, OUT only (appended last for the same reason). Set to
      *                    NULL on success, and to a short reason on every FALSE: which guard refused
-     *                    the call, or PHPMailer's own error message. It never contains the SMTP
-     *                    password (any occurrence, plain or base64, is masked defensively). A FALSE
-     *                    used to carry no reason at all.
+     *                    the call, or PHPMailer's ErrorInfo — its own line PLUS what the SMTP server
+     *                    answered ("SMTP Error: data not accepted. SMTP server error: DATA END
+     *                    command failed Detail: Daily sending quota exceeded SMTP code: 554
+     *                    Additional SMTP info: 5.7.1"), on one line. It used to carry PHPMailer's line alone, the server's reason
+     *                    lost. It never contains the SMTP password (any occurrence, plain or
+     *                    base64, is masked defensively). It CAN contain e-mail addresses: servers
+     *                    name the recipient they refuse. Before writing it to a log kept in clear,
+     *                    pass it through Str::redactEmails(). A FALSE used to carry no reason at
+     *                    all.
+     * @param string|null $altBody The text/plain part, used verbatim (appended after $error, for the
+     *                    same reason as $embeddedImagesBaseDir). NULL or '' derives it from the
+     *                    delivered body with PHPMailer::html2text(), which keeps the text of a
+     *                    link but drops its address: pass your own whenever a reader of the plain
+     *                    part needs a URL — a confirmation link, the way off a mailing list.
      *
      * @return bool TRUE on success. FALSE on a missing/invalid $configs key (including a 'secure'
      *              outside {'tls','ssl','none'}), on $useEmbeddedImages without a usable
@@ -170,7 +182,8 @@ class Mailer {
         bool $isSMTP = true,
         bool $debugMode = false,
         ?string $embeddedImagesBaseDir = null,
-        ?string &$error = null
+        ?string &$error = null,
+        ?string $altBody = null
     ): bool {
         $error = null;
 
@@ -359,7 +372,14 @@ class Mailer {
                 // PHPMailer still masks the AUTH exchange; DEBUG_LOWLEVEL would log the credentials.
                 $mail->Debugoutput = 'error_log';
                 $mail->Mailer     = 'smtp';
-                if (isset($configs['timeout'])) $mail->Timeout = $configs['timeout'];
+                // Timeout alone bounded the connection and each read, but SMTP::get_lines() waits for
+                // a reply to START with stream_select() for Timelimit seconds — 300 unless set — so a
+                // server that accepted the connection and then went silent still held the request
+                // for five minutes.
+                if (isset($configs['timeout'])) {
+                    $mail->Timeout = $configs['timeout'];
+                    $mail->getSMTPInstance()->Timelimit = $configs['timeout'];
+                }
 
                 // WHERE we deliver is independent of WHETHER we authenticate. Gating these on
                 // $useAuth meant an unauthenticated relay silently fell back to PHPMailer's own
@@ -502,14 +522,15 @@ class Mailer {
                 $mail->Body = $rebuilt;
             }
 
-            // The text/plain part. PHPMailer's own converter drops <head>, <title>, <style> and
-            // <script> before stripping tags and decodes entities; a bare strip_tags() used to
-            // leave the stylesheet and script text in the plain part and "&amp;" encoded.
-            $mail->AltBody = $mail->html2text($mail->Body);
+            // The text/plain part: the caller's own, or one derived from the body. PHPMailer's
+            // converter drops <head>, <title>, <style> and <script> before stripping tags and
+            // decodes entities; a bare strip_tags() used to leave the stylesheet and script text in
+            // the plain part and "&amp;" encoded.
+            $mail->AltBody = ($altBody ?? '') !== '' ? $altBody : $mail->html2text($mail->Body);
 
             $ret = $mail->send();
             if (!$ret) {
-                $error = self::maskSecret($mail->ErrorInfo !== '' ? $mail->ErrorInfo : 'PHPMailer reported a failed send.', $configs['pass'] ?? null);
+                $error = self::failureReason($mail, 'PHPMailer reported a failed send.', $configs['pass'] ?? null);
             }
 
             $mail->clearAllRecipients();
@@ -517,10 +538,26 @@ class Mailer {
             $mail->clearCustomHeaders();
             $mail->clearReplyTos();
         } catch (\PHPMailer\PHPMailer\Exception $e) {
-            $error = self::maskSecret($e->getMessage(), $configs['pass'] ?? null);
+            // The exception carries PHPMailer's own line only ("SMTP Error: data not accepted.");
+            // what the server answered, the actual reason, is in ErrorInfo.
+            $error = self::failureReason($mail, $e->getMessage(), $configs['pass'] ?? null);
         }
 
         return $ret;
+    }
+
+    /**
+     * Why a send failed: PHPMailer's ErrorInfo (its own line plus the SMTP server's answer), or
+     * $fallback when it is empty; the secret masked, on one line.
+     */
+    private static function failureReason(\PHPMailer\PHPMailer\PHPMailer $mail, string $fallback, #[\SensitiveParameter] ?string $secret): string {
+        $reason = self::maskSecret($mail->ErrorInfo !== '' ? $mail->ErrorInfo : $fallback, $secret);
+
+        // A server's answer ends in CRLF and may span several lines: one line for the log, and no
+        // line break a server could use to forge entries in it. ASCII whitespace only, spelled
+        // out: under a non-C LC_CTYPE, PHP builds PCRE tables in which \s can match 0x85 or 0xA0,
+        // continuation bytes of UTF-8 letters ("à" is C3 A0).
+        return trim((string) preg_replace('/[\x09-\x0D\x20]+/', ' ', $reason));
     }
 
     /**

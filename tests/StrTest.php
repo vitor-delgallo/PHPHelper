@@ -528,6 +528,51 @@ final class StrTest extends TestCase {
         self::assertSame('a b', Str::removeExcessSpaces("a\r\n\tb"));
     }
 
+    public function testRedactEmailsReplacesEveryAddressAndKeepsWhatSurroundsIt(): void {
+        self::assertSame(
+            'SMTP Error: The following recipients failed: [e-mail]: <[e-mail]>: Recipient address rejected',
+            Str::redactEmails('SMTP Error: The following recipients failed: ana@example.com: <ana@example.com>: Recipient address rejected')
+        );
+        self::assertSame('mailto:[e-mail], [e-mail]; ([e-mail])', Str::redactEmails('mailto:ana+news@mail.example.co.uk, root@localhost; (bo.b@x.io)'));
+        self::assertSame("from [e-mail]\nto [e-mail]", Str::redactEmails("from ana@example.com\nto bob@example.com"));
+    }
+
+    public function testRedactEmailsTakesUtf8AddressesWholeUnderAnyLocale(): void {
+        // "à" is C3 A0: a pattern using \s under a Windows-1252 LC_CTYPE could stop at the A0 and
+        // leave "jo" + half a character + the domain behind.
+        $previous = setlocale(LC_CTYPE, '0');
+        setlocale(LC_CTYPE, 'Portuguese_Brazil.1252', 'pt_BR.ISO-8859-1', 'pt_BR');
+        try {
+            self::assertSame('olá [e-mail] à tarde', Str::redactEmails('olá joàna@exemplo.com.br à tarde'));
+        } finally {
+            setlocale(LC_CTYPE, $previous);
+        }
+    }
+
+    public function testRedactEmailsLeavesQuotedDatabaseAccountsAndPlainTextAlone(): void {
+        $text = "Access denied for user 'app'@'localhost' (using password: YES)";
+        self::assertSame($text, Str::redactEmails($text));
+        self::assertSame('no address here, just an @ sign', Str::redactEmails('no address here, just an @ sign'));
+    }
+
+    public function testRedactEmailsUsesTheReplacementLiterally(): void {
+        self::assertSame('to $1\\0 now', Str::redactEmails('to ana@example.com now', '$1\\0'));
+        self::assertSame('', Str::redactEmails(null));
+        self::assertSame('', Str::redactEmails(''));
+    }
+
+    public function testRedactEmailsIsLinearOnALongRunWithoutSeparators(): void {
+        // A match may only start after a separator. Without that, a 1 MB run with no "@" in it
+        // was re-scanned from each of its million positions before the address after it was found.
+        $text = str_repeat('a', 1_000_000) . ' ana@example.com';
+        $started = microtime(true);
+        $result = Str::redactEmails($text);
+        $elapsed = microtime(true) - $started;
+
+        self::assertSame(str_repeat('a', 1_000_000) . ' [e-mail]', $result);
+        self::assertLessThan(2.0, $elapsed, sprintf('took %.2f s', $elapsed));
+    }
+
     public function testRemoveExcessSpacesRemovesEveryRunWhenKeepSingleSpaceIsFalse(): void {
         self::assertSame('HelloWorld', Str::removeExcessSpaces('Hello    World', false));
         self::assertSame('ab', Str::removeExcessSpaces("a \n <br> b", false));

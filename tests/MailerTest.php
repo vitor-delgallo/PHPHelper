@@ -22,17 +22,28 @@ final class MailerTest extends TestCase
      * The sink. Responds 220 / EHLO+AUTH / 334 / 235 / 250 / 354, logs every command line to
      * "<log>" and everything between DATA and the terminating "." to "<log>.eml". It does NOT speak
      * TLS: STARTTLS is refused with 454, and a TLS ClientHello is just a garbage line to it.
-     * $argv[2] is how long to wait for the one connection it serves.
+     * $argv[2] is how long to wait for the one connection it serves. $argv[3] is the mode: 'ok'
+     * (default); 'refuse-data' answers the end of DATA with a 554; 'refuse-rcpt' answers RCPT
+     * with a two-line 550; 'silent' accepts and never says a word, not even the 220, until the
+     * client hangs up (or 20 s pass).
      */
     private const SINK_SOURCE = <<<'SINK'
 <?php
 $log = $argv[1];
+$mode = $argv[3] ?? 'ok';
 $srv = stream_socket_server('tcp://127.0.0.1:0', $errno, $errstr);
 if (!$srv) { file_put_contents($log, "ERR $errstr\n"); exit(1); }
 $name = stream_socket_get_name($srv, false);
 file_put_contents($log . '.port', (string) (int) substr($name, strrpos($name, ':') + 1));
 $conn = @stream_socket_accept($srv, (float) ($argv[2] ?? 5));
 if (!$conn) { file_put_contents($log, "NOACCEPT\n"); exit(1); }
+if ($mode === 'silent') {
+    $r = [$conn]; $w = null; $e = null;
+    @stream_select($r, $w, $e, 20);
+    file_put_contents($log, "SILENT\n");
+    fclose($conn);
+    exit(0);
+}
 $session = '';
 $data    = '';
 $inData  = false;
@@ -40,12 +51,20 @@ $expect  = null;
 fwrite($conn, "220 sink ESMTP\r\n");
 while (($line = fgets($conn, 8192)) !== false) {
     if ($inData) {
-        if (rtrim($line, "\r\n") === '.') { $inData = false; fwrite($conn, "250 OK queued\r\n"); continue; }
+        if (rtrim($line, "\r\n") === '.') {
+            $inData = false;
+            fwrite($conn, $mode === 'refuse-data' ? "554 5.7.1 Daily sending quota exceeded\r\n" : "250 OK queued\r\n");
+            continue;
+        }
         $data .= $line;
         continue;
     }
     $session .= $line;
     $cmd = strtoupper(substr(trim($line), 0, 4));
+    if ($cmd === 'RCPT' && $mode === 'refuse-rcpt') {
+        fwrite($conn, "550-5.1.1 <to@example.com>: Recipient address rejected:\r\n550 5.1.1 User unknown in virtual mailbox table\r\n");
+        continue;
+    }
     if ($expect === 'user')  { $expect = 'pass'; fwrite($conn, "334 UGFzc3dvcmQ6\r\n"); continue; }
     if ($expect === 'pass' || $expect === 'plain') { $expect = null; fwrite($conn, "235 2.7.0 ok\r\n"); continue; }
     if ($cmd === 'EHLO') { fwrite($conn, "250-sink\r\n250-AUTH LOGIN PLAIN\r\n250 HELP\r\n"); continue; }
@@ -131,15 +150,16 @@ SINK;
      *
      * @param float $acceptTimeout How long the sink waits for a connection. A test that expects
      *                             NOTHING to connect passes a short one, or it pays the full wait.
+     * @param string $mode How the sink behaves; see SINK_SOURCE.
      */
-    private function startSink(float $acceptTimeout = 5.0): int
+    private function startSink(float $acceptTimeout = 5.0, string $mode = 'ok'): int
     {
         $script = $this->tmpDir . DIRECTORY_SEPARATOR . 'sink.php';
         file_put_contents($script, self::SINK_SOURCE);
         $this->sinkLog = $this->tmpDir . DIRECTORY_SEPARATOR . 'session';
 
         $proc = proc_open(
-            [PHP_BINARY, $script, $this->sinkLog, (string) $acceptTimeout],
+            [PHP_BINARY, $script, $this->sinkLog, (string) $acceptTimeout, $mode],
             [['pipe', 'r'], ['pipe', 'w'], ['pipe', 'w']],
             $this->sinkPipes
         );
@@ -780,6 +800,109 @@ SINK;
         self::assertStringNotContainsString('color:#B08D57', $plain, 'no stylesheet in the text part');
         self::assertStringNotContainsString('alert(1)', $plain, 'no script in the text part');
         self::assertStringNotContainsString('page title', $plain, 'no <title> in the text part');
+    }
+
+    /**
+     * The derived text part keeps a link's text and drops its address, so a reader of the plain
+     * part could not confirm or leave a list. A caller's own $altBody goes out verbatim, URLs and
+     * all, and the HTML part is still the body.
+     */
+    public function testSendMailUsesTheCallersAltBodyVerbatim(): void
+    {
+        $port = $this->startSink();
+        $text = "Confirm here: https://example.com/confirm?t=abc123\nLeave the list: https://example.com/leave?t=xyz";
+
+        [$ok, $error] = self::send(
+            $this->configs($port),
+            [['email' => 'to@example.com']],
+            'Subject',
+            '<p><a href="https://example.com/confirm?t=abc123">Confirm</a></p>',
+            ['altBody' => $text]
+        );
+
+        self::assertTrue($ok, (string) $error);
+        $eml = $this->sinkCapture()['eml'];
+        $plain = self::plainPart($eml);
+        self::assertStringContainsString('Confirm here: https://example.com/confirm?t=abc123', $plain);
+        self::assertStringContainsString('Leave the list: https://example.com/leave?t=xyz', $plain);
+        self::assertStringContainsString('<a href="https://example.com/confirm?t=abc123">Confirm</a>', $eml, 'the HTML part is the body');
+    }
+
+    /** '' means "no text part of my own", like NULL: the part is derived, never sent empty. */
+    public function testSendMailDerivesAltBodyWhenTheCallersIsEmpty(): void
+    {
+        $port = $this->startSink();
+
+        [$ok, $error] = self::send(
+            $this->configs($port),
+            [['email' => 'to@example.com']],
+            'Subject',
+            '<p>derived text marker</p>',
+            ['altBody' => '']
+        );
+
+        self::assertTrue($ok, (string) $error);
+        $plain = self::plainPart($this->sinkCapture()['eml']);
+        self::assertStringContainsString('derived text marker', $plain);
+        self::assertStringNotContainsString('<p>', $plain);
+    }
+
+    // ---------------------------------------------------------------- failures and waits
+
+    /**
+     * FINDING (fixed): a refused message makes PHPMailer THROW with its own line only, "SMTP Error:
+     * data not accepted.", and $error was that exception message: the server's reason (a quota, a
+     * policy block) never reached the caller. It is in ErrorInfo, which $error now carries.
+     */
+    public function testSendMailErrorCarriesTheServersReasonForARefusedMessage(): void
+    {
+        $port = $this->startSink(5.0, 'refuse-data');
+
+        [$ok, $error] = self::send($this->configs($port), [['email' => 'to@example.com']], 'Subject', '<p>Body</p>');
+
+        self::assertFalse($ok);
+        self::assertStringContainsString('data not accepted', (string) $error);
+        self::assertStringContainsString('Daily sending quota exceeded', (string) $error, "the server's own reason");
+        self::assertStringContainsString('554', (string) $error);
+    }
+
+    /**
+     * A server's answer can span lines and name the recipient. $error is one line (no line break
+     * a server could plant in a log), and the address it may hold is what Str::redactEmails()
+     * is documented for.
+     */
+    public function testSendMailErrorIsOneLineAndMayNameTheRefusedRecipient(): void
+    {
+        $port = $this->startSink(5.0, 'refuse-rcpt');
+
+        [$ok, $error] = self::send($this->configs($port), [['email' => 'to@example.com']], 'Subject', '<p>Body</p>');
+
+        self::assertFalse($ok);
+        self::assertStringContainsString('User unknown in virtual mailbox table', (string) $error);
+        self::assertDoesNotMatchRegularExpression('/[\r\n]/', (string) $error);
+        self::assertStringContainsString('to@example.com', (string) $error);
+        self::assertStringNotContainsString('to@example.com', \VD\PHPHelper\Str::redactEmails((string) $error));
+    }
+
+    /**
+     * FINDING (fixed): 'timeout' set PHPMailer's Timeout only, but SMTP::get_lines() waits for a
+     * reply to START with stream_select() for Timelimit seconds, 300 unless set. A server that
+     * accepted the connection and never spoke held the caller for five minutes, whatever 'timeout'
+     * said. This sink gives up after 20 s, so a send still bound by the old wait takes all of them.
+     */
+    public function testSendMailTimeoutAlsoBoundsTheWaitForASilentServer(): void
+    {
+        $port = $this->startSink(5.0, 'silent');
+        $configs = $this->configs($port);
+        $configs['timeout'] = 2;
+
+        $started = microtime(true);
+        [$ok, $error] = self::send($configs, [['email' => 'to@example.com']], 'Subject', '<p>Body</p>');
+        $elapsed = microtime(true) - $started;
+
+        self::assertFalse($ok);
+        self::assertNotNull($error);
+        self::assertLessThan(10.0, $elapsed, sprintf('gave up after %.1f s; the bound was 2 s', $elapsed));
     }
 
     /** The text/plain part of a multipart message as the sink captured it. */
@@ -1901,12 +2024,16 @@ SINK;
             'useConfig', 'lang', 'files', 'stringFiles', 'priority', 'wrap',
             'cc', 'cco', 'reply', 'headers', 'template', 'confirm', 'useEmbeddedImages',
             'charset', 'useAuth', 'isSMTP', 'debugMode',
-            'embeddedImagesBaseDir', 'error',
+            'embeddedImagesBaseDir', 'error', 'altBody',
         ], $names);
 
         $error = (new \ReflectionMethod(Mailer::class, 'sendMail'))->getParameters()[22];
         self::assertTrue($error->isPassedByReference(), '$error is an OUT parameter');
         self::assertTrue($error->isOptional());
+
+        $altBody = (new \ReflectionMethod(Mailer::class, 'sendMail'))->getParameters()[23];
+        self::assertFalse($altBody->isPassedByReference());
+        self::assertTrue($altBody->isOptional());
     }
 
     // ---------------------------------------------------------------- injection & leakage

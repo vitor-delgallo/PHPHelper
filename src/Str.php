@@ -471,6 +471,47 @@ class Str {
     }
 
     /**
+     * Replaces everything shaped like an e-mail address with $replacement, for text bound for a
+     * log kept in clear: a mail server's answer (servers name the recipient they refuse, see
+     * Mailer::sendMail()'s $error), a database error, an exception message.
+     *
+     * Deliberately broad: a run of characters around an "@", up to whitespace, a control
+     * character or one of < > , ; : " ' ( ), is taken as an address, so "<ana@example.com>",
+     * "mailto:ana+news@mail.example.co.uk" and "root@localhost" all go, their brackets and
+     * "mailto:" kept. Things that only look like an address go too ("user@host" in a stack trace):
+     * a log line that loses a word is the price of never keeping a reader's address. A quoted
+     * name before the "@" stops the match, so a database account such as 'app'@'localhost' stays
+     * readable — and so does a quoted local part ("ana silva"@example.com), which mail almost
+     * never uses.
+     *
+     * Byte-based and locale-independent: safe on UTF-8 and on invalid UTF-8. Linear in the length
+     * of $text: a match may only START after a separator, so a long run of text is scanned once,
+     * not once per position.
+     *
+     * @param string|null $text The text; NULL yields "".
+     * @param string $replacement What each address becomes.
+     * @return string $text with every address replaced.
+     */
+    public static function redactEmails(?string $text, string $replacement = '[e-mail]'): string {
+        if ($text === null || $text === '') {
+            return '';
+        }
+
+        // The separators are spelled out instead of \s, for the same reason as in
+        // removeExcessSpaces(): under a non-C LC_CTYPE, \s can match a byte of a UTF-8 letter, and
+        // a match cut there would leave part of the address behind. The lookbehind is what keeps
+        // this linear: without it, a long run with no "@" in it was re-scanned from every position.
+        // The local part excludes "@" so it cannot run past the first one.
+        $separators = '\x00-\x20\x7F<>,;:"\'()';
+
+        return (string) preg_replace(
+            '/(?<![^' . $separators . '])[^' . $separators . '@]+@[^' . $separators . ']+/',
+            str_replace(['\\', '$'], ['\\\\', '\\$'], $replacement),
+            $text
+        );
+    }
+
+    /**
      * Converts a string to uppercase using multibyte support (UTF-8).
      *
      * Every multibyte method in this class passes 'UTF-8' explicitly rather than inheriting

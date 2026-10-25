@@ -351,7 +351,11 @@ Argon2id via `password_hash`/`password_verify`. Never use the encryption helpers
   every recipient list and the sender go through `validateMail()`, since PHPMailer would otherwise
   trim and send; Mailer debug output goes to `error_log`, never to stdout, with the SMTP password
   masked, and `$configs` is a `#[\SensitiveParameter]` so an exception that escapes `sendMail`
-  does not carry the password in its trace.
+  does not carry the password in its trace. The `$error` of a failed send is one line (a server's
+  answer cannot plant line breaks in your log) with the password masked, but it can name the
+  recipient the server refused: pass it through `Str::redactEmails()` before a log kept in clear.
+  `$configs['timeout']` bounds the wait for each server reply as well as the connection, so a
+  server that goes silent cannot hold the request for PHPMailer's default five minutes.
 - **XML** — `Parser::xmlToArray` parses **content only** (files go through `xmlFileToArray`),
   blocks external entities with `LIBXML_NONET`, and restores the previous entity loader afterwards.
   `Parser::arrayToXml` serializes only public object state, validates the root name, and writes a
